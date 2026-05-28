@@ -54,6 +54,7 @@ public final class CodecBlockBuilder {
         if (switchTemplate == null) switchTemplate = prefTemplate;
 
         Object category = null;
+        Object header = null;
         Object insertionParent = container;
         int firstChildOrder = order;
         if (wrapInCategory) {
@@ -70,6 +71,19 @@ public final class CodecBlockBuilder {
             PrefRef.addPreference(container, category);
             insertionParent = category;
             firstChildOrder = 0;
+        } else {
+            header = newOf(context, COUI_PREFERENCE, ANDX_PREFERENCE);
+            if (header != null) {
+                cloneVisualStyleFrom(header, prefTemplate);
+                PrefRef.setKey(header, "melody_codec_lsp_header");
+                PrefRef.setTitle(header, Strings.CODEC_BLOCK_TITLE);
+                PrefRef.setSelectable(header, false);
+                PrefRef.setIconSpaceReserved(header, false);
+                PrefRef.setPersistent(header, false);
+                PrefRef.setOrder(header, order);
+                PrefRef.addPreference(container, header);
+                firstChildOrder = order + 1;
+            }
         }
 
         // Plain Preference rows for quality and sample rate: their click handlers will pop a
@@ -115,6 +129,7 @@ public final class CodecBlockBuilder {
 
         Object codecDisplay;
         if (category != null) codecDisplay = category;
+        else if (header != null) codecDisplay = header;
         else if (quality != null) codecDisplay = quality;
         else if (sampleRate != null) codecDisplay = sampleRate;
         else codecDisplay = remember;
@@ -152,6 +167,7 @@ public final class CodecBlockBuilder {
         for (int i = 0; i < count; i++) {
             Object pref = PrefRef.getPreference(container, i);
             if (pref == null) continue;
+            if (isUnsuitableTemplate(pref)) continue;
             String name = pref.getClass().getName();
             if (matchesSuffix(name, suffix)) {
                 if (PrefRef.getLayoutResource(pref) != 0) return pref;
@@ -169,6 +185,12 @@ public final class CodecBlockBuilder {
             }
         }
         return fallback;
+    }
+
+    private static boolean isUnsuitableTemplate(Object pref) {
+        String key = PrefRef.getKey(pref);
+        return "footer_preference".equals(key)
+                || "pref_device_info".equals(key);
     }
 
     private static boolean matchesSuffix(String className, String suffix) {

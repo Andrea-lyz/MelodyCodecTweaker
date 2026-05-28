@@ -58,6 +58,11 @@ public final class HostHookInstaller {
 
     /** {@code PreferenceCategory.setKey(cls.getSimpleName())} stamps this on the Hi-Res item. */
     private static final String KEY_HIRES_ITEM = "HiQualityAudioItem";
+    private static final String KEY_CODEC_HEADER = "melody_codec_lsp_header";
+    private static final String KEY_CODEC_CATEGORY = "melody_codec_lsp_category";
+    private static final String KEY_CODEC_QUALITY = "melody_codec_lsp_quality";
+    private static final String KEY_MORE_SETTING = "pref_more_setting";
+    private static final String KEY_FOOTER = "footer_preference";
 
     private final MelodyCodecLspEntry module;
     private final ClassLoader classLoader;
@@ -149,15 +154,18 @@ public final class HostHookInstaller {
             try {
                 Object screen = PrefRef.getPreferenceScreen(fragment);
                 if (screen != null && attachedScreens.contains(screen)) {
-                    if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null
-                            || PrefRef.findPreference(screen, "melody_codec_lsp_quality") != null) {
+                    if (hasCodecMarker(screen)) {
+                        scheduleNextSurfaceCheck(fragment, attempt);
                         return;
                     }
                     // The host can rebuild the same PreferenceScreen instance after our first
                     // injection. If the marker disappeared, allow the retry loop to inject again.
                     attachedScreens.remove(screen);
                 }
-                if (dispatchSurface(fragment)) return;
+                if (dispatchSurface(fragment)) {
+                    scheduleNextSurfaceCheck(fragment, attempt);
+                    return;
+                }
             } catch (Throwable t) {
                 MLog.e("Surface dispatch failed", t);
                 return;
@@ -173,6 +181,18 @@ public final class HostHookInstaller {
         }, attempt == 0 ? 200L : 1000L);
     }
 
+    private void scheduleNextSurfaceCheck(Object fragment, int attempt) {
+        if (attempt < 14) {
+            scheduleSurfaceDispatch(fragment, attempt + 1);
+        }
+    }
+
+    private static boolean hasCodecMarker(Object screen) {
+        return PrefRef.findPreference(screen, KEY_CODEC_HEADER) != null
+                || PrefRef.findPreference(screen, KEY_CODEC_CATEGORY) != null
+                || PrefRef.findPreference(screen, KEY_CODEC_QUALITY) != null;
+    }
+
     /**
      * Decide which surface the fragment represents by inspecting the keys that exist on its
      * PreferenceScreen, then route to the matching insertion routine.
@@ -181,8 +201,7 @@ public final class HostHookInstaller {
         Object screen = PrefRef.getPreferenceScreen(fragment);
         if (screen == null) return false;
 
-        if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null
-                || PrefRef.findPreference(screen, "melody_codec_lsp_quality") != null) {
+        if (hasCodecMarker(screen)) {
             // Already injected on this screen.
             attachedScreens.add(screen);
             return true;
@@ -193,7 +212,8 @@ public final class HostHookInstaller {
         }
 
         if (PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY) != null
-                || PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY) != null) {
+                || PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY) != null
+                || PrefRef.findPreference(screen, KEY_MORE_SETTING) != null) {
             return injectIntoOneSpace(fragment, screen);
         }
 
@@ -234,31 +254,35 @@ public final class HostHookInstaller {
         if (themedContext == null) return false;
 
         Object noiseMenu = PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY);
-        Object moreSetting = PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY);
+        Object moreSettingCategory = PrefRef.findPreference(
+                screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY);
+        Object moreSettingRow = PrefRef.findPreference(screen, KEY_MORE_SETTING);
+        if (moreSettingCategory == null && moreSettingRow != null) {
+            Object parent = PrefRef.getParent(moreSettingRow);
+            moreSettingCategory = parent != null && parent != screen ? parent : moreSettingRow;
+        }
+        Object footer = PrefRef.findPreference(screen, KEY_FOOTER);
+
+        Object anchor = moreSettingCategory != null ? moreSettingCategory : footer;
         int targetOrder;
-        if (noiseMenu != null && moreSetting != null) {
-            int low = Math.min(PrefRef.getOrder(noiseMenu), PrefRef.getOrder(moreSetting));
-            int high = Math.max(PrefRef.getOrder(noiseMenu), PrefRef.getOrder(moreSetting));
-            targetOrder = (low + high) / 2;
-            if (targetOrder == low) targetOrder = low + 1;
-        } else if (moreSetting != null) {
-            targetOrder = Math.max(0, PrefRef.getOrder(moreSetting) - 1);
+        if (anchor != null) {
+            targetOrder = Math.max(0, PrefRef.getOrder(anchor));
+        } else if (noiseMenu != null) {
+            targetOrder = PrefRef.getOrder(noiseMenu) + 1;
         } else {
             targetOrder = PrefRef.getPreferenceCount(screen);
-        }
-        if (moreSetting != null && targetOrder >= PrefRef.getOrder(moreSetting)) {
-            PrefRef.setOrder(moreSetting, targetOrder + 1);
         }
         String mac = resolveMacFromActivityIntent(fragment);
         if (mac == null) {
             MLog.w("OneSpace mac unresolved; skip");
             return false;
         }
-        // OneSpace is for instant switching only — flatten (no Category wrapper) and skip the
-        // remember toggle. Persistence is owned by DetailMain's panel.
+        shiftPreferenceOrders(screen, targetOrder, +3);
+        // OneSpace is for instant switching only: use top-level rows and skip the remember
+        // toggle. Persistence is owned by DetailMain's panel.
         CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(
                 themedContext, screen, targetOrder,
-                /* wrapInCategory= */ true, /* includeRemember= */ false);
+                /* wrapInCategory= */ false, /* includeRemember= */ false);
         if (prefs == null) return false;
         controller.attach(mac, prefs, fragment);
         attachedScreens.add(screen);

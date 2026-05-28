@@ -144,8 +144,10 @@ public final class CodecController {
             return;
         }
         long[] options = snapshot.selectableCodecSpecific1;
+        boolean preserveLhdcHighBits = false;
         if (options == null || options.length == 0) {
             options = CodecLabelTable.qualityFallback(snapshot.activeCodecType);
+            preserveLhdcHighBits = CodecLabelTable.isLhdc(snapshot.activeCodecType);
         }
         if (options == null || options.length == 0) {
             Toast.makeText(context,
@@ -164,12 +166,16 @@ public final class CodecController {
             MLog.w("showQualityPicker skipped: no live activity context");
             return;
         }
+        boolean finalPreserveLhdcHighBits = preserveLhdcHighBits;
         try {
             new AlertDialog.Builder(dialogContext)
                     .setTitle(Strings.QUALITY_OPTION_TITLE)
                     .setSingleChoiceItems(entries, checked, (DialogInterface dlg, int which) -> {
                         dlg.dismiss();
                         long picked = finalOptions[which];
+                        if (finalPreserveLhdcHighBits) {
+                            picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
+                        }
                         CodecRequest req = CodecRequest.fromActive(snapshot)
                                 .withSpecific1(picked).build();
                         applyWrite(sub, req);

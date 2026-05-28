@@ -108,20 +108,38 @@ public final class CodecBridgeClient {
         // Path A.
         try {
             reflect.setCodec(request);
-            return awaitConfirmation(request, WriteResult.Path.DIRECT_API);
+            return awaitConfirmation(request, WriteResult.Path.DIRECT_API)
+                    .thenCompose(result -> {
+                        if (result.outcome == WriteResult.Outcome.CONFIRMED) {
+                            return CompletableFuture.completedFuture(result);
+                        }
+                        MLog.w("Path-A accepted but not confirmed; trying bridge/settings/root");
+                        return setCodecViaBridgeOrFallback(request);
+                    });
         } catch (BluetoothCodecReflect.BluetoothCodecReflectException e) {
             MLog.w("Path-A setCodec failed: " + e.className + "#" + e.methodName);
         } catch (Throwable t) {
             MLog.w("Path-A setCodec failed", t);
         }
 
+        return setCodecViaBridgeOrFallback(request);
+    }
+
+    private CompletableFuture<WriteResult> setCodecViaBridgeOrFallback(CodecRequest request) {
         // Path B.
         ICodecBridge bridge = ensureBridge();
         if (bridge != null) {
             try {
                 int code = bridge.setCodec(request);
                 if (code == CodecRequest.RESULT_OK) {
-                    return awaitConfirmation(request, WriteResult.Path.SYSTEM_BRIDGE);
+                    return awaitConfirmation(request, WriteResult.Path.SYSTEM_BRIDGE)
+                            .thenCompose(result -> {
+                                if (result.outcome == WriteResult.Outcome.CONFIRMED) {
+                                    return CompletableFuture.completedFuture(result);
+                                }
+                                MLog.w("Path-B accepted but not confirmed; trying settings/root");
+                                return setCodecViaSettingsOrRoot(request);
+                            });
                 }
                 MLog.w("Path-B bridge.setCodec returned " + code);
             } catch (RemoteException re) {
@@ -129,6 +147,10 @@ public final class CodecBridgeClient {
             }
         }
 
+        return setCodecViaSettingsOrRoot(request);
+    }
+
+    private CompletableFuture<WriteResult> setCodecViaSettingsOrRoot(CodecRequest request) {
         // Path C — Settings.Global from app context (needs WRITE_SECURE_SETTINGS, usually denied).
         boolean wrote = settingsFallback.apply(request);
         if (wrote) {
