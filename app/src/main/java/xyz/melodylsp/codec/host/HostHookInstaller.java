@@ -148,7 +148,15 @@ public final class HostHookInstaller {
             if (controller == null) return;
             try {
                 Object screen = PrefRef.getPreferenceScreen(fragment);
-                if (screen != null && attachedScreens.contains(screen)) return;
+                if (screen != null && attachedScreens.contains(screen)) {
+                    if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null
+                            || PrefRef.findPreference(screen, "melody_codec_lsp_quality") != null) {
+                        return;
+                    }
+                    // The host can rebuild the same PreferenceScreen instance after our first
+                    // injection. If the marker disappeared, allow the retry loop to inject again.
+                    attachedScreens.remove(screen);
+                }
                 if (dispatchSurface(fragment)) return;
             } catch (Throwable t) {
                 MLog.e("Surface dispatch failed", t);
@@ -250,7 +258,7 @@ public final class HostHookInstaller {
         // remember toggle. Persistence is owned by DetailMain's panel.
         CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(
                 themedContext, screen, targetOrder,
-                /* wrapInCategory= */ false, /* includeRemember= */ false);
+                /* wrapInCategory= */ true, /* includeRemember= */ false);
         if (prefs == null) return false;
         controller.attach(mac, prefs, fragment);
         attachedScreens.add(screen);

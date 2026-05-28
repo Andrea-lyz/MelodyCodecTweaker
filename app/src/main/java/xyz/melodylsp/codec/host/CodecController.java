@@ -1,8 +1,10 @@
 package xyz.melodylsp.codec.host;
 
 import android.app.AlertDialog;
+import android.app.Activity;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -94,12 +96,22 @@ public final class CodecController {
         }
         Object qualityListener = Proxy.newProxyInstance(cl, new Class[]{clickListenerCls},
                 (proxy, method, args) -> {
-                    showQualityPicker(sub);
+                    try {
+                        showQualityPicker(sub);
+                    } catch (Throwable t) {
+                        MLog.e("showQualityPicker failed", t);
+                        Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                    }
                     return true;
                 });
         Object sampleListener = Proxy.newProxyInstance(cl, new Class[]{clickListenerCls},
                 (proxy, method, args) -> {
-                    showSampleRatePicker(sub);
+                    try {
+                        showSampleRatePicker(sub);
+                    } catch (Throwable t) {
+                        MLog.e("showSampleRatePicker failed", t);
+                        Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                    }
                     return true;
                 });
         invokeSetClickListener(sub.prefs.qualityOption, qualityListener, clickListenerCls);
@@ -147,17 +159,27 @@ public final class CodecController {
             if (options[i] == snapshot.activeCodecSpecific1) checked = i;
         }
         long[] finalOptions = options;
-        new AlertDialog.Builder(context)
-                .setTitle(Strings.QUALITY_OPTION_TITLE)
-                .setSingleChoiceItems(entries, checked, (DialogInterface dlg, int which) -> {
-                    dlg.dismiss();
-                    long picked = finalOptions[which];
-                    CodecRequest req = CodecRequest.fromActive(snapshot)
-                            .withSpecific1(picked).build();
-                    applyWrite(sub, req);
-                })
-                .setNegativeButton(android.R.string.cancel, null)
-                .show();
+        Context dialogContext = resolveLiveDialogContext(sub);
+        if (dialogContext == null) {
+            MLog.w("showQualityPicker skipped: no live activity context");
+            return;
+        }
+        try {
+            new AlertDialog.Builder(dialogContext)
+                    .setTitle(Strings.QUALITY_OPTION_TITLE)
+                    .setSingleChoiceItems(entries, checked, (DialogInterface dlg, int which) -> {
+                        dlg.dismiss();
+                        long picked = finalOptions[which];
+                        CodecRequest req = CodecRequest.fromActive(snapshot)
+                                .withSpecific1(picked).build();
+                        applyWrite(sub, req);
+                    })
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show();
+        } catch (Throwable t) {
+            MLog.e("showQualityPicker dialog.show failed", t);
+            Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+        }
     }
 
     private void showSampleRatePicker(Subscription sub) {
@@ -184,19 +206,50 @@ public final class CodecController {
             if (rates[i] == activeHz) checked = i;
         }
         int[] finalRates = rates;
-        new AlertDialog.Builder(context)
-                .setTitle(Strings.SAMPLE_RATE_OPTION_TITLE)
-                .setSingleChoiceItems(entries, checked, (DialogInterface dlg, int which) -> {
-                    dlg.dismiss();
-                    int hz = finalRates[which];
-                    int bit = sampleRateHzToBit(hz);
-                    if (bit < 0) return;
-                    CodecRequest req = CodecRequest.fromActive(snapshot)
-                            .withSampleRate(bit).build();
-                    applyWrite(sub, req);
-                })
-                .setNegativeButton(android.R.string.cancel, null)
-                .show();
+        Context dialogContext = resolveLiveDialogContext(sub);
+        if (dialogContext == null) {
+            MLog.w("showSampleRatePicker skipped: no live activity context");
+            return;
+        }
+        try {
+            new AlertDialog.Builder(dialogContext)
+                    .setTitle(Strings.SAMPLE_RATE_OPTION_TITLE)
+                    .setSingleChoiceItems(entries, checked, (DialogInterface dlg, int which) -> {
+                        dlg.dismiss();
+                        int hz = finalRates[which];
+                        int bit = sampleRateHzToBit(hz);
+                        if (bit < 0) return;
+                        CodecRequest req = CodecRequest.fromActive(snapshot)
+                                .withSampleRate(bit).build();
+                        applyWrite(sub, req);
+                    })
+                    .setNegativeButton(android.R.string.cancel, null)
+                    .show();
+        } catch (Throwable t) {
+            MLog.e("showSampleRatePicker dialog.show failed", t);
+            Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private static Context resolveLiveDialogContext(Subscription sub) {
+        Context ui = sub != null && sub.prefs != null ? sub.prefs.uiContext : null;
+        Activity activity = findActivity(ui);
+        if (activity == null) return null;
+        if (activity.isFinishing()) return null;
+        if (android.os.Build.VERSION.SDK_INT >= 17 && activity.isDestroyed()) return null;
+        return ui;
+    }
+
+    private static Activity findActivity(Context ctx) {
+        Context cur = ctx;
+        while (cur != null) {
+            if (cur instanceof Activity) return (Activity) cur;
+            if (!(cur instanceof ContextWrapper)) return null;
+            Context next = ((ContextWrapper) cur).getBaseContext();
+            if (next == cur) return null;
+            cur = next;
+        }
+        return null;
     }
 
     /** Resolve {@code Preference.OnPreferenceClickListener} (1-arg, returns boolean). */

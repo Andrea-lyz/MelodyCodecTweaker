@@ -121,7 +121,7 @@ public final class CodecBlockBuilder {
 
         MLog.event("codec_block.inserted", "order", order,
                 "wrapped", wrapInCategory, "remember", includeRemember);
-        return new CodecPreferences(category, codecDisplay, quality, sampleRate, remember);
+        return new CodecPreferences(context, category, codecDisplay, quality, sampleRate, remember);
     }
 
     /** Backwards-compatible overload: wrap in category, include remember toggle. */
@@ -148,11 +148,15 @@ public final class CodecBlockBuilder {
     private static Object findFirstOfType(Object container, String suffix) {
         if (container == null) return null;
         int count = PrefRef.getPreferenceCount(container);
+        Object fallback = null;
         for (int i = 0; i < count; i++) {
             Object pref = PrefRef.getPreference(container, i);
             if (pref == null) continue;
             String name = pref.getClass().getName();
-            if (matchesSuffix(name, suffix)) return pref;
+            if (matchesSuffix(name, suffix)) {
+                if (PrefRef.getLayoutResource(pref) != 0) return pref;
+                if (fallback == null) fallback = pref;
+            }
         }
         for (int i = 0; i < count; i++) {
             Object pref = PrefRef.getPreference(container, i);
@@ -160,21 +164,33 @@ public final class CodecBlockBuilder {
             int childCount = PrefRef.getPreferenceCount(pref);
             if (childCount > 0) {
                 Object found = findFirstOfType(pref, suffix);
-                if (found != null) return found;
+                if (found != null && PrefRef.getLayoutResource(found) != 0) return found;
+                if (fallback == null) fallback = found;
             }
         }
-        return null;
+        return fallback;
     }
 
     private static boolean matchesSuffix(String className, String suffix) {
         if (className == null) return false;
+        if (suffix.equals("Preference")) {
+            // OneSpace has custom top-level rows such as OneSpaceHeaderPreference. Cloning
+            // their layout makes our injected rows render as a blank white block. Prefer the
+            // regular COUI rows used by "noise menu" / "more settings" instead.
+            if (className.contains("COUIJumpPreference")
+                    || className.contains("COUIMenuPreference")
+                    || className.contains("COUIPreference")) {
+                return !className.contains("Category")
+                        && !className.contains("Switch")
+                        && !className.contains("List")
+                        && !className.contains("Group");
+            }
+            return "androidx.preference.Preference".equals(className);
+        }
         if (className.endsWith("." + suffix)) return true;
         if (className.endsWith(suffix)) return true;
         if (suffix.equals("SwitchPreference") && className.contains("SwitchPreference")) return true;
         if (suffix.equals("PreferenceCategory") && className.contains("PreferenceCategory")) return true;
-        if (suffix.equals("Preference") && className.contains("Preference")
-                && !className.contains("Category") && !className.contains("Switch")
-                && !className.contains("List") && !className.contains("Group")) return true;
         return false;
     }
 
