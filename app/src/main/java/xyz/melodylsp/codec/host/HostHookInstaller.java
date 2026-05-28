@@ -61,7 +61,7 @@ public final class HostHookInstaller {
 
     private final MelodyCodecLspEntry module;
     private final ClassLoader classLoader;
-    private final Set<Object> attachedFragments =
+    private final Set<Object> attachedScreens =
             java.util.Collections.newSetFromMap(new IdentityHashMap<>());
     private CodecController controller;
 
@@ -146,8 +146,9 @@ public final class HostHookInstaller {
     private void scheduleSurfaceDispatch(Object fragment, int attempt) {
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             if (controller == null) return;
-            if (attachedFragments.contains(fragment)) return;
             try {
+                Object screen = PrefRef.getPreferenceScreen(fragment);
+                if (screen != null && attachedScreens.contains(screen)) return;
                 if (dispatchSurface(fragment)) return;
             } catch (Throwable t) {
                 MLog.e("Surface dispatch failed", t);
@@ -172,22 +173,17 @@ public final class HostHookInstaller {
         Object screen = PrefRef.getPreferenceScreen(fragment);
         if (screen == null) return false;
 
-        if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null) {
-            // Already injected on this screen; mark and stop.
-            attachedFragments.add(fragment);
+        if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null
+                || PrefRef.findPreference(screen, "melody_codec_lsp_quality") != null) {
+            // Already injected on this screen.
+            attachedScreens.add(screen);
             return true;
         }
 
-        // DetailMain main panel & MoreSetting (more-setting screen) both place the Hi-Res item
-        // by Class.simpleName ("HiQualityAudioItem"). DetailMain stamps it inside a "sound"
-        // PreferenceCategory that lives at the top-level of the screen, MoreSetting stamps it
-        // directly. Either way, findPreference recurses into nested PreferenceGroups, so we can
-        // probe the whole screen with a single call.
         if (PrefRef.findPreference(screen, KEY_HIRES_ITEM) != null) {
             return injectAfterHires(fragment, screen);
         }
 
-        // OneSpace surface: noise_menu / more_setting categories.
         if (PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY) != null
                 || PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY) != null) {
             return injectIntoOneSpace(fragment, screen);
@@ -196,13 +192,6 @@ public final class HostHookInstaller {
         return false;
     }
 
-    /**
-     * Insert the codec block immediately after the Hi-Res anchor. Used by both DetailMain
-     * (where the anchor lives inside a "sound" PreferenceCategory) and MoreSetting (where it
-     * is a top-level COUIPreferenceCategory). For nested anchors we add to the same parent
-     * group so the codec block appears as a sibling underneath; for top-level anchors we add
-     * to the root screen.
-     */
     private boolean injectAfterHires(Object fragment, Object screen) {
         Object anchor = PrefRef.findPreference(screen, KEY_HIRES_ITEM);
         if (anchor == null) return false;
@@ -220,10 +209,13 @@ public final class HostHookInstaller {
             MLog.w("Hi-Res-anchored insertion: mac unresolved; skip");
             return false;
         }
-        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(themedContext, parent, targetOrder);
+        // DetailMain wants the wrapped category card with remember toggle.
+        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(
+                themedContext, parent, targetOrder,
+                /* wrapInCategory= */ true, /* includeRemember= */ true);
         if (prefs == null) return false;
         controller.attach(mac, prefs, fragment);
-        attachedFragments.add(fragment);
+        attachedScreens.add(screen);
         MLog.event("hires_anchored.injected", "mac_len", mac.length(),
                 "order", targetOrder, "fragment", fragment.getClass().getName());
         return true;
@@ -254,13 +246,14 @@ public final class HostHookInstaller {
             MLog.w("OneSpace mac unresolved; skip");
             return false;
         }
-        // OneSpace renders extra padding around every PreferenceCategory; nesting a wrapper
-        // pushes the toggle off-screen. Flatten the items as siblings of pref_more_setting.
+        // OneSpace is for instant switching only — flatten (no Category wrapper) and skip the
+        // remember toggle. Persistence is owned by DetailMain's panel.
         CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(
-                themedContext, screen, targetOrder, /* wrapInCategory= */ false);
+                themedContext, screen, targetOrder,
+                /* wrapInCategory= */ false, /* includeRemember= */ false);
         if (prefs == null) return false;
         controller.attach(mac, prefs, fragment);
-        attachedFragments.add(fragment);
+        attachedScreens.add(screen);
         MLog.event("onespace.injected", "mac_len", mac.length(), "order", targetOrder);
         return true;
     }

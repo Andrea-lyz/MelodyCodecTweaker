@@ -5,21 +5,18 @@ import android.content.Context;
 import xyz.melodylsp.codec.util.MLog;
 
 /**
- * Builds the codec block (one {@code PreferenceCategory} containing
- * {@code Quality / SampleRate / Remember_Toggle}) using only the host classpath.
+ * Builds the codec block (Quality / SampleRate / Remember Toggle) using only host classpath
+ * types. <strong>No ListPreference is used</strong>: the host APK is R8-minified and R8
+ * stripped {@code ListPreference.setEntries / setEntryValues} entirely (they are unused in
+ * the host's own code), so the moment the user taps a {@code ListPreference} the dialog
+ * fragment crashes with {@code "ListPreference requires an entries array and an entryValues
+ * array."} regardless of how we try to populate it. We dodge the entire dialog path by using
+ * plain {@code Preference} rows whose click handler is a hand-rolled {@code AlertDialog}
+ * (see {@link CodecController#showPickerDialog}). Same UX, none of the R8 fallout.
  *
- * <p>The category title is the merged {@code "蓝牙音质 · {codec_name}"}; the standalone
- * "current codec" item from previous iterations is gone — having both was redundant and
- * pushed the toggle below the screen. The {@link CodecController} updates the category title
- * directly when codec status changes.
- *
- * <p>Visual fidelity: COUI Preferences pull their layoutResource from a styleable attribute
- * resolved against the host {@code preferenceTheme}. Programmatically calling
- * {@code new COUIPreferenceCategory(ctx)} from a non-themed context lands on the framework
- * default layout — visible as a centred grey title with no leading inset (the screenshot the
- * user reported). To dodge this we clone the {@code layoutResource} / {@code widgetLayout}
- * from a sibling Preference of the same kind that already exists on the screen, so our items
- * inherit the host's exact visual style.</p>
+ * <p>OneSpace gets the items flattened into the screen (no Category wrapper, no remember
+ * toggle — that surface is for instant switching, persistence belongs in DetailMain).
+ * DetailMain gets the full block wrapped in a Category card.</p>
  */
 public final class CodecBlockBuilder {
 
@@ -28,13 +25,13 @@ public final class CodecBlockBuilder {
             "com.oplus.melody.common.widget.MelodyCOUIPreferenceCategory";
     private static final String COUI_PREFERENCE_CATEGORY =
             "com.coui.appcompat.preference.COUIPreferenceCategory";
-    private static final String COUI_LIST_PREFERENCE =
-            "com.coui.appcompat.preference.COUIListPreference";
+    private static final String COUI_PREFERENCE =
+            "com.coui.appcompat.preference.COUIPreference";
     private static final String COUI_SWITCH_PREFERENCE =
             "com.coui.appcompat.preference.COUISwitchPreference";
 
     private static final String ANDX_PREFERENCE_CATEGORY = "androidx.preference.PreferenceCategory";
-    private static final String ANDX_LIST_PREFERENCE = "androidx.preference.ListPreference";
+    private static final String ANDX_PREFERENCE = "androidx.preference.Preference";
     private static final String ANDX_SWITCH_PREFERENCE_COMPAT =
             "androidx.preference.SwitchPreferenceCompat";
 
@@ -42,29 +39,19 @@ public final class CodecBlockBuilder {
     }
 
     /**
-     * Insert the codec block into {@code container} at the position {@code order}.
+     * Insert the codec block into {@code container}.
      *
-     * <p>{@code wrapInCategory} controls whether to wrap the items in a
-     * {@code PreferenceCategory}. DetailMain wants the wrapper because the surrounding screen
-     * paints PreferenceCategory groups as visually distinct white cards. OneSpace does not —
-     * the OneSpace bottom-sheet renders extra padding above each Category which throws off
-     * the layout (the user reports a too-large gap between the existing "通用设置" card and
-     * the codec block); flattening the items as siblings of the existing top-level
-     * Preferences lets them inherit the same visual treatment.</p>
-     *
-     * <p>The returned {@link CodecPreferences} bag still has a {@code codecDisplay} field —
-     * for the wrapped variant it points at the category, for the flat variant it points at
-     * the first non-null Preference (quality / sampleRate / remember in that order). Either
-     * way {@code PrefRef.setTitle} on it will refresh the merged "{@code 蓝牙音质 · LHDC}"
-     * header. The flat variant uses the first Preference's title as the header.</p>
+     * @param wrapInCategory   true → DetailMain card style (PreferenceCategory wrapper).
+     * @param includeRemember  true → include the "remember this earphone" SwitchPreference.
      */
     public static CodecPreferences buildAndInsert(
-            Context context, Object container, int order, boolean wrapInCategory) {
+            Context context, Object container, int order,
+            boolean wrapInCategory, boolean includeRemember) {
         Object styleSource = container;
         Object categoryTemplate = findFirstOfType(styleSource, "PreferenceCategory");
-        Object listTemplate = findFirstOfType(styleSource, "ListPreference");
+        Object prefTemplate = findFirstOfType(styleSource, "Preference");
         Object switchTemplate = findFirstOfType(styleSource, "SwitchPreference");
-        if (switchTemplate == null) switchTemplate = findFirstOfType(styleSource, "Preference");
+        if (switchTemplate == null) switchTemplate = prefTemplate;
 
         Object category = null;
         Object insertionParent = container;
@@ -82,14 +69,14 @@ public final class CodecBlockBuilder {
             PrefRef.setOrder(category, order);
             PrefRef.addPreference(container, category);
             insertionParent = category;
-            firstChildOrder = 0; // children of a Category are positioned by their own order.
+            firstChildOrder = 0;
         }
 
-        Object quality = newOf(context, COUI_LIST_PREFERENCE, ANDX_LIST_PREFERENCE);
-        if (quality == null) {
-            MLog.w("buildAndInsert: ListPreference unavailable, skipping quality option");
-        } else {
-            cloneVisualStyleFrom(quality, listTemplate);
+        // Plain Preference rows for quality and sample rate: their click handlers will pop a
+        // hand-rolled AlertDialog instead of going through ListPreference's R8-stripped path.
+        Object quality = newOf(context, COUI_PREFERENCE, ANDX_PREFERENCE);
+        if (quality != null) {
+            cloneVisualStyleFrom(quality, prefTemplate);
             PrefRef.setKey(quality, "melody_codec_lsp_quality");
             PrefRef.setTitle(quality, Strings.QUALITY_OPTION_TITLE);
             PrefRef.setVisible(quality, false);
@@ -99,9 +86,9 @@ public final class CodecBlockBuilder {
             PrefRef.addPreference(insertionParent, quality);
         }
 
-        Object sampleRate = newOf(context, COUI_LIST_PREFERENCE, ANDX_LIST_PREFERENCE);
+        Object sampleRate = newOf(context, COUI_PREFERENCE, ANDX_PREFERENCE);
         if (sampleRate != null) {
-            cloneVisualStyleFrom(sampleRate, listTemplate);
+            cloneVisualStyleFrom(sampleRate, prefTemplate);
             PrefRef.setKey(sampleRate, "melody_codec_lsp_sample_rate");
             PrefRef.setTitle(sampleRate, Strings.SAMPLE_RATE_OPTION_TITLE);
             PrefRef.setVisible(sampleRate, false);
@@ -111,41 +98,45 @@ public final class CodecBlockBuilder {
             PrefRef.addPreference(insertionParent, sampleRate);
         }
 
-        Object remember = newOf(context, COUI_SWITCH_PREFERENCE, ANDX_SWITCH_PREFERENCE_COMPAT);
-        if (remember != null) {
-            cloneVisualStyleFrom(remember, switchTemplate);
-            PrefRef.setKey(remember, "melody_codec_lsp_remember");
-            PrefRef.setTitle(remember, Strings.REMEMBER_TOGGLE_TITLE);
-            PrefRef.setSummary(remember, Strings.REMEMBER_TOGGLE_SUMMARY);
-            PrefRef.setIconSpaceReserved(remember, false);
-            PrefRef.setPersistent(remember, false);
-            PrefRef.setOrder(remember, firstChildOrder + 2);
-            PrefRef.addPreference(insertionParent, remember);
+        Object remember = null;
+        if (includeRemember) {
+            remember = newOf(context, COUI_SWITCH_PREFERENCE, ANDX_SWITCH_PREFERENCE_COMPAT);
+            if (remember != null) {
+                cloneVisualStyleFrom(remember, switchTemplate);
+                PrefRef.setKey(remember, "melody_codec_lsp_remember");
+                PrefRef.setTitle(remember, Strings.REMEMBER_TOGGLE_TITLE);
+                PrefRef.setSummary(remember, Strings.REMEMBER_TOGGLE_SUMMARY);
+                PrefRef.setIconSpaceReserved(remember, false);
+                PrefRef.setPersistent(remember, false);
+                PrefRef.setOrder(remember, firstChildOrder + 2);
+                PrefRef.addPreference(insertionParent, remember);
+            }
         }
 
-        // codecDisplay holds whichever Preference the controller will mutate to refresh the
-        // "蓝牙音质 · LHDC" header. With a category wrapper it's the category itself; in the
-        // flat layout it's the first child.
         Object codecDisplay;
-        if (category != null) {
-            codecDisplay = category;
-        } else if (quality != null) {
-            codecDisplay = quality;
-        } else if (sampleRate != null) {
-            codecDisplay = sampleRate;
-        } else {
-            codecDisplay = remember;
-        }
-        MLog.event("codec_block.inserted", "order", order, "wrapped", wrapInCategory);
+        if (category != null) codecDisplay = category;
+        else if (quality != null) codecDisplay = quality;
+        else if (sampleRate != null) codecDisplay = sampleRate;
+        else codecDisplay = remember;
+
+        MLog.event("codec_block.inserted", "order", order,
+                "wrapped", wrapInCategory, "remember", includeRemember);
         return new CodecPreferences(category, codecDisplay, quality, sampleRate, remember);
     }
 
-    /** Convenience overload retaining wrap-in-category behaviour for older callers. */
+    /** Backwards-compatible overload: wrap in category, include remember toggle. */
     public static CodecPreferences buildAndInsert(Context context, Object container, int order) {
-        return buildAndInsert(context, container, order, /* wrapInCategory= */ true);
+        return buildAndInsert(context, container, order,
+                /* wrapInCategory= */ true, /* includeRemember= */ true);
     }
 
-    /** Copy {@code layoutResource} and {@code widgetLayoutResource} from {@code from} to {@code to}. */
+    /** Wrap-in-category overload (legacy). */
+    public static CodecPreferences buildAndInsert(
+            Context context, Object container, int order, boolean wrapInCategory) {
+        return buildAndInsert(context, container, order, wrapInCategory,
+                /* includeRemember= */ true);
+    }
+
     private static void cloneVisualStyleFrom(Object to, Object from) {
         if (to == null || from == null) return;
         int layout = PrefRef.getLayoutResource(from);
@@ -154,27 +145,18 @@ public final class CodecBlockBuilder {
         if (widget != 0) PrefRef.setWidgetLayoutResource(to, widget);
     }
 
-    /**
-     * Walk the children of {@code container} (recursively into nested PreferenceGroup
-     * subclasses) looking for the first Preference whose runtime class name ends with
-     * {@code suffix}. Used for visual style cloning. Returns {@code null} if none found.
-     */
     private static Object findFirstOfType(Object container, String suffix) {
         if (container == null) return null;
         int count = PrefRef.getPreferenceCount(container);
-        // Phase 1: shallow scan — if we find a sibling at depth 0 that is the closest visual
-        // match (same hierarchy as the items we're about to insert) prefer it.
         for (int i = 0; i < count; i++) {
             Object pref = PrefRef.getPreference(container, i);
             if (pref == null) continue;
             String name = pref.getClass().getName();
             if (matchesSuffix(name, suffix)) return pref;
         }
-        // Phase 2: descend into nested groups.
         for (int i = 0; i < count; i++) {
             Object pref = PrefRef.getPreference(container, i);
             if (pref == null) continue;
-            // Only descend if the child is a group — otherwise getPreferenceCount is undefined.
             int childCount = PrefRef.getPreferenceCount(pref);
             if (childCount > 0) {
                 Object found = findFirstOfType(pref, suffix);
@@ -186,23 +168,16 @@ public final class CodecBlockBuilder {
 
     private static boolean matchesSuffix(String className, String suffix) {
         if (className == null) return false;
-        // ClassName.endsWith covers both "androidx.preference.PreferenceCategory" and
-        // OPPO's "com.coui...COUIPreferenceCategory" / "MelodyCOUIPreferenceCategory".
         if (className.endsWith("." + suffix)) return true;
         if (className.endsWith(suffix)) return true;
-        // Match COUIListPreference for "ListPreference" suffix; SwitchPreferenceCompat for
-        // "SwitchPreference" suffix.
-        if (suffix.equals("ListPreference") && className.contains("ListPreference")) return true;
         if (suffix.equals("SwitchPreference") && className.contains("SwitchPreference")) return true;
         if (suffix.equals("PreferenceCategory") && className.contains("PreferenceCategory")) return true;
+        if (suffix.equals("Preference") && className.contains("Preference")
+                && !className.contains("Category") && !className.contains("Switch")
+                && !className.contains("List") && !className.contains("Group")) return true;
         return false;
     }
 
-    /**
-     * Try class names in order, preferring the {@code (Context, AttributeSet)} constructor
-     * which lets COUI / androidx pull default style attributes from the host theme. Falls
-     * through to the single-arg constructor when no AttributeSet ctor exists.
-     */
     private static Object newOf(Context context, String... classNames) {
         ClassLoader cl = context.getClassLoader();
         for (String name : classNames) {

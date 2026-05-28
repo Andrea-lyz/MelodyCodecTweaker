@@ -1,7 +1,9 @@
 package xyz.melodylsp.codec.host;
 
+import android.app.AlertDialog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
@@ -11,11 +13,8 @@ import android.widget.Toast;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,8 +31,12 @@ import xyz.melodylsp.codec.util.MLog;
  * controller refreshes UI state from {@code BluetoothA2dp.getCodecStatus} and routes write
  * intents through {@link CodecBridgeClient}.
  *
- * <p>Every {@code androidx.preference} access goes through {@link PrefRef} reflection because
- * the host APK is R8-minified.</p>
+ * <p>Quality and sample-rate rows are plain {@code Preference} entries whose click handler
+ * pops a hand-rolled {@link AlertDialog}. We deliberately avoid {@code ListPreference}: R8
+ * stripped {@code setEntries} / {@code setEntryValues} from the host APK because the host
+ * never calls them in code, so the AOSP {@code ListPreferenceDialogFragmentCompat} crashes
+ * the moment the user taps the row, regardless of how we try to populate the entries by
+ * reflection.</p>
  */
 public final class CodecController {
 
@@ -65,84 +68,162 @@ public final class CodecController {
         this.bridge.addSnapshotListener(this::onPushedSnapshot);
     }
 
-    /**
-     * Bind a {@link CodecPreferences} bag to a fragment lifecycle. {@code fragment} is the host
-     * Fragment instance; we reflectively call {@code getLifecycle().addObserver(...)} so we
-     * never compile-time-reference {@code LifecycleOwner}.
-     */
+    /** Bind a {@link CodecPreferences} bag to a fragment lifecycle. */
     public void attach(String mac, CodecPreferences pref, Object fragment) {
         Subscription sub = new Subscription(mac, pref);
         subscriptions.put(fragment, sub);
 
-        wireListeners(sub);
+        wireClickListeners(sub);
+        wireRememberToggle(sub);
         sub.registerReceiver();
         mainHandler.post(() -> refreshSnapshot(sub));
-
-        // Best-effort lifecycle observation: when we can resolve a Lifecycle we add a hand-rolled
-        // observer that mirrors STARTED/STOPPED via reflection. Failures degrade silently — we
-        // already eagerly registered the receiver above.
-        try {
-            Method getLifecycle = fragment.getClass().getMethod("getLifecycle");
-            Object lifecycle = getLifecycle.invoke(fragment);
-            ClassLoader cl = fragment.getClass().getClassLoader();
-            Class<?> observerCls = Class.forName("androidx.lifecycle.LifecycleEventObserver", false, cl);
-            Object observer = Proxy.newProxyInstance(cl, new Class[]{observerCls},
-                    (proxy, method, args) -> {
-                        if ("onStateChanged".equals(method.getName()) && args != null && args.length == 2) {
-                            Object event = args[1];
-                            String eventName = event != null ? event.toString() : "";
-                            if ("ON_DESTROY".equals(eventName)) {
-                                subscriptions.remove(fragment);
-                                sub.unregisterReceiver();
-                            }
-                        }
-                        return null;
-                    });
-            Method add = lifecycle.getClass().getMethod("addObserver",
-                    Class.forName("androidx.lifecycle.LifecycleObserver", false, cl));
-            add.invoke(lifecycle, observer);
-        } catch (Throwable t) {
-            MLog.w("attach lifecycle observer failed; receiver will outlive fragment", t);
-        }
     }
 
-    private void wireListeners(Subscription sub) {
+    /**
+     * Wire up click listeners on the quality and sample-rate Preferences. Tap → pop a
+     * hand-rolled AlertDialog with the current options. We resolve
+     * {@code OnPreferenceClickListener} via reflection because the inner-class FQN is
+     * R8-renamed inside the host APK.
+     */
+    private void wireClickListeners(Subscription sub) {
         ClassLoader cl = context.getClassLoader();
-        // The host APK is R8-minified and the inner interface
-        // androidx.preference.Preference$OnPreferenceChangeListener has been renamed. Probe for
-        // it by walking the Preference class for 1-arg setters whose only parameter is an
-        // interface declaring a single boolean method (Preference, Object) -> boolean.
-        Class<?> changeListenerCls = resolveChangeListenerInterface(cl, sub.prefs.qualityOption);
-        if (changeListenerCls == null) {
-            MLog.w("OnPreferenceChangeListener interface not resolvable; UI is read-only");
+        Class<?> clickListenerCls = resolveClickListenerInterface(cl, sub.prefs.qualityOption);
+        if (clickListenerCls == null) {
+            MLog.w("OnPreferenceClickListener interface not resolvable; UI is read-only");
             return;
         }
-        Object qualityListener = Proxy.newProxyInstance(cl, new Class[]{changeListenerCls},
+        Object qualityListener = Proxy.newProxyInstance(cl, new Class[]{clickListenerCls},
                 (proxy, method, args) -> {
-                    if (args == null || args.length < 2) return false;
-                    return handleQualityChange(sub, args[1]);
+                    showQualityPicker(sub);
+                    return true;
                 });
-        Object sampleListener = Proxy.newProxyInstance(cl, new Class[]{changeListenerCls},
+        Object sampleListener = Proxy.newProxyInstance(cl, new Class[]{clickListenerCls},
                 (proxy, method, args) -> {
-                    if (args == null || args.length < 2) return false;
-                    return handleSampleRateChange(sub, args[1]);
+                    showSampleRatePicker(sub);
+                    return true;
                 });
-        Object rememberListener = Proxy.newProxyInstance(cl, new Class[]{changeListenerCls},
+        invokeSetClickListener(sub.prefs.qualityOption, qualityListener, clickListenerCls);
+        invokeSetClickListener(sub.prefs.sampleRateOption, sampleListener, clickListenerCls);
+    }
+
+    /** Wire the remember toggle's change handler. Safe no-op when the toggle is absent. */
+    private void wireRememberToggle(Subscription sub) {
+        if (sub.prefs.rememberToggle == null) return;
+        ClassLoader cl = context.getClassLoader();
+        Class<?> changeListenerCls = resolveChangeListenerInterface(cl, sub.prefs.rememberToggle);
+        if (changeListenerCls == null) return;
+        Object listener = Proxy.newProxyInstance(cl, new Class[]{changeListenerCls},
                 (proxy, method, args) -> {
                     if (args == null || args.length < 2) return false;
                     return handleRememberChange(sub, args[1]);
                 });
-
-        invokeSetChangeListener(sub.prefs.qualityOption, qualityListener, changeListenerCls);
-        invokeSetChangeListener(sub.prefs.sampleRateOption, sampleListener, changeListenerCls);
-        invokeSetChangeListener(sub.prefs.rememberToggle, rememberListener, changeListenerCls);
+        invokeSetChangeListener(sub.prefs.rememberToggle, listener, changeListenerCls);
     }
 
     /**
-     * Discover the {@code OnPreferenceChangeListener} interface class by walking
-     * {@code androidx.preference.Preference} for a 1-arg setter whose parameter is an
-     * interface with a single abstract method that returns boolean.
+     * Pop an AlertDialog letting the user pick a quality step. Picks a sensible options list
+     * even when AOSP {@code getCodecsSelectableCapabilities} returned nothing for this codec
+     * (vendor codec quirk on every OPPO LHDC variant).
      */
+    private void showQualityPicker(Subscription sub) {
+        CodecSnapshot snapshot = lastSnapshot.get();
+        if (snapshot == null) {
+            Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        long[] options = snapshot.selectableCodecSpecific1;
+        if (options == null || options.length == 0) {
+            options = CodecLabelTable.qualityFallback(snapshot.activeCodecType);
+        }
+        if (options == null || options.length == 0) {
+            Toast.makeText(context,
+                    "当前编解码器不支持播放质量调整", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        CharSequence[] entries = new CharSequence[options.length];
+        int checked = -1;
+        for (int i = 0; i < options.length; i++) {
+            entries[i] = CodecLabelTable.qualityLabel(context, snapshot.activeCodecType, options[i]);
+            if (options[i] == snapshot.activeCodecSpecific1) checked = i;
+        }
+        long[] finalOptions = options;
+        new AlertDialog.Builder(context)
+                .setTitle(Strings.QUALITY_OPTION_TITLE)
+                .setSingleChoiceItems(entries, checked, (DialogInterface dlg, int which) -> {
+                    dlg.dismiss();
+                    long picked = finalOptions[which];
+                    CodecRequest req = CodecRequest.fromActive(snapshot)
+                            .withSpecific1(picked).build();
+                    applyWrite(sub, req);
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void showSampleRatePicker(Subscription sub) {
+        CodecSnapshot snapshot = lastSnapshot.get();
+        if (snapshot == null) {
+            Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        int rateMask = snapshot.selectableSampleRateMask;
+        if (rateMask == 0 || CodecSnapshot.decodeSampleRateBits(rateMask).length == 0) {
+            rateMask = sampleRateFallbackMask(snapshot.activeCodecType, snapshot.activeSampleRate);
+        }
+        int[] rates = CodecSnapshot.decodeSampleRateBits(rateMask);
+        if (rates.length == 0) {
+            Toast.makeText(context,
+                    "当前编解码器没有可调采样率", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        CharSequence[] entries = new CharSequence[rates.length];
+        int activeHz = sampleRateBitToHz(snapshot.activeSampleRate);
+        int checked = -1;
+        for (int i = 0; i < rates.length; i++) {
+            entries[i] = CodecLabelTable.sampleRateLabel(rates[i]);
+            if (rates[i] == activeHz) checked = i;
+        }
+        int[] finalRates = rates;
+        new AlertDialog.Builder(context)
+                .setTitle(Strings.SAMPLE_RATE_OPTION_TITLE)
+                .setSingleChoiceItems(entries, checked, (DialogInterface dlg, int which) -> {
+                    dlg.dismiss();
+                    int hz = finalRates[which];
+                    int bit = sampleRateHzToBit(hz);
+                    if (bit < 0) return;
+                    CodecRequest req = CodecRequest.fromActive(snapshot)
+                            .withSampleRate(bit).build();
+                    applyWrite(sub, req);
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    /** Resolve {@code Preference.OnPreferenceClickListener} (1-arg, returns boolean). */
+    private Class<?> resolveClickListenerInterface(ClassLoader cl, Object prefSample) {
+        Class<?> prefBase = PrefRef.load(cl, "androidx.preference.Preference");
+        if (prefBase == null) return null;
+        Class<?> sampleCls = prefSample != null ? prefSample.getClass() : prefBase;
+        Class<?> cls = sampleCls;
+        while (cls != null && cls != Object.class) {
+            for (Method m : cls.getDeclaredMethods()) {
+                if (m.getParameterCount() != 1) continue;
+                Class<?> p = m.getParameterTypes()[0];
+                if (!p.isInterface()) continue;
+                Method[] ifaceMethods = p.getDeclaredMethods();
+                if (ifaceMethods.length != 1) continue;
+                Method only = ifaceMethods[0];
+                if (only.getReturnType() != boolean.class) continue;
+                if (only.getParameterCount() != 1) continue;
+                if (!prefBase.isAssignableFrom(only.getParameterTypes()[0])) continue;
+                return p;
+            }
+            cls = cls.getSuperclass();
+        }
+        return null;
+    }
+
+    /** Resolve {@code Preference.OnPreferenceChangeListener} (2-arg, returns boolean). */
     private Class<?> resolveChangeListenerInterface(ClassLoader cl, Object prefSample) {
         Class<?> prefBase = PrefRef.load(cl, "androidx.preference.Preference");
         if (prefBase == null) return null;
@@ -158,7 +239,6 @@ public final class CodecController {
                 Method only = ifaceMethods[0];
                 if (only.getReturnType() != boolean.class) continue;
                 if (only.getParameterCount() != 2) continue;
-                // First parameter should be Preference (or a subclass), second any Object.
                 if (!prefBase.isAssignableFrom(only.getParameterTypes()[0])) continue;
                 return p;
             }
@@ -167,20 +247,30 @@ public final class CodecController {
         return null;
     }
 
+    private static void invokeSetClickListener(Object pref, Object listener, Class<?> ifaceCls) {
+        invokeSetListener(pref, listener, ifaceCls, "setOnPreferenceClickListener");
+    }
+
     private static void invokeSetChangeListener(Object pref, Object listener, Class<?> ifaceCls) {
+        invokeSetListener(pref, listener, ifaceCls, "setOnPreferenceChangeListener");
+    }
+
+    private static void invokeSetListener(Object pref, Object listener, Class<?> ifaceCls,
+            String label) {
         if (pref == null || listener == null) return;
         try {
             Method m = findUnaryAcceptingType(pref.getClass(), ifaceCls);
             if (m != null) {
                 m.setAccessible(true);
                 m.invoke(pref, listener);
+            } else {
+                MLog.w(label + ": no matching setter on " + pref.getClass().getName());
             }
         } catch (Throwable t) {
-            MLog.w("setOnPreferenceChangeListener failed", t);
+            MLog.w(label + " failed", t);
         }
     }
 
-    /** Find a 1-arg method (any name, void return) accepting EXACTLY {@code paramType}. */
     private static Method findUnaryAcceptingType(Class<?> startCls, Class<?> paramType) {
         Class<?> cls = startCls;
         while (cls != null && cls != Object.class) {
@@ -188,45 +278,11 @@ public final class CodecController {
                 if (m.getParameterCount() != 1) continue;
                 if (m.isSynthetic() || m.isBridge()) continue;
                 Class<?> p = m.getParameterTypes()[0];
-                // Must match exactly. Using isAssignableFrom() in either direction picks up
-                // unrelated setters (e.g. setSummaryProvider, setOnPreferenceClickListener) that
-                // happen to take *some* interface, then ListPreference.onSetInitialValue tries to
-                // (String) cast our Proxy and crashes with ClassCastException.
                 if (p == paramType) return m;
             }
             cls = cls.getSuperclass();
         }
         return null;
-    }
-
-    private boolean handleQualityChange(Subscription sub, Object value) {
-        if (!(value instanceof CharSequence)) return false;
-        CodecSnapshot snapshot = lastSnapshot.get();
-        if (snapshot == null) return false;
-        long specific1;
-        try {
-            specific1 = Long.parseLong(value.toString());
-        } catch (NumberFormatException e) {
-            return false;
-        }
-        CodecRequest req = CodecRequest.fromActive(snapshot)
-                .withSpecific1(specific1)
-                .build();
-        applyWrite(sub, req);
-        return true;
-    }
-
-    private boolean handleSampleRateChange(Subscription sub, Object value) {
-        if (!(value instanceof CharSequence)) return false;
-        CodecSnapshot snapshot = lastSnapshot.get();
-        if (snapshot == null) return false;
-        int rateBit = decodeStoredSampleRate(value.toString(), snapshot.selectableSampleRateMask);
-        if (rateBit < 0) return false;
-        CodecRequest req = CodecRequest.fromActive(snapshot)
-                .withSampleRate(rateBit)
-                .build();
-        applyWrite(sub, req);
-        return true;
     }
 
     private boolean handleRememberChange(Subscription sub, Object value) {
@@ -314,7 +370,6 @@ public final class CodecController {
         renderSnapshot(snapshot, sub, /* fromCache= */ false);
     }
 
-    /** Called when {@link CodecBridgeClient} forwards a system-side push event. */
     private void onPushedSnapshot(CodecSnapshot snapshot) {
         if (snapshot == null || snapshot.mac == null) return;
         mainHandler.post(() -> {
@@ -328,12 +383,14 @@ public final class CodecController {
     }
 
     private void renderUnknown(Subscription sub) {
-        // codecDisplay points at the category itself; mutating its title gives us the merged
-        // "蓝牙音质 · LHDC" header without needing a separate Preference row.
-        PrefRef.setTitle(sub.prefs.category, Strings.CODEC_BLOCK_TITLE);
+        if (sub.prefs.codecDisplay != null) {
+            PrefRef.setTitle(sub.prefs.codecDisplay, Strings.CODEC_BLOCK_TITLE);
+        }
         PrefRef.setVisible(sub.prefs.qualityOption, false);
         PrefRef.setVisible(sub.prefs.sampleRateOption, false);
-        PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+        if (sub.prefs.rememberToggle != null) {
+            PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+        }
     }
 
     private void renderSnapshot(CodecSnapshot snapshot, Subscription sub, boolean fromCache) {
@@ -346,105 +403,68 @@ public final class CodecController {
         } else {
             header = Strings.CODEC_BLOCK_TITLE + " · " + codecName;
         }
-        PrefRef.setTitle(sub.prefs.category, header);
+        if (sub.prefs.codecDisplay != null) {
+            PrefRef.setTitle(sub.prefs.codecDisplay, header);
+        }
 
         renderQuality(snapshot, sub);
         renderSampleRate(snapshot, sub);
-        PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+        if (sub.prefs.rememberToggle != null) {
+            PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+        }
     }
 
     private void renderQuality(CodecSnapshot snapshot, Subscription sub) {
-        long[] selectable = snapshot.selectableCodecSpecific1;
         Object q = sub.prefs.qualityOption;
         if (q == null) return;
-        // Hide Quality option for codecs that do not expose quality steps (e.g. SBC default).
         if (!CodecLabelTable.isQualityCapable(snapshot.activeCodecType)) {
             PrefRef.setVisible(q, false);
             return;
         }
-        // AOSP getCodecStatus reports an empty selectableCodecSpecific1 for vendor codecs
-        // whose capability set was not registered with the system codec manager — which is
-        // every OPPO Vendor LHDC variant we know about. Fall back to the protocol-defined
-        // step list (LDAC: 1000/1001/1002, LHDC: V1/V2/V3/V5) so the user still sees the
-        // dropdown. The bridge writes the selected value through to A2DP, and the kernel
-        // accepts it as long as the bits are valid for that vendor codec.
-        if (selectable == null || selectable.length == 0) {
-            selectable = CodecLabelTable.qualityFallback(snapshot.activeCodecType);
+        long[] options = snapshot.selectableCodecSpecific1;
+        if (options == null || options.length == 0) {
+            options = CodecLabelTable.qualityFallback(snapshot.activeCodecType);
         }
-        if (selectable.length == 0) {
+        if (options.length == 0) {
             PrefRef.setVisible(q, false);
             return;
         }
-        CharSequence[] entries = new CharSequence[selectable.length];
-        CharSequence[] values = new CharSequence[selectable.length];
-        for (int i = 0; i < selectable.length; i++) {
-            entries[i] = CodecLabelTable.qualityLabel(context, snapshot.activeCodecType, selectable[i]);
-            values[i] = String.valueOf(selectable[i]);
+        // Show the current quality as the row's summary, exact match or fallback.
+        boolean known = false;
+        for (long opt : options) {
+            if (opt == snapshot.activeCodecSpecific1) { known = true; break; }
         }
-        PrefRef.setEntries(q, entries);
-        PrefRef.setEntryValues(q, values);
-        String currentValue = String.valueOf(snapshot.activeCodecSpecific1);
-        if (!Arrays.asList(values).contains(currentValue)) {
-            PrefRef.setSummary(q, String.format(Strings.QUALITY_UNKNOWN_VALUE_FORMAT, currentValue));
-        } else {
-            PrefRef.setValue(q, currentValue);
+        if (known) {
             PrefRef.setSummary(q, CodecLabelTable.qualityLabel(
                     context, snapshot.activeCodecType, snapshot.activeCodecSpecific1));
+        } else {
+            PrefRef.setSummary(q,
+                    String.format(Strings.QUALITY_UNKNOWN_VALUE_FORMAT, snapshot.activeCodecSpecific1));
         }
         PrefRef.setVisible(q, true);
     }
 
     private void renderSampleRate(CodecSnapshot snapshot, Subscription sub) {
-        int rateMask = snapshot.selectableSampleRateMask;
-        // AOSP also leaves selectableSampleRateMask = 0 for vendor codecs. Fall back to the
-        // sample rates the protocol allows for that codec family. LHDC V5 is the only codec
-        // exposed by this build that goes beyond 96 kHz, so the fallback list is union'd
-        // with the active rate bit so we never hide a working option.
-        if (rateMask == 0 || CodecSnapshot.decodeSampleRateBits(rateMask).length == 0) {
-            rateMask = sampleRateFallbackMask(snapshot.activeCodecType, snapshot.activeSampleRate);
-        }
-        int[] rates = CodecSnapshot.decodeSampleRateBits(rateMask);
         Object r = sub.prefs.sampleRateOption;
         if (r == null) return;
-        if (rates.length == 0) {
-            PrefRef.setVisible(r, false);
-            return;
-        }
-        List<CharSequence> entryList = new ArrayList<>(rates.length);
-        List<CharSequence> valueList = new ArrayList<>(rates.length);
-        for (int rate : rates) {
-            entryList.add(CodecLabelTable.sampleRateLabel(rate));
-            valueList.add(String.valueOf(rate));
-        }
-        PrefRef.setEntries(r, entryList.toArray(new CharSequence[0]));
-        PrefRef.setEntryValues(r, valueList.toArray(new CharSequence[0]));
         int activeHz = sampleRateBitToHz(snapshot.activeSampleRate);
         if (activeHz > 0) {
-            PrefRef.setValue(r, String.valueOf(activeHz));
             PrefRef.setSummary(r, CodecLabelTable.sampleRateLabel(activeHz));
+        } else {
+            PrefRef.setSummary(r,
+                    "采样率 (0x" + Integer.toHexString(snapshot.activeSampleRate) + ")");
         }
         PrefRef.setVisible(r, true);
     }
 
-    /**
-     * Returns the protocol-defined sample-rate mask for {@code codecType} so we can populate
-     * the dropdown when AOSP failed to enumerate it. The mask is union'd with the active
-     * sample-rate bit so the dropdown always at least includes the rate the device is using
-     * right now (otherwise tapping it would dismiss the dialog and re-open showing nothing).
-     */
     private static int sampleRateFallbackMask(int codecType, int activeRateBit) {
         int mask = activeRateBit;
-        // Bits — see CodecSnapshot.decodeSampleRateBits.
         final int B44_1 = 1, B48 = 2, B88_2 = 4, B96 = 8, B176_4 = 16, B192 = 32;
         if (codecType == CodecLabelTable.CODEC_LDAC) {
             mask |= B44_1 | B48 | B88_2 | B96;
         } else if (CodecLabelTable.isLhdc(codecType)) {
-            // LHDC V1/V2/V3 top out at 96 kHz, V5 adds 192 kHz. We do not know the version
-            // from rate-mask alone, so include the entire set the protocol can carry; the
-            // bridge will reject anything the kernel does not actually accept.
             mask |= B44_1 | B48 | B88_2 | B96 | B192;
         } else {
-            // Generic SBC / AAC / aptX cover at least 44.1k and 48k.
             mask |= B44_1 | B48;
         }
         return mask;
@@ -456,40 +476,15 @@ public final class CodecController {
         return decoded[0];
     }
 
-    private static int decodeStoredSampleRate(String storedValue, int selectableMask) {
-        int hz;
-        try {
-            hz = Integer.parseInt(storedValue);
-        } catch (NumberFormatException e) {
-            return -1;
-        }
-        // If the platform did not report a selectable mask (vendor codec quirk), accept any
-        // standard-rate value the user picked. The kernel will reject impossible writes, the
-        // bridge will then time out and we will roll back. This is symmetric with the
-        // renderSampleRate fallback that populates the dropdown the same way.
-        if (selectableMask == 0) {
-            int[] knownBits = {0x1, 0x2, 0x4, 0x8, 0x10, 0x20};
-            int[] knownHz = {44100, 48000, 88200, 96000, 176400, 192000};
-            for (int i = 0; i < knownHz.length; i++) {
-                if (knownHz[i] == hz) return knownBits[i];
-            }
-            return -1;
-        }
-        int[] supported = CodecSnapshot.decodeSampleRateBits(selectableMask);
-        for (int v : supported) {
-            if (v == hz) {
-                for (int b = 0; b < 31; b++) {
-                    int bit = 1 << b;
-                    if ((selectableMask & bit) == 0) continue;
-                    int[] decoded = CodecSnapshot.decodeSampleRateBits(bit);
-                    if (decoded.length == 1 && decoded[0] == hz) return bit;
-                }
-            }
+    private static int sampleRateHzToBit(int hz) {
+        int[] knownBits = {0x1, 0x2, 0x4, 0x8, 0x10, 0x20};
+        int[] knownHz = {44100, 48000, 88200, 96000, 176400, 192000};
+        for (int i = 0; i < knownHz.length; i++) {
+            if (knownHz[i] == hz) return knownBits[i];
         }
         return -1;
     }
 
-    /** Per-attach state. */
     private final class Subscription {
         final String mac;
         final CodecPreferences prefs;
