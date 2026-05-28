@@ -1,7 +1,8 @@
 package xyz.melodylsp.codec.host;
 
 import android.app.Activity;
-import android.app.Dialog;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.ContextWrapper;
@@ -13,11 +14,11 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.View;
-import android.view.Window;
-import android.view.WindowManager;
 import android.widget.LinearLayout;
+import android.widget.PopupWindow;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -43,7 +44,7 @@ import xyz.melodylsp.codec.util.MLog;
  * intents through {@link CodecBridgeClient}.
  *
  * <p>Quality and sample-rate rows are plain {@code Preference} entries whose click handler
- * pops a hand-rolled small floating {@link Dialog}. We deliberately avoid {@code ListPreference}: R8
+ * pops a hand-rolled small floating {@link PopupWindow}. We deliberately avoid {@code ListPreference}: R8
  * stripped {@code setEntries} / {@code setEntryValues} from the host APK because the host
  * never calls them in code, so the AOSP {@code ListPreferenceDialogFragmentCompat} crashes
  * the moment the user taps the row, regardless of how we try to populate the entries by
@@ -55,6 +56,9 @@ public final class CodecController {
             "android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED";
     private static final String ACTION_CONNECTION_STATE_CHANGED =
             "android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED";
+    private static final String EXTRA_CONNECTION_STATE = "android.bluetooth.profile.extra.STATE";
+    private static final int SAMPLE_RATE_48000_BIT = 0x2;
+    private static final int SAMPLE_RATE_48000_HZ = 48_000;
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
@@ -213,6 +217,7 @@ public final class CodecController {
         }
         CharSequence[] entries = new CharSequence[rates.length];
         int activeHz = sampleRateBitToHz(snapshot.activeSampleRate);
+        if (activeHz <= 0) activeHz = SAMPLE_RATE_48000_HZ;
         int checked = -1;
         for (int i = 0; i < rates.length; i++) {
             entries[i] = CodecLabelTable.sampleRateLabel(rates[i]);
@@ -245,13 +250,16 @@ public final class CodecController {
 
     private static void showChoicePopup(
             Context dialogContext, CharSequence[] entries, int checked, ChoiceCallback callback) {
-        Dialog dialog = new Dialog(dialogContext);
-        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        dialog.setCanceledOnTouchOutside(true);
+        Activity activity = findActivity(dialogContext);
+        if (activity == null || activity.getWindow() == null) return;
+        View root = activity.getWindow().getDecorView();
+        if (root == null) return;
+
+        final PopupWindow[] popupRef = new PopupWindow[1];
         LinearLayout list = new LinearLayout(dialogContext);
         list.setOrientation(LinearLayout.VERTICAL);
         int horizontal = dp(dialogContext, 22);
-        int rowHeight = dp(dialogContext, 64);
+        int rowHeight = dp(dialogContext, 58);
         int blue = Color.rgb(0, 105, 255);
         int textColor = Color.rgb(25, 25, 25);
         int dividerColor = Color.argb(28, 0, 0, 0);
@@ -260,9 +268,6 @@ public final class CodecController {
         bg.setColor(Color.WHITE);
         bg.setCornerRadius(dp(dialogContext, 22));
         list.setBackground(bg);
-        if (Build.VERSION.SDK_INT >= 21) {
-            list.setElevation(dp(dialogContext, 12));
-        }
 
         for (int i = 0; i < entries.length; i++) {
             final int index = i;
@@ -290,7 +295,8 @@ public final class CodecController {
                     dp(dialogContext, 44), LinearLayout.LayoutParams.MATCH_PARENT));
 
             row.setOnClickListener(v -> {
-                dialog.dismiss();
+                PopupWindow popup = popupRef[0];
+                if (popup != null) popup.dismiss();
                 callback.onChoice(index);
             });
             list.addView(row, new LinearLayout.LayoutParams(
@@ -306,22 +312,24 @@ public final class CodecController {
             }
         }
 
-        dialog.setContentView(list);
-        dialog.show();
-
-        Window window = dialog.getWindow();
-        if (window == null) return;
-        window.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        window.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
-        WindowManager.LayoutParams attrs = window.getAttributes();
-        attrs.width = Math.min(
-                dialogContext.getResources().getDisplayMetrics().widthPixels - dp(dialogContext, 48),
-                dp(dialogContext, 356));
-        attrs.height = WindowManager.LayoutParams.WRAP_CONTENT;
-        attrs.gravity = Gravity.TOP | Gravity.END;
-        attrs.x = dp(dialogContext, 18);
-        attrs.y = dp(dialogContext, 118);
-        window.setAttributes(attrs);
+        DisplayMetrics metrics = dialogContext.getResources().getDisplayMetrics();
+        int width = Math.min(metrics.widthPixels - dp(dialogContext, 48), dp(dialogContext, 356));
+        PopupWindow popup = new PopupWindow(
+                list, width, LinearLayout.LayoutParams.WRAP_CONTENT, true);
+        popupRef[0] = popup;
+        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        popup.setOutsideTouchable(true);
+        popup.setClippingEnabled(true);
+        popup.setInputMethodMode(PopupWindow.INPUT_METHOD_NOT_NEEDED);
+        if (Build.VERSION.SDK_INT >= 21) {
+            popup.setElevation(dp(dialogContext, 10));
+        }
+        int x = dp(dialogContext, 40);
+        int y = Math.round(metrics.heightPixels * 0.38f);
+        int minY = dp(dialogContext, 250);
+        int maxY = Math.max(minY, metrics.heightPixels - dp(dialogContext, 420));
+        y = Math.max(minY, Math.min(y, maxY));
+        popup.showAtLocation(root, Gravity.TOP | Gravity.END, x, y);
     }
 
     private static Context resolveLiveDialogContext(Subscription sub) {
@@ -505,12 +513,8 @@ public final class CodecController {
             lastSnapshot.set(snapshot);
         }
         if (snapshot == null) {
-            CodecSnapshot stale = lastSnapshot.get();
-            if (stale != null) {
-                renderSnapshot(stale, sub, /* fromCache= */ true);
-            } else {
-                renderUnknown(sub);
-            }
+            lastSnapshot.set(null);
+            renderUnknown(sub);
             return;
         }
         renderSnapshot(snapshot, sub, /* fromCache= */ false);
@@ -612,17 +616,13 @@ public final class CodecController {
         Object r = sub.prefs.sampleRateOption;
         if (r == null) return;
         int activeHz = sampleRateBitToHz(snapshot.activeSampleRate);
-        if (activeHz > 0) {
-            PrefRef.setSummary(r, CodecLabelTable.sampleRateLabel(activeHz));
-        } else {
-            PrefRef.setSummary(r,
-                    "采样率 (0x" + Integer.toHexString(snapshot.activeSampleRate) + ")");
-        }
+        if (activeHz <= 0) activeHz = SAMPLE_RATE_48000_HZ;
+        PrefRef.setSummary(r, CodecLabelTable.sampleRateLabel(activeHz));
         PrefRef.setVisible(r, true);
     }
 
     private static int sampleRateFallbackMask(int codecType, int activeRateBit) {
-        int mask = activeRateBit;
+        int mask = activeRateBit != 0 ? activeRateBit : SAMPLE_RATE_48000_BIT;
         final int B44_1 = 1, B48 = 2, B88_2 = 4, B96 = 8, B176_4 = 16, B192 = 32;
         if (codecType == CodecLabelTable.CODEC_LDAC) {
             mask |= B44_1 | B48 | B88_2 | B96;
@@ -636,7 +636,17 @@ public final class CodecController {
 
     private static boolean qualityValueMatches(int codecType, long option, long active) {
         if (CodecLabelTable.isLhdc(codecType)) {
-            return (option & 0xFFL) == (active & 0xFFL);
+            long optionByte = option & 0xFFL;
+            long activeByte = active & 0xFFL;
+            if (optionByte == activeByte) return true;
+            return (optionByte == CodecLabelTable.LHDC_QUALITY_BALANCED
+                    && activeByte == CodecLabelTable.LHDC_QUALITY_STANDARD)
+                    || (optionByte == CodecLabelTable.LHDC_QUALITY_STANDARD
+                    && activeByte == CodecLabelTable.LHDC_QUALITY_BALANCED)
+                    || (optionByte == CodecLabelTable.LHDC_QUALITY_HIGH
+                    && activeByte == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY)
+                    || (optionByte == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY
+                    && activeByte == CodecLabelTable.LHDC_QUALITY_HIGH);
         }
         return option == active;
     }
@@ -677,8 +687,18 @@ public final class CodecController {
                 @Override
                 public void onReceive(Context ctx, Intent intent) {
                     String action = intent.getAction();
-                    if (ACTION_CODEC_CONFIG_CHANGED.equals(action)
-                            || ACTION_CONNECTION_STATE_CHANGED.equals(action)) {
+                    if (ACTION_CONNECTION_STATE_CHANGED.equals(action)) {
+                        if (!matchesSubscriptionDevice(intent)) return;
+                        int state = intent.getIntExtra(EXTRA_CONNECTION_STATE, -1);
+                        if (state != -1 && state != BluetoothProfile.STATE_CONNECTED) {
+                            mainHandler.post(() -> {
+                                lastSnapshot.set(null);
+                                renderUnknown(Subscription.this);
+                            });
+                            return;
+                        }
+                        refreshSnapshot(Subscription.this);
+                    } else if (ACTION_CODEC_CONFIG_CHANGED.equals(action)) {
                         refreshSnapshot(Subscription.this);
                     }
                 }
@@ -690,6 +710,18 @@ public final class CodecController {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
             } catch (Throwable t) {
                 context.registerReceiver(receiver, filter);
+            }
+        }
+
+        @SuppressWarnings("deprecation")
+        private boolean matchesSubscriptionDevice(Intent intent) {
+            try {
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (device == null) return true;
+                String address = device.getAddress();
+                return address == null || address.equalsIgnoreCase(mac);
+            } catch (Throwable t) {
+                return true;
             }
         }
 

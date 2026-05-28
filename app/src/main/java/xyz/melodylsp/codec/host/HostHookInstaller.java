@@ -61,6 +61,7 @@ public final class HostHookInstaller {
     private static final String KEY_CODEC_HEADER = "melody_codec_lsp_header";
     private static final String KEY_CODEC_CATEGORY = "melody_codec_lsp_category";
     private static final String KEY_CODEC_QUALITY = "melody_codec_lsp_quality";
+    private static final String KEY_NOISE_SWITCH = "pref_noise_switch";
     private static final String KEY_MORE_SETTING = "pref_more_setting";
     private static final String KEY_FOOTER = "footer_preference";
 
@@ -213,6 +214,7 @@ public final class HostHookInstaller {
 
         if (PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY) != null
                 || PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY) != null
+                || PrefRef.findPreference(screen, KEY_NOISE_SWITCH) != null
                 || PrefRef.findPreference(screen, KEY_MORE_SETTING) != null) {
             return injectIntoOneSpace(fragment, screen);
         }
@@ -255,6 +257,7 @@ public final class HostHookInstaller {
         if (themedContext == null) return false;
 
         Object noiseMenu = PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY);
+        Object noiseSwitch = PrefRef.findPreference(screen, KEY_NOISE_SWITCH);
         Object moreSettingCategory = PrefRef.findPreference(
                 screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY);
         Object moreSettingRow = PrefRef.findPreference(screen, KEY_MORE_SETTING);
@@ -264,10 +267,14 @@ public final class HostHookInstaller {
         }
         Object footer = PrefRef.findPreference(screen, KEY_FOOTER);
 
-        Object anchor = moreSettingCategory != null ? moreSettingCategory : footer;
+        Object noiseSwitchParent = noiseSwitch != null ? PrefRef.getParent(noiseSwitch) : null;
+        Object anchor = noiseSwitch != null && noiseSwitchParent == screen
+                ? noiseSwitch
+                : moreSettingCategory != null ? moreSettingCategory : footer;
         int targetOrder;
         if (anchor != null) {
-            targetOrder = Math.max(0, PrefRef.getOrder(anchor));
+            int anchorOrder = PrefRef.getOrder(anchor);
+            targetOrder = Math.max(0, anchor == noiseSwitch ? anchorOrder + 1 : anchorOrder);
         } else if (noiseMenu != null) {
             targetOrder = PrefRef.getOrder(noiseMenu) + 1;
         } else {

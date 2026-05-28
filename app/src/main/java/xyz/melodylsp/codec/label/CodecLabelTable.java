@@ -45,10 +45,11 @@ public final class CodecLabelTable {
 
     // LHDC playback-quality codes live in codecSpecific1's low byte. The high bits carry
     // vendor flags and must be preserved when writing a new value.
-    public static final long LHDC_QUALITY_CONNECTION = 1L;
-    public static final long LHDC_QUALITY_BALANCED = 3L;
-    public static final long LHDC_QUALITY_HIGH = 5L;
-    public static final long LHDC_QUALITY_LOSSLESS = 9L;
+    public static final long LHDC_QUALITY_CONNECTION = 0L;
+    public static final long LHDC_QUALITY_STANDARD = 3L;
+    public static final long LHDC_QUALITY_HIGH_LEGACY = 5L;
+    public static final long LHDC_QUALITY_HIGH = 8L;
+    public static final long LHDC_QUALITY_BALANCED = 9L;
 
     private CodecLabelTable() {
     }
@@ -92,14 +93,13 @@ public final class CodecLabelTable {
     };
 
     /**
-     * Quality steps the LHDC family exposes on the OPPO stack. The active Enco X3 value in
-     * logs is 0x8009, so include 9 rather than treating it as an unknown vendor extension.
+     * Quality steps the LHDC family exposes on the OPPO stack. The active Enco X3 default in
+     * logs is 0x8009, which corresponds to the balanced profile on this ROM.
      */
     public static final long[] LHDC_QUALITY_STEPS = {
             LHDC_QUALITY_CONNECTION,
             LHDC_QUALITY_BALANCED,
-            LHDC_QUALITY_HIGH,
-            LHDC_QUALITY_LOSSLESS
+            LHDC_QUALITY_HIGH
     };
 
     /** Returns the protocol-defined quality steps for {@code codecType} when the platform
@@ -138,9 +138,10 @@ public final class CodecLabelTable {
             // future bit fields (e.g. lossless toggle) do not break label resolution.
             long versionByte = specific1 & 0xFFL;
             if (versionByte == LHDC_QUALITY_CONNECTION) return Strings.QUALITY_LHDC_CONNECTION;
+            if (versionByte == LHDC_QUALITY_STANDARD) return Strings.QUALITY_LHDC_BALANCED;
             if (versionByte == LHDC_QUALITY_BALANCED) return Strings.QUALITY_LHDC_BALANCED;
+            if (versionByte == LHDC_QUALITY_HIGH_LEGACY) return Strings.QUALITY_LHDC_HIGH;
             if (versionByte == LHDC_QUALITY_HIGH) return Strings.QUALITY_LHDC_HIGH;
-            if (versionByte == LHDC_QUALITY_LOSSLESS) return Strings.QUALITY_LHDC_LOSSLESS;
         }
         return "档位 (" + specific1 + ")";
     }

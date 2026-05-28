@@ -45,6 +45,7 @@ public final class CodecBridgeClient {
     private static final String ACTION_CODEC_CONFIG_CHANGED =
             "android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED";
     private static final long CONFIRM_TIMEOUT_MS = 3_000L;
+    private static final long LHDC_SECOND_STEP_DELAY_MS = 250L;
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
@@ -107,23 +108,66 @@ public final class CodecBridgeClient {
     /** Writes the request and resolves with the eventual outcome (confirmed / rolled back). */
     public CompletableFuture<WriteResult> setCodec(CodecRequest request) {
         // Path A.
-        try {
-            reflect.setCodec(request);
-            return awaitConfirmation(request, WriteResult.Path.DIRECT_API)
-                    .thenCompose(result -> {
-                        if (result.outcome == WriteResult.Outcome.CONFIRMED) {
-                            return CompletableFuture.completedFuture(result);
-                        }
-                        MLog.w("Path-A accepted but not confirmed; trying bridge/settings/root");
+        return applyDirectWrite(request)
+                .handle((ignored, error) -> error)
+                .thenCompose(error -> {
+                    if (error != null) {
+                        MLog.w("Path-A setCodec failed", unwrap(error));
                         return setCodecViaBridgeOrFallback(request);
-                    });
-        } catch (BluetoothCodecReflect.BluetoothCodecReflectException e) {
-            MLog.w("Path-A setCodec failed: " + e.className + "#" + e.methodName);
-        } catch (Throwable t) {
-            MLog.w("Path-A setCodec failed", t);
+                    }
+                    return awaitConfirmation(request, WriteResult.Path.DIRECT_API)
+                            .thenCompose(result -> {
+                                if (result.outcome == WriteResult.Outcome.CONFIRMED) {
+                                    return CompletableFuture.completedFuture(result);
+                                }
+                                MLog.w("Path-A accepted but not confirmed; trying bridge/settings/root");
+                                return setCodecViaBridgeOrFallback(request);
+                            });
+                });
+    }
+
+    private CompletableFuture<Void> applyDirectWrite(CodecRequest request) {
+        if (!CodecLabelTable.isLhdc(request.codecType) || request.codecSpecific1 == 0L) {
+            try {
+                reflect.setCodec(request);
+                return CompletableFuture.completedFuture(null);
+            } catch (Throwable t) {
+                CompletableFuture<Void> failed = new CompletableFuture<>();
+                failed.completeExceptionally(t);
+                return failed;
+            }
         }
 
-        return setCodecViaBridgeOrFallback(request);
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        CodecRequest priming = new CodecRequest(
+                request.mac,
+                request.codecType,
+                0L,
+                request.codecSpecific2,
+                request.codecSpecific3,
+                request.codecSpecific4,
+                request.sampleRate,
+                request.bitsPerSample,
+                request.channelMode);
+        try {
+            // Bluetooth Codec Changer primes LHDC by briefly applying codecSpecific1=0 before
+            // writing the target quality/sample tuple. OPPO's stack accepts this as a real-time
+            // renegotiation path instead of waiting for the next reconnect.
+            reflect.setCodec(priming);
+            MLog.event("write.lhdc.prime", "request", priming);
+        } catch (Throwable t) {
+            future.completeExceptionally(t);
+            return future;
+        }
+        mainHandler.postDelayed(() -> {
+            try {
+                reflect.setCodec(request);
+                future.complete(null);
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+            }
+        }, LHDC_SECOND_STEP_DELAY_MS);
+        return future;
     }
 
     private CompletableFuture<WriteResult> setCodecViaBridgeOrFallback(CodecRequest request) {
@@ -294,9 +338,34 @@ public final class CodecBridgeClient {
     }
 
     private static boolean matches(CodecSnapshot snapshot, CodecRequest request) {
-        return snapshot.activeCodecType == request.codecType
-                && snapshot.activeSampleRate == request.sampleRate
-                && snapshot.activeCodecSpecific1 == request.codecSpecific1;
+        if (snapshot.activeCodecType != request.codecType
+                || snapshot.activeSampleRate != request.sampleRate) {
+            return false;
+        }
+        if (CodecLabelTable.isLhdc(request.codecType)) {
+            long active = snapshot.activeCodecSpecific1 & 0xFFL;
+            long requested = request.codecSpecific1 & 0xFFL;
+            if (active == requested) return true;
+            return (active == CodecLabelTable.LHDC_QUALITY_BALANCED
+                    && requested == CodecLabelTable.LHDC_QUALITY_STANDARD)
+                    || (active == CodecLabelTable.LHDC_QUALITY_STANDARD
+                    && requested == CodecLabelTable.LHDC_QUALITY_BALANCED)
+                    || (active == CodecLabelTable.LHDC_QUALITY_HIGH
+                    && requested == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY)
+                    || (active == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY
+                    && requested == CodecLabelTable.LHDC_QUALITY_HIGH);
+        }
+        return snapshot.activeCodecSpecific1 == request.codecSpecific1;
+    }
+
+    private static Throwable unwrap(Throwable t) {
+        Throwable cur = t;
+        while (cur.getCause() != null
+                && (cur instanceof java.util.concurrent.CompletionException
+                || cur instanceof java.util.concurrent.ExecutionException)) {
+            cur = cur.getCause();
+        }
+        return cur;
     }
 
     private void completeWith(

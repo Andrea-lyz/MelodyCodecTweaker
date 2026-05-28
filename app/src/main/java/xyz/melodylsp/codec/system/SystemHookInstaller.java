@@ -64,13 +64,26 @@ public final class SystemHookInstaller {
                 Object[] args = chain.getArgs().toArray();
                 if (isMelodyA2dpCodecCall(args)) {
                     MLog.event("cdm.bypass", "method", m.getName());
-                    return null;
+                    return bypassReturnValue(m.getReturnType());
                 }
                 return chain.proceed();
             });
             hooked++;
         }
         MLog.event("cdm.hooks", "count", hooked);
+    }
+
+    private static Object bypassReturnValue(Class<?> returnType) {
+        if (returnType == void.class) return null;
+        if (returnType == boolean.class || returnType == Boolean.class) return Boolean.TRUE;
+        if (returnType == int.class || returnType == Integer.class) return 0;
+        if (returnType == long.class || returnType == Long.class) return 0L;
+        if (returnType == float.class || returnType == Float.class) return 0f;
+        if (returnType == double.class || returnType == Double.class) return 0d;
+        if (returnType == byte.class || returnType == Byte.class) return (byte) 0;
+        if (returnType == short.class || returnType == Short.class) return (short) 0;
+        if (returnType == char.class || returnType == Character.class) return (char) 0;
+        return null;
     }
 
     private void hookConstructors(Class<?> a2dpCls) {
