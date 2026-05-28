@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string-array name="xposed_scope" translatable="false">
-        <item>com.oplus.melody</item>
-        <item>com.android.bluetooth</item>
-    </string-array>
-</resources>

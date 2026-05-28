@@ -16,14 +16,11 @@
         tools:ignore="MissingApplicationIcon">
 
         <!--
-          libxposed API 101+ no longer reads xposedmodule / xposedminversion
-          metadata; the framework discovers the entry through META-INF/xposed/
-          java_init.list and the API version through META-INF/xposed/module.prop.
-          The xposedscope metadata is still honored as a default-scope hint.
+          libxposed API 101+ reads scope from META-INF/xposed/scope.list and module
+          metadata from META-INF/xposed/module.prop. The legacy
+          xposedmodule / xposedminversion / xposedscope manifest metadata are no
+          longer used by API 101 frameworks.
         -->
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
 
         <activity
             android:name=".ui.MasterSwitchActivity"
