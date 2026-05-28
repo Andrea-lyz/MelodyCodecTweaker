@@ -26,7 +26,10 @@ public final class HostHookInstaller {
 
     private static final String CLASS_HIGH_AUDIO =
             "com.oplus.melody.ui.component.detail.highaudio.HighAudioPreferenceFragment";
+    private static final String CLASS_DETAIL_MAIN_FRAGMENT = "G8.a";
     private static final String CLASS_ONE_SPACE_FRAGMENT = "com.oplus.melody.onespace.d";
+
+    private static final String KEY_HIRES_ITEM = "HiQualityAudioItem";
 
     private final MelodyCodecLspEntry module;
     private final ClassLoader classLoader;
@@ -40,6 +43,7 @@ public final class HostHookInstaller {
     public void install() {
         hookApplicationOnCreate();
         hookHighAudio();
+        hookDetailMain();
         hookOneSpace();
     }
 
@@ -78,6 +82,80 @@ public final class HostHookInstaller {
         controller = new CodecController(app, reflect, bridge, prefs);
 
         MLog.event("controller.ready", "version", hostVersion);
+    }
+
+    private void hookDetailMain() {
+        Class<?> fragCls = loadHostClass(CLASS_DETAIL_MAIN_FRAGMENT);
+        if (fragCls == null) {
+            MLog.w("MoreSettingFragment class not found");
+            return;
+        }
+        Method onViewCreated = findOnViewCreated(fragCls);
+        if (onViewCreated == null) {
+            MLog.w("MoreSettingFragment.onViewCreated(View,Bundle) not found");
+            return;
+        }
+        module.hook(onViewCreated).intercept(chain -> {
+            Object result = chain.proceed();
+            Object fragment = chain.getThisObject();
+            // The detail main panel populates its PreferenceScreen asynchronously through
+            // MoreSettingViewModel.f17885h (a LiveData of List<Class<?>>). Items appear bit by
+            // bit as the WhitelistConfig stream emits, so the Hi-Res item we want to anchor
+            // below may not be present at onViewCreated. Schedule a few retries spaced 800 ms
+            // apart to catch the moment the Preference for HiQualityAudioItem lands.
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    () -> tryInsertIntoDetailMain(fragment, /* attempt= */ 0), 600L);
+            return result;
+        });
+    }
+
+    private void tryInsertIntoDetailMain(Object fragment, int attempt) {
+        try {
+            if (insertIntoDetailMain(fragment)) {
+                return;
+            }
+        } catch (Throwable t) {
+            MLog.e("DetailMain insertion failed", t);
+            return;
+        }
+        if (attempt < 5) {
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(
+                    () -> tryInsertIntoDetailMain(fragment, attempt + 1), 800L);
+        } else {
+            MLog.w("DetailMain insertion gave up after 5 retries (Hi-Res item never appeared)");
+        }
+    }
+
+    /**
+     * Insert the codec block immediately after the {@code HiQualityAudioItem} Preference inside
+     * MoreSettingFragment. The item appears asynchronously, so this method is retried; it
+     * returns {@code true} when the anchor is found and injection succeeds.
+     */
+    private boolean insertIntoDetailMain(Object fragment) {
+        if (controller == null) return false;
+        Context context = resolveContext(fragment);
+        if (context == null) return false;
+        Object screen = PrefRef.getPreferenceScreen(fragment);
+        if (screen == null) return false;
+        // The PreferenceCategory wrapping the Hi-Res item uses the simple class name as its
+        // key (see G8.a$C0036a.invoke -> cOUIPreferenceCategory.setKey(cls.getSimpleName())).
+        Object hiresCategory = PrefRef.findPreference(screen, KEY_HIRES_ITEM);
+        if (hiresCategory == null) return false;
+        // Avoid re-inserting if we already attached.
+        if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null) {
+            return true;
+        }
+        int order = PrefRef.getOrder(hiresCategory) + 1;
+        String mac = resolveMacFromActivityIntent(fragment);
+        if (mac == null) {
+            MLog.w("DetailMain mac unresolved; skip");
+            return false;
+        }
+        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(context, screen, order);
+        if (prefs == null) return false;
+        controller.attach(mac, prefs, fragment);
+        MLog.event("detailmain.injected", "mac_len", mac.length(), "order", order);
+        return true;
     }
 
     private void hookHighAudio() {
