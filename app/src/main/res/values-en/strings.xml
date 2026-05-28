@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_label">Bluetooth Codec Panel (Melody)</string>
+    <string name="app_description">Injects 4 items (Active Codec / Quality / Sample rate / Remember choice) into the Wireless Headset app HighAudio page and OneSpace bottom sheet. All selectable values come from the live A2DP negotiation.</string>
+
+    <string name="codec_block_title">Bluetooth audio</string>
+    <string name="codec_display_title">Active codec</string>
+    <string name="quality_option_title">Playback quality</string>
+    <string name="sample_rate_option_title">Sample rate</string>
+    <string name="remember_toggle_title">Remember this headset</string>
+    <string name="remember_toggle_summary">When off, each reconnect uses the Android system default. When on, your last choice is replayed automatically next time this headset connects.</string>
+
+    <string name="state_no_device">No headset connected</string>
+    <string name="state_no_a2dp">This device does not support A2DP codec control</string>
+    <string name="state_codec_unknown">Codec status temporarily unavailable</string>
+    <string name="state_codec_unknown_action">Retry</string>
+    <string name="state_permission_required">Grant Bluetooth connect permission</string>
+    <string name="state_version_uncalibrated">Panel layout uncalibrated. Some controls may be limited.</string>
+
+    <string name="banner_via_settings">Written via developer options. Reconnect may be required.</string>
+    <string name="toast_apply_failed">The change did not take effect, please retry.</string>
+
+    <string name="codec_label_sbc">SBC</string>
+    <string name="codec_label_aac">AAC</string>
+    <string name="codec_label_aptx">aptX</string>
+    <string name="codec_label_aptx_hd">aptX HD</string>
+    <string name="codec_label_aptx_adaptive">aptX Adaptive</string>
+    <string name="codec_label_ldac">LDAC</string>
+    <string name="codec_label_lhdc">LHDC</string>
+    <string name="codec_label_opus">Opus</string>
+
+    <string name="quality_ldac_990">990 kbps (Quality)</string>
+    <string name="quality_ldac_660">660 kbps (Standard)</string>
+    <string name="quality_ldac_330">330 kbps (Connection)</string>
+    <string name="quality_lhdc_v1">LHDC V1</string>
+    <string name="quality_lhdc_v2">LHDC V2</string>
+    <string name="quality_lhdc_v3">LHDC V3</string>
+    <string name="quality_lhdc_v5">LHDC V5</string>
+
+    <string name="freshness_label">Last sync: %1$s</string>
+    <string name="quality_unknown_value">Unknown level (specific1=%1$s)</string>
+
+    <string name="master_switch_title">Bluetooth audio module</string>
+    <string name="master_switch_summary">When disabled, the next launch of the Wireless Headset app will not inject this block. The host panel is restored to its original state.</string>
+    <string name="master_switch_label">Inject Bluetooth audio block</string>
+    <string name="master_switch_status_on">Enabled</string>
+    <string name="master_switch_status_off">Disabled</string>
+</resources>

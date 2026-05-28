@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_label">蓝牙音质（Melody）</string>
+    <string name="app_description">在“无线耳机”App 的高解析度音频页与 OneSpace 快捷面板中，注入“当前编解码器 / 播放质量 / 采样率 / 记住此耳机的选择” 4 个项目，所有可选值动态来自系统 A2DP 协商能力。</string>
+
+    <string name="codec_block_title">蓝牙音质</string>
+    <string name="codec_display_title">当前编解码器</string>
+    <string name="quality_option_title">播放质量</string>
+    <string name="sample_rate_option_title">采样率</string>
+    <string name="remember_toggle_title">记住此耳机的选择</string>
+    <string name="remember_toggle_summary">关闭时每次重连按系统默认值；开启后下次连接会自动应用你上次的设置。</string>
+
+    <string name="state_no_device">未连接耳机</string>
+    <string name="state_no_a2dp">当前设备不支持 A2DP 编解码控制</string>
+    <string name="state_codec_unknown">暂时无法获取编解码器信息</string>
+    <string name="state_codec_unknown_action">重试</string>
+    <string name="state_permission_required">授予蓝牙连接权限</string>
+    <string name="state_version_uncalibrated">面板版本未校准，部分功能可能受限</string>
+
+    <string name="banner_via_settings">已通过开发者选项写入，可能需要重连耳机生效</string>
+    <string name="toast_apply_failed">切换未生效，请重试</string>
+
+    <string name="codec_label_sbc">SBC</string>
+    <string name="codec_label_aac">AAC</string>
+    <string name="codec_label_aptx">aptX</string>
+    <string name="codec_label_aptx_hd">aptX HD</string>
+    <string name="codec_label_aptx_adaptive">aptX Adaptive</string>
+    <string name="codec_label_ldac">LDAC</string>
+    <string name="codec_label_lhdc">LHDC</string>
+    <string name="codec_label_opus">Opus</string>
+
+    <string name="quality_ldac_990">990 kbps（音质优先）</string>
+    <string name="quality_ldac_660">660 kbps（标准）</string>
+    <string name="quality_ldac_330">330 kbps（连接优先）</string>
+    <string name="quality_lhdc_v1">LHDC V1</string>
+    <string name="quality_lhdc_v2">LHDC V2</string>
+    <string name="quality_lhdc_v3">LHDC V3</string>
+    <string name="quality_lhdc_v5">LHDC V5</string>
+
+    <string name="freshness_label">上次同步：%1$s</string>
+    <string name="quality_unknown_value">未知档位（specific1=%1$s）</string>
+
+    <string name="master_switch_title">蓝牙音质模块</string>
+    <string name="master_switch_summary">关闭后，下次启动“无线耳机” App 将不再注入新区块，宿主面板恢复原状。</string>
+    <string name="master_switch_label">启用蓝牙音质注入</string>
+    <string name="master_switch_status_on">已启用</string>
+    <string name="master_switch_status_off">已禁用</string>
+</resources>

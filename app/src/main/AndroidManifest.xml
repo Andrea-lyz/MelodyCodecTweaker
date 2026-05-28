@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+
+    <application
+        android:allowBackup="false"
+        android:label="@string/app_label"
+        android:description="@string/app_description"
+        android:icon="@android:drawable/ic_dialog_info"
+        android:theme="@android:style/Theme.DeviceDefault.Light.DialogWhenLarge"
+        tools:ignore="MissingApplicationIcon">
+
+        <!--
+          libxposed API 101+ no longer reads xposedmodule / xposedminversion
+          metadata; the framework discovers the entry through META-INF/xposed/
+          java_init.list and the API version through META-INF/xposed/module.prop.
+          The xposedscope metadata is still honored as a default-scope hint.
+        -->
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
+        <activity
+            android:name=".ui.MasterSwitchActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
+</manifest>

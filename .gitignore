@@ -1,0 +1,13 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+gradle-app.setting
+!gradle-wrapper.jar
+*.keystore
+*.jks
+*.bak
