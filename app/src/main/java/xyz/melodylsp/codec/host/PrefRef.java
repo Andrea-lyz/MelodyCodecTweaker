@@ -107,6 +107,24 @@ public final class PrefRef {
         invokeVoid(pref, "setChecked", new Class[]{boolean.class}, new Object[]{checked});
     }
 
+    public static int getLayoutResource(Object pref) {
+        Object r = invoke(pref, "getLayoutResource", new Class[0], new Object[0]);
+        return r instanceof Integer ? (Integer) r : 0;
+    }
+
+    public static void setLayoutResource(Object pref, int resId) {
+        invokeVoid(pref, "setLayoutResource", new Class[]{int.class}, new Object[]{resId});
+    }
+
+    public static int getWidgetLayoutResource(Object pref) {
+        Object r = invoke(pref, "getWidgetLayoutResource", new Class[0], new Object[0]);
+        return r instanceof Integer ? (Integer) r : 0;
+    }
+
+    public static void setWidgetLayoutResource(Object pref, int resId) {
+        invokeVoid(pref, "setWidgetLayoutResource", new Class[]{int.class}, new Object[]{resId});
+    }
+
     public static int getOrder(Object pref) {
         Object r = invoke(pref, "getOrder", new Class[0], new Object[0]);
         return r instanceof Integer ? (Integer) r : -1;
@@ -115,6 +133,16 @@ public final class PrefRef {
     public static String getKey(Object pref) {
         Object r = invoke(pref, "getKey", new Class[0], new Object[0]);
         return r != null ? r.toString() : null;
+    }
+
+    /**
+     * Returns the {@code PreferenceGroup} parent of a {@link androidx.preference.Preference}.
+     * AOSP exposes this as {@code Preference#getParent()}; under R8 that name is preserved on
+     * the public api surface so we just call it. Returns {@code null} if the Preference is
+     * detached or the call fails.
+     */
+    public static Object getParent(Object pref) {
+        return invoke(pref, "getParent", new Class[0], new Object[0]);
     }
 
     /**
@@ -359,20 +387,120 @@ public final class PrefRef {
         return null;
     }
 
-    /** Calls {@link androidx.preference.ListPreference#setEntries(CharSequence[])}. */
+    /**
+     * Calls {@link androidx.preference.ListPreference#setEntries(CharSequence[])}.
+     *
+     * <p>The host APK is R8-minified and the public {@code setEntries} method has been renamed
+     * (typically to a single character). When the literal-name lookup fails we fall back to
+     * picking the unique 1-arg method on the class hierarchy whose only parameter type is
+     * {@code CharSequence[]} — there are exactly two such setters on {@code ListPreference}
+     * ({@code setEntries} and {@code setEntryValues}), distinguished by their declaration
+     * order, so we tag them by index. Returns silently on failure.</p>
+     */
     public static void setEntries(Object listPref, CharSequence[] entries) {
-        invokeVoid(listPref, "setEntries", new Class[]{CharSequence[].class}, new Object[]{entries});
+        if (invokeVoidStrict(listPref, "setEntries",
+                new Class[]{CharSequence[].class}, new Object[]{entries})) return;
+        Method m = findCharSequenceArraySetter(listPref.getClass(), /* secondMatch= */ false);
+        invokeAccessible(listPref, m, entries, "setEntries");
     }
 
     /** Calls {@link androidx.preference.ListPreference#setEntryValues(CharSequence[])}. */
     public static void setEntryValues(Object listPref, CharSequence[] values) {
-        invokeVoid(listPref, "setEntryValues",
-                new Class[]{CharSequence[].class}, new Object[]{values});
+        if (invokeVoidStrict(listPref, "setEntryValues",
+                new Class[]{CharSequence[].class}, new Object[]{values})) return;
+        Method m = findCharSequenceArraySetter(listPref.getClass(), /* secondMatch= */ true);
+        invokeAccessible(listPref, m, values, "setEntryValues");
     }
 
     /** Calls {@link androidx.preference.ListPreference#setValue(String)}. */
     public static void setValue(Object listPref, String value) {
-        invokeVoid(listPref, "setValue", new Class[]{String.class}, new Object[]{value});
+        if (invokeVoidStrict(listPref, "setValue",
+                new Class[]{String.class}, new Object[]{value})) return;
+        // R8 may have also renamed setValue. Pick the only 1-arg String setter that returns
+        // void — but skip setKey by name (keeps "setKey" stable across this code path).
+        Method m = findUnaryStringSetterExcluding(listPref.getClass(), "setKey");
+        invokeAccessible(listPref, m, value, "setValue");
+    }
+
+    private static void invokeAccessible(Object target, Method m, Object arg, String label) {
+        if (m == null) {
+            xyz.melodylsp.codec.util.MLog.w(label
+                    + ": no signature-compatible method on " + target.getClass().getName());
+            return;
+        }
+        try {
+            m.setAccessible(true);
+            m.invoke(target, arg);
+        } catch (Throwable t) {
+            xyz.melodylsp.codec.util.MLog.w(label + " reflective invoke failed", t);
+        }
+    }
+
+    /**
+     * Pick the n-th 1-arg method on the hierarchy whose parameter is {@code CharSequence[]}
+     * and whose return type is void. {@code androidx.preference.ListPreference} declares them
+     * in the order {@code setEntries}, {@code setEntryValues}, so {@code secondMatch=false}
+     * means the first (entries), {@code secondMatch=true} means the second (entry values).
+     */
+    private static Method findCharSequenceArraySetter(Class<?> startCls, boolean secondMatch) {
+        int targetIdx = secondMatch ? 1 : 0;
+        int seen = 0;
+        Class<?> cls = startCls;
+        while (cls != null && cls != Object.class) {
+            Method[] methods = cls.getDeclaredMethods();
+            // Stable order across reflection invocations is undefined, but the *declared*
+            // order on a class is preserved by the runtime. Sort by name as a tie-break so
+            // an arbitrary toolchain change does not silently flip entries / entryValues.
+            java.util.Arrays.sort(methods, (a, b) -> a.getName().compareTo(b.getName()));
+            for (Method m : methods) {
+                if (m.getParameterCount() != 1) continue;
+                if (m.isSynthetic() || m.isBridge()) continue;
+                if (m.getReturnType() != void.class) continue;
+                Class<?> p = m.getParameterTypes()[0];
+                if (p != CharSequence[].class) continue;
+                if (seen == targetIdx) return m;
+                seen++;
+            }
+            cls = cls.getSuperclass();
+        }
+        return null;
+    }
+
+    /**
+     * Pick a 1-arg method whose parameter is {@code String} and whose return type is void,
+     * skipping any method whose name matches {@code excludeName}. Used to resolve
+     * {@code setValue(String)} after R8 rename when {@code setKey(String)} also lives on the
+     * same class.
+     */
+    private static Method findUnaryStringSetterExcluding(Class<?> startCls, String excludeName) {
+        Class<?> cls = startCls;
+        while (cls != null && cls != Object.class) {
+            for (Method m : cls.getDeclaredMethods()) {
+                if (m.getParameterCount() != 1) continue;
+                if (m.isSynthetic() || m.isBridge()) continue;
+                if (m.getReturnType() != void.class) continue;
+                if (m.getParameterTypes()[0] != String.class) continue;
+                if (excludeName != null && excludeName.equals(m.getName())) continue;
+                return m;
+            }
+            cls = cls.getSuperclass();
+        }
+        return null;
+    }
+
+    /** Returns true on success. {@link #invokeVoid} swallows failures, this one reports. */
+    private static boolean invokeVoidStrict(Object target, String name,
+            Class<?>[] paramTypes, Object[] args) {
+        if (target == null) return false;
+        Method m = findMethod(target.getClass(), name, paramTypes);
+        if (m == null) return false;
+        try {
+            m.setAccessible(true);
+            m.invoke(target, args);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static Object invoke(Object target, String name, Class<?>[] paramTypes, Object[] args) {

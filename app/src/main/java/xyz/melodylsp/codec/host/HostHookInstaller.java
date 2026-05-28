@@ -1,6 +1,5 @@
 package xyz.melodylsp.codec.host;
 
-import android.app.Activity;
 import android.app.Application;
 import android.content.Context;
 import android.content.pm.PackageInfo;
@@ -9,10 +8,7 @@ import android.os.Handler;
 import android.os.Looper;
 
 import java.lang.reflect.Method;
-import java.util.ArrayList;
-import java.util.Collection;
 import java.util.IdentityHashMap;
-import java.util.List;
 import java.util.Set;
 
 import xyz.melodylsp.codec.MelodyCodecLspEntry;
@@ -50,6 +46,15 @@ public final class HostHookInstaller {
     private static final String CLASS_HIGH_AUDIO =
             "com.oplus.melody.ui.component.detail.highaudio.HighAudioPreferenceFragment";
     private static final String CLASS_ONE_SPACE_FRAGMENT = "com.oplus.melody.onespace.d";
+    /**
+     * The shared base class for every OPLUS Preference-Fragment in the host APK
+     * ({@code DetailMainPreferenceFragment}, {@code MoreSettingFragment},
+     * {@code HighAudioPreferenceFragment}, {@code OneSpaceListFragment}, &c.). The package /
+     * class name {@code com.oplus.melody.ui.base.c} is preserved by R8 because the host hand-
+     * rolls reflection against this exact FQN. Hooking its {@code onViewCreated} gives us a
+     * single, stable entrypoint that fires for every such fragment.
+     */
+    private static final String CLASS_BASE_PREFERENCE_FRAGMENT = "com.oplus.melody.ui.base.c";
 
     /** {@code PreferenceCategory.setKey(cls.getSimpleName())} stamps this on the Hi-Res item. */
     private static final String KEY_HIRES_ITEM = "HiQualityAudioItem";
@@ -68,7 +73,7 @@ public final class HostHookInstaller {
     public void install() {
         hookApplicationOnCreate();
         hookHighAudio();
-        hookDetailMain();
+        hookBasePreferenceFragment();
         hookOneSpace();
     }
 
@@ -110,91 +115,153 @@ public final class HostHookInstaller {
     }
 
     /**
-     * DetailMainActivity is registered in the Manifest, so its FQN survives R8 minification.
-     * Hook {@code onResume} (called every time the panel comes back to the foreground) and
-     * scan the activity's fragments for the Preference-Fragment-shaped child whose
-     * PreferenceScreen contains the {@code HiQualityAudioItem} category.
+     * Hook the shared OPLUS preference-fragment base class. Every OPLUS PreferenceFragment in
+     * the host APK extends {@code com.oplus.melody.ui.base.c}; hooking its {@code onViewCreated}
+     * gives us a single firing point covering DetailMainPreferenceFragment,
+     * MoreSettingFragment, HighAudioPreferenceFragment, OneSpaceListFragment, and any other
+     * subclass. We then dispatch on the PreferenceScreen's contents to figure out which
+     * surface we're on (by looking for HiQualityAudioItem / pref_noise_menu_category / &c.).
      */
-    private void hookDetailMain() {
-        Class<?> activityCls = loadHostClass(CLASS_DETAIL_MAIN_ACTIVITY);
-        if (activityCls == null) {
-            MLog.w("DetailMainActivity class not found");
+    private void hookBasePreferenceFragment() {
+        Class<?> baseCls = loadHostClass(CLASS_BASE_PREFERENCE_FRAGMENT);
+        if (baseCls == null) {
+            MLog.w("Base preference fragment class not found");
             return;
         }
-        Method onResume = findMethodIgnoringDeclared(activityCls, "onResume");
-        if (onResume == null) {
-            MLog.w("DetailMainActivity.onResume not found");
+        Method onViewCreated = findOnViewCreated(baseCls);
+        if (onViewCreated == null) {
+            MLog.w("Base preference fragment onViewCreated(View,Bundle) not found");
             return;
         }
-        module.hook(onResume).intercept(chain -> {
+        module.hook(onViewCreated).intercept(chain -> {
             Object result = chain.proceed();
-            Object activity = chain.getThisObject();
-            scheduleDetailMainScan(activity, /* attempt= */ 0);
+            Object fragment = chain.getThisObject();
+            // PreferenceScreen items often arrive asynchronously after onViewCreated; retry a
+            // few times spaced 800 ms apart to catch the moment the anchors land.
+            scheduleSurfaceDispatch(fragment, /* attempt= */ 0);
             return result;
         });
     }
 
-    private void scheduleDetailMainScan(Object activity, int attempt) {
+    private void scheduleSurfaceDispatch(Object fragment, int attempt) {
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (controller == null) return;
+            if (attachedFragments.contains(fragment)) return;
             try {
-                if (tryInjectDetailMain(activity)) return;
+                if (dispatchSurface(fragment)) return;
             } catch (Throwable t) {
-                MLog.e("DetailMain scan failed", t);
+                MLog.e("Surface dispatch failed", t);
                 return;
             }
-            // Hi-Res items are populated asynchronously off WhitelistConfig — give it up to
-            // ~5 s to show up before giving up for this onResume cycle.
-            if (attempt < 6) {
-                scheduleDetailMainScan(activity, attempt + 1);
-            } else {
-                MLog.w("DetailMain anchor not found after 6 retries");
+            if (attempt < 8) {
+                scheduleSurfaceDispatch(fragment, attempt + 1);
             }
-        }, attempt == 0 ? 400L : 800L);
+        }, attempt == 0 ? 200L : 800L);
     }
 
-    private boolean tryInjectDetailMain(Object activity) {
-        if (controller == null) return false;
-        if (!(activity instanceof Activity)) return false;
-        List<Object> fragments = collectAllFragments((Activity) activity);
-        for (Object fragment : fragments) {
-            if (attachedFragments.contains(fragment)) return true;
-            Object screen = PrefRef.getPreferenceScreen(fragment);
-            if (screen == null) continue;
-            Object hiresCategory = PrefRef.findPreference(screen, KEY_HIRES_ITEM);
-            if (hiresCategory == null) continue;
-            Context context = resolveContext(fragment);
-            if (context == null) continue;
-            // If we already injected on this PreferenceScreen, mark and stop.
-            if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null) {
-                attachedFragments.add(fragment);
-                return true;
-            }
-            int hiresOrder = PrefRef.getOrder(hiresCategory);
-            int targetOrder = hiresOrder + 1;
-            // Push the categories below Hi-Res down by one to leave a slot.
-            shiftPreferenceOrders(screen, targetOrder, +1);
+    /**
+     * Decide which surface the fragment represents by inspecting the keys that exist on its
+     * PreferenceScreen, then route to the matching insertion routine.
+     */
+    private boolean dispatchSurface(Object fragment) {
+        Object screen = PrefRef.getPreferenceScreen(fragment);
+        if (screen == null) return false;
 
-            String mac = resolveMacFromActivityIntent(fragment);
-            if (mac == null) {
-                MLog.w("DetailMain mac unresolved; skip");
-                return false;
-            }
-            CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(context, screen, targetOrder);
-            if (prefs == null) return false;
-            controller.attach(mac, prefs, fragment);
+        if (PrefRef.findPreference(screen, "melody_codec_lsp_category") != null) {
+            // Already injected on this screen; mark and stop.
             attachedFragments.add(fragment);
-            MLog.event("detailmain.injected", "mac_len", mac.length(),
-                    "order", targetOrder, "fragment", fragment.getClass().getName());
             return true;
         }
+
+        // DetailMain main panel & MoreSetting (more-setting screen) both place the Hi-Res item
+        // by Class.simpleName ("HiQualityAudioItem"). DetailMain stamps it inside a "sound"
+        // PreferenceCategory that lives at the top-level of the screen, MoreSetting stamps it
+        // directly. Either way, findPreference recurses into nested PreferenceGroups, so we can
+        // probe the whole screen with a single call.
+        if (PrefRef.findPreference(screen, KEY_HIRES_ITEM) != null) {
+            return injectAfterHires(fragment, screen);
+        }
+
+        // OneSpace surface: noise_menu / more_setting categories.
+        if (PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY) != null
+                || PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY) != null) {
+            return injectIntoOneSpace(fragment, screen);
+        }
+
         return false;
     }
 
+    /**
+     * Insert the codec block immediately after the Hi-Res anchor. Used by both DetailMain
+     * (where the anchor lives inside a "sound" PreferenceCategory) and MoreSetting (where it
+     * is a top-level COUIPreferenceCategory). For nested anchors we add to the same parent
+     * group so the codec block appears as a sibling underneath; for top-level anchors we add
+     * to the root screen.
+     */
+    private boolean injectAfterHires(Object fragment, Object screen) {
+        Object anchor = PrefRef.findPreference(screen, KEY_HIRES_ITEM);
+        if (anchor == null) return false;
+        Context themedContext = resolveThemedContext(fragment);
+        if (themedContext == null) return false;
+
+        Object parent = PrefRef.getParent(anchor);
+        if (parent == null) parent = screen;
+        int anchorOrder = PrefRef.getOrder(anchor);
+        int targetOrder = anchorOrder + 1;
+        shiftPreferenceOrders(parent, targetOrder, +1);
+
+        String mac = resolveMacFromActivityIntent(fragment);
+        if (mac == null) {
+            MLog.w("Hi-Res-anchored insertion: mac unresolved; skip");
+            return false;
+        }
+        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(themedContext, parent, targetOrder);
+        if (prefs == null) return false;
+        controller.attach(mac, prefs, fragment);
+        attachedFragments.add(fragment);
+        MLog.event("hires_anchored.injected", "mac_len", mac.length(),
+                "order", targetOrder, "fragment", fragment.getClass().getName());
+        return true;
+    }
+
+    private boolean injectIntoOneSpace(Object fragment, Object screen) {
+        Context themedContext = resolveThemedContext(fragment);
+        if (themedContext == null) return false;
+
+        Object noiseMenu = PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY);
+        Object moreSetting = PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY);
+        int targetOrder;
+        if (noiseMenu != null && moreSetting != null) {
+            int low = Math.min(PrefRef.getOrder(noiseMenu), PrefRef.getOrder(moreSetting));
+            int high = Math.max(PrefRef.getOrder(noiseMenu), PrefRef.getOrder(moreSetting));
+            targetOrder = (low + high) / 2;
+            if (targetOrder == low) targetOrder = low + 1;
+        } else if (moreSetting != null) {
+            targetOrder = Math.max(0, PrefRef.getOrder(moreSetting) - 1);
+        } else {
+            targetOrder = PrefRef.getPreferenceCount(screen);
+        }
+        if (moreSetting != null && targetOrder >= PrefRef.getOrder(moreSetting)) {
+            PrefRef.setOrder(moreSetting, targetOrder + 1);
+        }
+        String mac = resolveMacFromActivityIntent(fragment);
+        if (mac == null) {
+            MLog.w("OneSpace mac unresolved; skip");
+            return false;
+        }
+        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(themedContext, screen, targetOrder);
+        if (prefs == null) return false;
+        controller.attach(mac, prefs, fragment);
+        attachedFragments.add(fragment);
+        MLog.event("onespace.injected", "mac_len", mac.length(), "order", targetOrder);
+        return true;
+    }
+
     /** Shifts the {@code order} of every Preference at index >= {@code threshold} by {@code delta}. */
-    private static void shiftPreferenceOrders(Object screen, int threshold, int delta) {
-        int count = PrefRef.getPreferenceCount(screen);
+    private static void shiftPreferenceOrders(Object container, int threshold, int delta) {
+        int count = PrefRef.getPreferenceCount(container);
         for (int i = 0; i < count; i++) {
-            Object pref = PrefRef.getPreference(screen, i);
+            Object pref = PrefRef.getPreference(container, i);
             if (pref == null) continue;
             int order = PrefRef.getOrder(pref);
             if (order >= threshold) {
@@ -203,90 +270,31 @@ public final class HostHookInstaller {
         }
     }
 
-    /**
-     * Walks the activity's FragmentManager (FragmentActivity / AppCompatActivity) and returns
-     * every fragment recursively, including child fragments. Class lookups go through
-     * reflection because the support library types are also minified inside the host APK.
-     */
-    private static List<Object> collectAllFragments(Activity activity) {
-        List<Object> out = new ArrayList<>();
-        try {
-            Method getFm = findMethodIgnoringDeclared(activity.getClass(), "getSupportFragmentManager");
-            if (getFm == null) return out;
-            Object fm = getFm.invoke(activity);
-            walkFragmentManager(fm, out, /* depth= */ 0);
-        } catch (Throwable t) {
-            MLog.w("collectAllFragments failed", t);
-        }
-        return out;
-    }
-
-    private static void walkFragmentManager(Object fm, List<Object> out, int depth) {
-        if (fm == null || depth > 4) return;
-        try {
-            Method getFragments = findMethodIgnoringDeclared(fm.getClass(), "getFragments");
-            if (getFragments == null) return;
-            Object listObj = getFragments.invoke(fm);
-            if (!(listObj instanceof Collection)) return;
-            for (Object f : (Collection<?>) listObj) {
-                if (f == null) continue;
-                out.add(f);
-                Method getChildFm =
-                        findMethodIgnoringDeclared(f.getClass(), "getChildFragmentManager");
-                if (getChildFm != null) {
-                    try {
-                        walkFragmentManager(getChildFm.invoke(f), out, depth + 1);
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            MLog.w("walkFragmentManager failed", t);
-        }
-    }
-
     private void hookHighAudio() {
         Class<?> fragCls = loadHostClass(CLASS_HIGH_AUDIO);
         if (fragCls == null) {
-            MLog.w("HighAudioPreferenceFragment class not found");
+            // HighAudio Fragment is rarely present on this build; not an error.
             return;
         }
         Method onViewCreated = findOnViewCreated(fragCls);
-        if (onViewCreated == null) {
-            MLog.w("HighAudioPreferenceFragment.onViewCreated(View,Bundle) not found");
-            return;
-        }
+        if (onViewCreated == null) return;
         module.hook(onViewCreated).intercept(chain -> {
             Object result = chain.proceed();
-            try {
-                insertIntoHighAudio(chain.getThisObject());
-            } catch (Throwable t) {
-                MLog.e("HighAudio insertion failed", t);
-            }
+            // The base-class hook will already cover this fragment via dispatchSurface, so
+            // there is nothing extra to do here. Kept hooked so future surface evolution stays
+            // observable from one place.
             return result;
         });
     }
 
     private void hookOneSpace() {
         Class<?> fragCls = loadHostClass(CLASS_ONE_SPACE_FRAGMENT);
-        if (fragCls == null) {
-            MLog.w("OneSpaceListFragment class not found");
-            return;
-        }
+        if (fragCls == null) return;
         Method onViewCreated = findOnViewCreated(fragCls);
-        if (onViewCreated == null) {
-            MLog.w("OneSpaceListFragment.onViewCreated(View,Bundle) not found");
-            return;
-        }
-        module.hook(onViewCreated).intercept(chain -> {
-            Object result = chain.proceed();
-            try {
-                insertIntoOneSpace(chain.getThisObject());
-            } catch (Throwable t) {
-                MLog.e("OneSpace insertion failed", t);
-            }
-            return result;
-        });
+        if (onViewCreated == null) return;
+        // Dispatch is handled by hookBasePreferenceFragment(); keep this hook installed only as
+        // a no-op observer so that future host evolution keeps a single owning installer.
+        module.hook(onViewCreated).intercept(chain -> chain.proceed());
     }
 
     /**
@@ -329,78 +337,6 @@ public final class HostHookInstaller {
         return null;
     }
 
-    private void insertIntoHighAudio(Object fragment) {
-        if (controller == null || attachedFragments.contains(fragment)) {
-            return;
-        }
-        Context context = resolveContext(fragment);
-        if (context == null) {
-            MLog.w("HighAudio insertion skipped: no context");
-            return;
-        }
-        Object screen = PrefRef.getPreferenceScreen(fragment);
-        if (screen == null) {
-            MLog.w("HighAudio screen is null");
-            return;
-        }
-        Object hires = PrefRef.findPreference(screen, MelodyResIds.KEY_HIRES_SWITCH_CATEGORY);
-        int order = hires != null ? PrefRef.getOrder(hires) + 1 : PrefRef.getPreferenceCount(screen);
-        String mac = resolveHighAudioMac(fragment);
-        if (mac == null) {
-            MLog.w("HighAudio mac unresolved; skip");
-            return;
-        }
-        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(context, screen, order);
-        if (prefs == null) return;
-        controller.attach(mac, prefs, fragment);
-        attachedFragments.add(fragment);
-        MLog.event("highaudio.injected", "mac_len", mac.length(), "order", order);
-    }
-
-    private void insertIntoOneSpace(Object fragment) {
-        if (controller == null || attachedFragments.contains(fragment)) {
-            return;
-        }
-        Context context = resolveContext(fragment);
-        if (context == null) {
-            MLog.w("OneSpace insertion skipped: no context");
-            return;
-        }
-        Object screen = PrefRef.getPreferenceScreen(fragment);
-        if (screen == null) {
-            MLog.w("OneSpace screen is null");
-            return;
-        }
-        Object noiseMenu = PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY);
-        Object moreSetting = PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY);
-
-        int targetOrder;
-        if (noiseMenu != null && moreSetting != null) {
-            int low = Math.min(PrefRef.getOrder(noiseMenu), PrefRef.getOrder(moreSetting));
-            int high = Math.max(PrefRef.getOrder(noiseMenu), PrefRef.getOrder(moreSetting));
-            targetOrder = (low + high) / 2;
-            if (targetOrder == low) targetOrder = low + 1;
-        } else if (moreSetting != null) {
-            targetOrder = Math.max(0, PrefRef.getOrder(moreSetting) - 1);
-        } else {
-            targetOrder = PrefRef.getPreferenceCount(screen);
-        }
-        if (moreSetting != null && targetOrder >= PrefRef.getOrder(moreSetting)) {
-            PrefRef.setOrder(moreSetting, targetOrder + 1);
-        }
-
-        String mac = resolveOneSpaceMac(fragment);
-        if (mac == null) {
-            MLog.w("OneSpace mac unresolved; skip");
-            return;
-        }
-        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(context, screen, targetOrder);
-        if (prefs == null) return;
-        controller.attach(mac, prefs, fragment);
-        attachedFragments.add(fragment);
-        MLog.event("onespace.injected", "mac_len", mac.length(), "order", targetOrder);
-    }
-
     /** Calls {@code Fragment.requireContext()} via reflection. */
     private static Context resolveContext(Object fragment) {
         try {
@@ -417,6 +353,35 @@ public final class HostHookInstaller {
             MLog.w("resolveContext failed", t);
             return null;
         }
+    }
+
+    /**
+     * Resolve the {@link Context} that has the host {@code preferenceTheme} overlay applied.
+     *
+     * <p>{@code androidx.preference.PreferenceFragmentCompat} caches a themed context inside
+     * its {@code PreferenceManager} so that programmatic {@code new COUIPreferenceCategory(ctx)}
+     * picks up {@code R.style.Preference_Category_*} (= correct title color, padding, dark-mode
+     * tint). {@code Fragment.requireContext()} returns the un-themed activity context, so any
+     * Preference instantiated against it paints centre-aligned grey text on a transparent
+     * background. We prefer the themed context.</p>
+     */
+    private static Context resolveThemedContext(Object fragment) {
+        try {
+            Method getPm = findMethodIgnoringDeclared(fragment.getClass(), "getPreferenceManager");
+            if (getPm != null) {
+                Object pm = getPm.invoke(fragment);
+                if (pm != null) {
+                    Method getCtx = findMethodIgnoringDeclared(pm.getClass(), "getContext");
+                    if (getCtx != null) {
+                        Object ctx = getCtx.invoke(pm);
+                        if (ctx instanceof Context) return (Context) ctx;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            MLog.w("resolveThemedContext via PreferenceManager failed", t);
+        }
+        return resolveContext(fragment);
     }
 
     /**
