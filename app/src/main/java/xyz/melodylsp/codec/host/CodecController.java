@@ -20,7 +20,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
-import xyz.melodylsp.codec.R;
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.bt.BluetoothCodecReflect;
@@ -243,14 +242,14 @@ public final class CodecController {
         bridge.setCodec(request).whenComplete((result, ex) -> mainHandler.post(() -> {
             if (ex != null) {
                 MLog.e("setCodec future failed", ex);
-                Toast.makeText(context, R.string.toast_apply_failed, Toast.LENGTH_SHORT).show();
+                Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
                 refreshSnapshot(sub);
                 return;
             }
             switch (result.outcome) {
                 case CONFIRMED:
                     if (result.path == WriteResult.Path.SETTINGS_GLOBAL) {
-                        Toast.makeText(context, R.string.banner_via_settings, Toast.LENGTH_LONG).show();
+                        Toast.makeText(context, Strings.BANNER_VIA_SETTINGS, Toast.LENGTH_LONG).show();
                     }
                     if (prefs.isRemembered(sub.mac)) {
                         prefs.writeSnapshot(sub.mac, request.codecSpecific1, request.sampleRate);
@@ -258,7 +257,7 @@ public final class CodecController {
                     refreshSnapshot(sub);
                     break;
                 case TIMEOUT_ROLLED_BACK:
-                    Toast.makeText(context, R.string.toast_apply_failed, Toast.LENGTH_SHORT).show();
+                    Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
                     if (result.rollbackSnapshot != null) {
                         publish(result.rollbackSnapshot, sub);
                     } else {
@@ -267,7 +266,7 @@ public final class CodecController {
                     break;
                 case FAILED:
                 default:
-                    Toast.makeText(context, R.string.toast_apply_failed, Toast.LENGTH_SHORT).show();
+                    Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
                     refreshSnapshot(sub);
                     break;
             }
@@ -323,7 +322,7 @@ public final class CodecController {
     }
 
     private void renderUnknown(Subscription sub) {
-        PrefRef.setSummary(sub.prefs.codecDisplay, context.getString(R.string.state_codec_unknown));
+        PrefRef.setSummary(sub.prefs.codecDisplay, Strings.STATE_CODEC_UNKNOWN);
         PrefRef.setVisible(sub.prefs.qualityOption, false);
         PrefRef.setVisible(sub.prefs.sampleRateOption, false);
         PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
@@ -334,7 +333,7 @@ public final class CodecController {
         if (fromCache) {
             String stamp = new SimpleDateFormat("HH:mm:ss", Locale.ROOT).format(new Date());
             PrefRef.setSummary(sub.prefs.codecDisplay,
-                    codecName + "  ·  " + context.getString(R.string.freshness_label, stamp));
+                    codecName + "  ·  " + String.format(Strings.FRESHNESS_LABEL_FORMAT, stamp));
         } else {
             PrefRef.setSummary(sub.prefs.codecDisplay, codecName);
         }
@@ -367,7 +366,7 @@ public final class CodecController {
         PrefRef.setEntryValues(q, values);
         String currentValue = String.valueOf(snapshot.activeCodecSpecific1);
         if (!Arrays.asList(values).contains(currentValue)) {
-            PrefRef.setSummary(q, context.getString(R.string.quality_unknown_value, currentValue));
+            PrefRef.setSummary(q, String.format(Strings.QUALITY_UNKNOWN_VALUE_FORMAT, currentValue));
         } else {
             PrefRef.setValue(q, currentValue);
             PrefRef.setSummary(q, CodecLabelTable.qualityLabel(

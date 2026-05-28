@@ -1,9 +1,8 @@
 package xyz.melodylsp.codec.label;
 
 import android.content.Context;
-import android.content.res.Resources;
 
-import xyz.melodylsp.codec.R;
+import xyz.melodylsp.codec.host.Strings;
 
 /**
  * Static label tables and fallback formatters. Selectable sets always come from system
@@ -12,6 +11,12 @@ import xyz.melodylsp.codec.R;
  * <p>Codec / quality / sample-rate ids correspond to {@code BluetoothCodecConfig}. Because the
  * module targets Android 13+, the constants are inlined to avoid {@code @hide} resolution
  * problems at compile time.
+ *
+ * <p>Strings are hard-coded via {@link Strings} rather than fetched through {@code R.string}.
+ * The module APK gets its own resource id range that overlaps with the host APK; reading
+ * strings via {@code Context.getString(int)} on a host {@code Context} returns whatever
+ * happens to live at that id in the host APK (usually the path to a host XML resource), not
+ * our string. Hard-coding sidesteps the entire resource lookup.</p>
  */
 public final class CodecLabelTable {
 
@@ -40,26 +45,25 @@ public final class CodecLabelTable {
     private CodecLabelTable() {
     }
 
-    /** Resolve the user-facing codec name. */
+    /** Resolve the user-facing codec name. {@code context} is unused but kept for API stability. */
     public static String codecLabel(Context context, int codecType) {
-        Resources r = context.getResources();
         switch (codecType) {
             case CODEC_SBC:
-                return r.getString(R.string.codec_label_sbc);
+                return Strings.CODEC_LABEL_SBC;
             case CODEC_AAC:
-                return r.getString(R.string.codec_label_aac);
+                return Strings.CODEC_LABEL_AAC;
             case CODEC_APTX:
-                return r.getString(R.string.codec_label_aptx);
+                return Strings.CODEC_LABEL_APTX;
             case CODEC_APTX_HD:
-                return r.getString(R.string.codec_label_aptx_hd);
+                return Strings.CODEC_LABEL_APTX_HD;
             case CODEC_LDAC:
-                return r.getString(R.string.codec_label_ldac);
+                return Strings.CODEC_LABEL_LDAC;
             case CODEC_OPUS:
-                return r.getString(R.string.codec_label_opus);
+                return Strings.CODEC_LABEL_OPUS;
             case CODEC_APTX_ADAPTIVE:
-                return r.getString(R.string.codec_label_aptx_adaptive);
+                return Strings.CODEC_LABEL_APTX_ADAPTIVE;
             case CODEC_LHDC:
-                return r.getString(R.string.codec_label_lhdc);
+                return Strings.CODEC_LABEL_LHDC;
             default:
                 return "Codec(0x" + Integer.toHexString(codecType) + ")";
         }
@@ -67,20 +71,19 @@ public final class CodecLabelTable {
 
     /** Resolve the LDAC / LHDC quality label, or fall back to {@code "档位 (rawValue)"}. */
     public static String qualityLabel(Context context, int codecType, long specific1) {
-        Resources r = context.getResources();
         if (codecType == CODEC_LDAC) {
-            if (specific1 == LDAC_QUALITY_HIGH) return r.getString(R.string.quality_ldac_990);
-            if (specific1 == LDAC_QUALITY_MID) return r.getString(R.string.quality_ldac_660);
-            if (specific1 == LDAC_QUALITY_LOW) return r.getString(R.string.quality_ldac_330);
+            if (specific1 == LDAC_QUALITY_HIGH) return Strings.QUALITY_LDAC_990;
+            if (specific1 == LDAC_QUALITY_MID) return Strings.QUALITY_LDAC_660;
+            if (specific1 == LDAC_QUALITY_LOW) return Strings.QUALITY_LDAC_330;
         }
         if (codecType == CODEC_LHDC) {
             // The vendor encodes the version in the low byte; mask it before lookup so that
             // future bit fields (e.g. lossless toggle) do not break label resolution.
             long versionByte = specific1 & 0xFFL;
-            if (versionByte == LHDC_V1) return r.getString(R.string.quality_lhdc_v1);
-            if (versionByte == LHDC_V2) return r.getString(R.string.quality_lhdc_v2);
-            if (versionByte == LHDC_V3) return r.getString(R.string.quality_lhdc_v3);
-            if (versionByte == LHDC_V5) return r.getString(R.string.quality_lhdc_v5);
+            if (versionByte == LHDC_V1) return Strings.QUALITY_LHDC_V1;
+            if (versionByte == LHDC_V2) return Strings.QUALITY_LHDC_V2;
+            if (versionByte == LHDC_V3) return Strings.QUALITY_LHDC_V3;
+            if (versionByte == LHDC_V5) return Strings.QUALITY_LHDC_V5;
         }
         return "档位 (" + specific1 + ")";
     }

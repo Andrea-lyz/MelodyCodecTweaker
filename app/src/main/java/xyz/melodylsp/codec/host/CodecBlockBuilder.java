@@ -2,7 +2,6 @@ package xyz.melodylsp.codec.host;
 
 import android.content.Context;
 
-import xyz.melodylsp.codec.R;
 import xyz.melodylsp.codec.util.MLog;
 
 /**
@@ -47,14 +46,14 @@ public final class CodecBlockBuilder {
             return null;
         }
         PrefRef.setKey(category, "melody_codec_lsp_category");
-        PrefRef.setTitle(category, context.getString(R.string.codec_block_title));
+        PrefRef.setTitle(category, Strings.CODEC_BLOCK_TITLE);
         PrefRef.setOrder(category, order);
         PrefRef.addPreference(screen, category);
 
         Object codecDisplay = newOf(context, COUI_PREFERENCE, ANDX_PREFERENCE);
         PrefRef.setKey(codecDisplay, "melody_codec_lsp_display");
-        PrefRef.setTitle(codecDisplay, context.getString(R.string.codec_display_title));
-        PrefRef.setSummary(codecDisplay, context.getString(R.string.state_codec_unknown));
+        PrefRef.setTitle(codecDisplay, Strings.CODEC_DISPLAY_TITLE);
+        PrefRef.setSummary(codecDisplay, Strings.STATE_CODEC_UNKNOWN);
         PrefRef.setSelectable(codecDisplay, false);
         PrefRef.setIconSpaceReserved(codecDisplay, false);
         PrefRef.setPersistent(codecDisplay, false);
@@ -62,7 +61,7 @@ public final class CodecBlockBuilder {
 
         Object quality = newOf(context, COUI_LIST_PREFERENCE, ANDX_LIST_PREFERENCE);
         PrefRef.setKey(quality, "melody_codec_lsp_quality");
-        PrefRef.setTitle(quality, context.getString(R.string.quality_option_title));
+        PrefRef.setTitle(quality, Strings.QUALITY_OPTION_TITLE);
         PrefRef.setVisible(quality, false);
         PrefRef.setIconSpaceReserved(quality, false);
         PrefRef.setPersistent(quality, false);
@@ -70,7 +69,7 @@ public final class CodecBlockBuilder {
 
         Object sampleRate = newOf(context, COUI_LIST_PREFERENCE, ANDX_LIST_PREFERENCE);
         PrefRef.setKey(sampleRate, "melody_codec_lsp_sample_rate");
-        PrefRef.setTitle(sampleRate, context.getString(R.string.sample_rate_option_title));
+        PrefRef.setTitle(sampleRate, Strings.SAMPLE_RATE_OPTION_TITLE);
         PrefRef.setVisible(sampleRate, false);
         PrefRef.setIconSpaceReserved(sampleRate, false);
         PrefRef.setPersistent(sampleRate, false);
@@ -78,8 +77,8 @@ public final class CodecBlockBuilder {
 
         Object remember = newOf(context, COUI_SWITCH_PREFERENCE, ANDX_SWITCH_PREFERENCE_COMPAT);
         PrefRef.setKey(remember, "melody_codec_lsp_remember");
-        PrefRef.setTitle(remember, context.getString(R.string.remember_toggle_title));
-        PrefRef.setSummary(remember, context.getString(R.string.remember_toggle_summary));
+        PrefRef.setTitle(remember, Strings.REMEMBER_TOGGLE_TITLE);
+        PrefRef.setSummary(remember, Strings.REMEMBER_TOGGLE_SUMMARY);
         PrefRef.setIconSpaceReserved(remember, false);
         PrefRef.setPersistent(remember, false);
         PrefRef.addPreference(category, remember);
