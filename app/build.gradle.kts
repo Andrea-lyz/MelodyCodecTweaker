@@ -26,12 +26,10 @@ android {
 
     buildTypes {
         getByName("release") {
-            isMinifyEnabled = true
+            // R8 disabled for now — we want a clean repro path. Re-enable once we have
+            // verified hooks work end-to-end and proguard rules are tuned.
+            isMinifyEnabled = false
             isShrinkResources = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
         }
         getByName("debug") {
             isMinifyEnabled = false

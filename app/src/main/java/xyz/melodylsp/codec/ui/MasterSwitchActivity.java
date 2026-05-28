@@ -27,10 +27,9 @@ public final class MasterSwitchActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Use MODE_WORLD_READABLE so older LSPosed implementations that read the file directly
-        // (rather than via the libxposed remote prefs pipe) can still observe changes.
-        @SuppressWarnings("WorldReadableFiles")
-        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_WORLD_READABLE);
+        // libxposed framework reads this SharedPreferences via the remote prefs pipe; on
+        // modern Android we just use MODE_PRIVATE and let the framework handle propagation.
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         boolean enabled = prefs.getBoolean(KEY_ENABLED, true);
 
         LinearLayout root = new LinearLayout(this);
