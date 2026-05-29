@@ -66,6 +66,7 @@ public final class LeAudioManager {
 
     private final Map<String, Boolean> supportedByMac = new ConcurrentHashMap<>();
     private final Map<String, Boolean> enabledByMac = new ConcurrentHashMap<>();
+    private final Map<String, Boolean> connectedByMac = new ConcurrentHashMap<>();
 
     private BroadcastReceiver receiver;
 
@@ -87,6 +88,12 @@ public final class LeAudioManager {
         return v != null && v;
     }
 
+    /** True when either LE Audio or classic audio has recently reported a live profile. */
+    public boolean isConnected(String mac) {
+        Boolean v = mac != null ? connectedByMac.get(mac) : null;
+        return v != null && v;
+    }
+
     /**
      * Begin tracking a MAC: read the local best-effort state immediately and ask the
      * bluetooth bridge for the authoritative state. Safe to call repeatedly.
@@ -97,6 +104,11 @@ public final class LeAudioManager {
         boolean en = readEnabledFromPrefs(mac, isEnabled(mac));
         supportedByMac.put(mac, sup);
         enabledByMac.put(mac, en);
+        if (en) {
+            connectedByMac.put(mac, true);
+        } else {
+            connectedByMac.putIfAbsent(mac, false);
+        }
         notifyChanged(mac);
         queryBridge(mac);
     }
@@ -178,9 +190,15 @@ public final class LeAudioManager {
         if (mac == null) return;
         boolean sup = intent.getBooleanExtra(LeAudioIpc.EXTRA_SUPPORTED, isSupported(mac));
         boolean en = intent.getBooleanExtra(LeAudioIpc.EXTRA_ENABLED, isEnabled(mac));
+        boolean connected = intent.getBooleanExtra(
+                LeAudioIpc.EXTRA_CONNECTED, isConnected(mac) || en);
         supportedByMac.put(mac, sup);
         enabledByMac.put(mac, en);
-        MLog.event("le.melody.state.recv", "supported", sup, "enabled", en);
+        connectedByMac.put(mac, connected || en);
+        MLog.event("le.melody.state.recv",
+                "supported", sup,
+                "enabled", en,
+                "connected", connected);
         notifyChanged(mac);
     }
 
@@ -211,9 +229,28 @@ public final class LeAudioManager {
         }
         int state = intent.getIntExtra(EXTRA_CONNECTION_STATE, -1);
         String action = intent.getAction();
-        if (ACTION_LE_AUDIO_CONNECTION_STATE_CHANGED.equals(action)
-                && state == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
-            enabledByMac.put(mac, true);
+        boolean changed = false;
+        if (ACTION_LE_AUDIO_CONNECTION_STATE_CHANGED.equals(action)) {
+            if (state == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
+                enabledByMac.put(mac, true);
+                connectedByMac.put(mac, true);
+                changed = true;
+            } else if (state == android.bluetooth.BluetoothProfile.STATE_DISCONNECTED
+                    && !isEnabled(mac)) {
+                connectedByMac.put(mac, false);
+                changed = true;
+            }
+        } else if (ACTION_A2DP_CONNECTION_STATE_CHANGED.equals(action)) {
+            if (state == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
+                connectedByMac.put(mac, true);
+                changed = true;
+            } else if (state == android.bluetooth.BluetoothProfile.STATE_DISCONNECTED
+                    && !isEnabled(mac)) {
+                connectedByMac.put(mac, false);
+                changed = true;
+            }
+        }
+        if (changed) {
             notifyChanged(mac);
         }
         mainHandler.postDelayed(() -> queryBridge(mac), 1200L);

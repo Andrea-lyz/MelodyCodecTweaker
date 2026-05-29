@@ -25,6 +25,7 @@ import xyz.melodylsp.codec.util.MLog;
 public final class BluetoothLeAudioBridge {
 
     private static final int PROFILE_LE_AUDIO = 22;
+    private static final int PROFILE_A2DP = 2;
     private static final int CONNECTION_POLICY_FORBIDDEN = 0;
     private static final int CONNECTION_POLICY_ALLOWED = 100;
     private static final String ACTION_CHANGE_LEA_CONN_STATE =
@@ -35,6 +36,7 @@ public final class BluetoothLeAudioBridge {
     private final Context context;
     private volatile boolean registered;
     private volatile Object leAudioProxy;
+    private volatile Object a2dpProxy;
 
     public BluetoothLeAudioBridge(Context context) {
         this.context = context.getApplicationContext();
@@ -100,12 +102,24 @@ public final class BluetoothLeAudioBridge {
         }
         if (ok) {
             sendTransportSwitch(device, enable);
+            if (!enable) {
+                reconnectA2dpLater(device, 1200L);
+                reconnectA2dpLater(device, 3200L);
+            }
         }
         return ok;
     }
 
     private synchronized Object acquireProxyBlocking() {
-        Object current = leAudioProxy;
+        return acquireProfileProxyBlocking(PROFILE_LE_AUDIO);
+    }
+
+    private synchronized Object acquireA2dpProxyBlocking() {
+        return acquireProfileProxyBlocking(PROFILE_A2DP);
+    }
+
+    private synchronized Object acquireProfileProxyBlocking(int targetProfile) {
+        Object current = targetProfile == PROFILE_LE_AUDIO ? leAudioProxy : a2dpProxy;
         if (current != null) return current;
         BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
         if (adapter == null) return null;
@@ -113,7 +127,7 @@ public final class BluetoothLeAudioBridge {
         BluetoothProfile.ServiceListener listener = new BluetoothProfile.ServiceListener() {
             @Override
             public void onServiceConnected(int profile, BluetoothProfile proxy) {
-                if (profile == PROFILE_LE_AUDIO && proxy != null) {
+                if (profile == targetProfile && proxy != null) {
                     future.complete(proxy);
                 }
             }
@@ -122,19 +136,25 @@ public final class BluetoothLeAudioBridge {
             public void onServiceDisconnected(int profile) {
                 if (profile == PROFILE_LE_AUDIO) {
                     leAudioProxy = null;
+                } else if (profile == PROFILE_A2DP) {
+                    a2dpProxy = null;
                 }
             }
         };
         try {
-            if (!adapter.getProfileProxy(context, listener, PROFILE_LE_AUDIO)) {
-                MLog.w("le.bt.getProfileProxy returned false");
+            if (!adapter.getProfileProxy(context, listener, targetProfile)) {
+                MLog.w("le.bt.getProfileProxy returned false profile=" + targetProfile);
                 return null;
             }
             Object proxy = future.get(2000L, TimeUnit.MILLISECONDS);
-            leAudioProxy = proxy;
+            if (targetProfile == PROFILE_LE_AUDIO) {
+                leAudioProxy = proxy;
+            } else if (targetProfile == PROFILE_A2DP) {
+                a2dpProxy = proxy;
+            }
             return proxy;
         } catch (Throwable t) {
-            MLog.w("le.bt.acquireProxy failed", t);
+            MLog.w("le.bt.acquireProxy failed profile=" + targetProfile, t);
             return null;
         }
     }
@@ -198,6 +218,33 @@ public final class BluetoothLeAudioBridge {
         }
     }
 
+    private void reconnectA2dpLater(BluetoothDevice device, long delayMs) {
+        new Thread(() -> {
+            try {
+                Thread.sleep(delayMs);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            reconnectA2dp(device);
+        }, "MelodyCodecLsp-a2dp-reconnect").start();
+    }
+
+    private void reconnectA2dp(BluetoothDevice device) {
+        Object proxy = acquireA2dpProxyBlocking();
+        if (proxy == null || device == null) {
+            MLog.w("le.bt.a2dp.reconnect skipped");
+            return;
+        }
+        boolean policyOk = setConnectionPolicy(proxy, device, CONNECTION_POLICY_ALLOWED);
+        Boolean connectOk = invokeBoolean(proxy, "connect",
+                new Class[]{BluetoothDevice.class}, new Object[]{device});
+        int state = getProfileConnectionState(proxy, device);
+        MLog.event("le.bt.a2dp.reconnect",
+                "policyOk", policyOk,
+                "connectOk", connectOk,
+                "state", state);
+    }
+
     private void replyLater(String mac, boolean ok, long delayMs) {
         try {
             Thread.sleep(delayMs);
@@ -211,16 +258,22 @@ public final class BluetoothLeAudioBridge {
         Object proxy = acquireProxyBlocking();
         boolean supported = proxy != null;
         boolean enabled = supported && isLeAudioEnabled(proxy, mac);
+        boolean connected = supported && isLeAudioConnected(proxy, mac);
         Intent reply = new Intent(LeAudioIpc.ACTION_LE_AUDIO_STATE);
         reply.setPackage(LeAudioIpc.MELODY_PKG);
         reply.putExtra(LeAudioIpc.EXTRA_TOKEN, LeAudioIpc.TOKEN);
         reply.putExtra(LeAudioIpc.EXTRA_MAC, mac);
         reply.putExtra(LeAudioIpc.EXTRA_SUPPORTED, supported);
         reply.putExtra(LeAudioIpc.EXTRA_ENABLED, enabled);
+        reply.putExtra(LeAudioIpc.EXTRA_CONNECTED, connected);
         reply.putExtra(LeAudioIpc.EXTRA_OK, ok);
         try {
             context.sendBroadcast(reply);
-            MLog.event("le.bt.reply", "supported", supported, "enabled", enabled, "ok", ok);
+            MLog.event("le.bt.reply",
+                    "supported", supported,
+                    "enabled", enabled,
+                    "connected", connected,
+                    "ok", ok);
         } catch (Throwable t) {
             MLog.w("le.bt.reply send failed", t);
         }
@@ -235,14 +288,28 @@ public final class BluetoothLeAudioBridge {
                 new Class[]{BluetoothDevice.class}, new Object[]{device});
         if (enabled != null) return enabled;
         try {
-            Method m = findMethod(proxy.getClass(), "getConnectionState", BluetoothDevice.class);
-            if (m == null) return false;
-            m.setAccessible(true);
-            Object out = m.invoke(proxy, device);
-            return out instanceof Integer
-                    && ((Integer) out) == BluetoothProfile.STATE_CONNECTED;
+            return getProfileConnectionState(proxy, device) == BluetoothProfile.STATE_CONNECTED;
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    private static boolean isLeAudioConnected(Object proxy, String mac) {
+        BluetoothDevice device = resolveDevice(mac);
+        return proxy != null
+                && device != null
+                && getProfileConnectionState(proxy, device) == BluetoothProfile.STATE_CONNECTED;
+    }
+
+    private static int getProfileConnectionState(Object proxy, BluetoothDevice device) {
+        try {
+            Method m = findMethod(proxy.getClass(), "getConnectionState", BluetoothDevice.class);
+            if (m == null) return BluetoothProfile.STATE_DISCONNECTED;
+            m.setAccessible(true);
+            Object out = m.invoke(proxy, device);
+            return out instanceof Integer ? (Integer) out : BluetoothProfile.STATE_DISCONNECTED;
+        } catch (Throwable t) {
+            return BluetoothProfile.STATE_DISCONNECTED;
         }
     }
 

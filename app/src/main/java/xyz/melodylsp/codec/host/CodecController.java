@@ -104,6 +104,9 @@ public final class CodecController {
             if (sub.mac == null || !sub.mac.equals(mac)) continue;
             applyLeAudioToSwitch(sub);
             if (leOn) {
+                // LC3 takes over the LE transport and A2DP reports DISCONNECTED. Keep the
+                // injected block interactive instead of treating that as "no earphone".
+                sub.connected = Boolean.TRUE;
                 CodecSnapshot snap = lastSnapshot.get();
                 if (snap != null && mac.equals(snap.mac) && !Boolean.FALSE.equals(sub.connected)) {
                     renderSnapshot(snap, sub, /* fromCache= */ false);
@@ -115,6 +118,8 @@ public final class CodecController {
                 // LE Audio turned off: A2DP is coming back, so re-read the real codec status
                 // instead of trusting the now-stale snapshot.
                 refreshSnapshot(sub);
+                refreshSnapshotDelayed(sub, 1200L);
+                refreshSnapshotDelayed(sub, 3200L);
             }
         }
     }
@@ -988,6 +993,10 @@ public final class CodecController {
         worker.start();
     }
 
+    private void refreshSnapshotDelayed(Subscription sub, long delayMs) {
+        mainHandler.postDelayed(() -> refreshSnapshot(sub), delayMs);
+    }
+
     private void publish(CodecSnapshot snapshot, Subscription sub) {
         if (snapshot != null) {
             lastSnapshot.set(snapshot);
@@ -1005,7 +1014,8 @@ public final class CodecController {
         mainHandler.post(() -> {
             lastSnapshot.set(snapshot);
             for (Subscription sub : subscriptions.values()) {
-                if (snapshot.mac.equals(sub.mac) && !Boolean.FALSE.equals(sub.connected)) {
+                if (snapshot.mac.equals(sub.mac)) {
+                    sub.connected = Boolean.TRUE;
                     renderSnapshot(snapshot, sub, /* fromCache= */ false);
                 }
             }
@@ -1014,21 +1024,9 @@ public final class CodecController {
 
     private void renderUnknown(Subscription sub) {
         // When LE Audio is enabled the A2DP codec status is unavailable (the device is on the
-        // LE transport), but that is NOT a disconnect — show the LC3 state instead of
-        // "未连接耳机" so the codec block stays meaningful. Only treat it as LE Audio when the
-        // device is not explicitly reported disconnected.
-        if (leAudioManager.isEnabled(sub.mac) && !Boolean.FALSE.equals(sub.connected)) {
-            if (sub.prefs.codecDisplay != null) {
-                PrefRef.setTitle(sub.prefs.codecDisplay,
-                        Strings.CODEC_BLOCK_TITLE + " : " + Strings.CODEC_LABEL_LC3);
-            }
-            PrefRef.setVisible(sub.prefs.qualityOption, false);
-            PrefRef.setVisible(sub.prefs.sampleRateOption, false);
-            setBlockDisabled(sub, false);
-            applyLeAudioToSwitch(sub);
-            if (sub.prefs.rememberToggle != null) {
-                PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
-            }
+        // LE transport), but that is NOT a disconnect — show LC3 and keep the switch usable.
+        if (leAudioManager.isEnabled(sub.mac)) {
+            renderLeAudioActive(sub);
             return;
         }
         if (sub.prefs.codecDisplay != null) {
@@ -1047,25 +1045,15 @@ public final class CodecController {
     }
 
     private void renderSnapshot(CodecSnapshot snapshot, Subscription sub, boolean fromCache) {
-        if (Boolean.FALSE.equals(sub.connected)) {
-            renderUnknown(sub);
-            return;
-        }
         // LE Audio override (TODO B): when LE Audio is on, the device runs LC3 over the LE
         // transport, so the A2DP codec / quality / sample-rate controls do not apply. Show
         // "蓝牙音质 : LC3" and hide the quality + sample-rate rows on BOTH surfaces.
         if (leAudioManager.isEnabled(sub.mac)) {
-            if (sub.prefs.codecDisplay != null) {
-                PrefRef.setTitle(sub.prefs.codecDisplay,
-                        Strings.CODEC_BLOCK_TITLE + " : " + Strings.CODEC_LABEL_LC3);
-            }
-            PrefRef.setVisible(sub.prefs.qualityOption, false);
-            PrefRef.setVisible(sub.prefs.sampleRateOption, false);
-            setBlockDisabled(sub, false);
-            applyLeAudioToSwitch(sub);
-            if (sub.prefs.rememberToggle != null) {
-                PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
-            }
+            renderLeAudioActive(sub);
+            return;
+        }
+        if (Boolean.FALSE.equals(sub.connected)) {
+            renderUnknown(sub);
             return;
         }
         String codecName = CodecLabelTable.codecLabel(
@@ -1085,6 +1073,20 @@ public final class CodecController {
 
         renderQuality(snapshot, sub);
         renderSampleRate(snapshot, sub);
+        applyLeAudioToSwitch(sub);
+        if (sub.prefs.rememberToggle != null) {
+            PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+        }
+    }
+
+    private void renderLeAudioActive(Subscription sub) {
+        if (sub.prefs.codecDisplay != null) {
+            PrefRef.setTitle(sub.prefs.codecDisplay,
+                    Strings.CODEC_BLOCK_TITLE + " : " + Strings.CODEC_LABEL_LC3);
+        }
+        PrefRef.setVisible(sub.prefs.qualityOption, false);
+        PrefRef.setVisible(sub.prefs.sampleRateOption, false);
+        setBlockDisabled(sub, false);
         applyLeAudioToSwitch(sub);
         if (sub.prefs.rememberToggle != null) {
             PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
@@ -1279,6 +1281,11 @@ public final class CodecController {
                         int state = intent.getIntExtra(EXTRA_CONNECTION_STATE, -1);
                         if (state != -1 && state != BluetoothProfile.STATE_CONNECTED) {
                             mainHandler.post(() -> {
+                                if (leAudioManager.isEnabled(mac)) {
+                                    connected = Boolean.TRUE;
+                                    renderLeAudioActive(Subscription.this);
+                                    return;
+                                }
                                 connected = Boolean.FALSE;
                                 lastSnapshot.set(null);
                                 renderUnknown(Subscription.this);
@@ -1289,7 +1296,15 @@ public final class CodecController {
                             connected = Boolean.TRUE;
                         }
                         refreshSnapshot(Subscription.this);
+                        if (state == BluetoothProfile.STATE_CONNECTED) {
+                            refreshSnapshotDelayed(Subscription.this, 1200L);
+                            refreshSnapshotDelayed(Subscription.this, 3200L);
+                        }
                     } else if (ACTION_CODEC_CONFIG_CHANGED.equals(action)) {
+                        if (leAudioManager.isEnabled(mac)) {
+                            renderLeAudioActive(Subscription.this);
+                            return;
+                        }
                         refreshSnapshot(Subscription.this);
                     }
                 }
