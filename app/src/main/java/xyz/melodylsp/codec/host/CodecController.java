@@ -72,6 +72,7 @@ public final class CodecController {
     private final ConnectionStateReplayer replayer;
     private final Map<Object, Subscription> subscriptions = new HashMap<>();
     private final AtomicReference<CodecSnapshot> lastSnapshot = new AtomicReference<>();
+    private final xyz.melodylsp.codec.leaudio.LeAudioManager leAudioManager;
 
     public CodecController(
             Context context,
@@ -85,7 +86,36 @@ public final class CodecController {
         this.replayer = new ConnectionStateReplayer(this.context, bridge, prefs);
         this.replayer.start();
         this.bridge.addSnapshotListener(this::onPushedSnapshot);
+        this.leAudioManager = new xyz.melodylsp.codec.leaudio.LeAudioManager(
+                this.context, this::onLeAudioStateChanged);
         registerActivityCleanup();
+    }
+
+    /**
+     * Re-render every subscription bound to {@code mac} when its LE Audio state changes. This
+     * is what lets OneSpace — which has no LE Audio switch of its own — still react (codec name
+     * → LC3, hide quality / sample-rate rows) when LE Audio is toggled from DetailMain or the
+     * system.
+     */
+    private void onLeAudioStateChanged(String mac) {
+        boolean leOn = leAudioManager.isEnabled(mac);
+        for (Subscription sub : subscriptions.values()) {
+            if (sub.mac == null || !sub.mac.equals(mac)) continue;
+            applyLeAudioToSwitch(sub);
+            if (leOn) {
+                CodecSnapshot snap = lastSnapshot.get();
+                if (snap != null && mac.equals(snap.mac) && !Boolean.FALSE.equals(sub.connected)) {
+                    renderSnapshot(snap, sub, /* fromCache= */ false);
+                } else {
+                    // LE Audio took over the transport; renderUnknown shows the LC3 state.
+                    renderUnknown(sub);
+                }
+            } else {
+                // LE Audio turned off: A2DP is coming back, so re-read the real codec status
+                // instead of trusting the now-stale snapshot.
+                refreshSnapshot(sub);
+            }
+        }
     }
 
     /**
@@ -198,14 +228,40 @@ public final class CodecController {
 
     /** Bring the optional LE Audio switch to life (TODO B1 / B2). No-op when absent. */
     private void wireLeAudio(Subscription sub) {
+        // Always track LE Audio state for this MAC (even without a switch on this surface), so
+        // OneSpace can hide the codec rows when LE Audio is on.
+        leAudioManager.ensureTracking(sub.mac);
         if (sub.prefs.leAudioSwitch == null) return;
-        try {
-            sub.leAudio = new xyz.melodylsp.codec.leaudio.LeAudioUiController(
-                    context, sub.mac, sub.prefs.leAudioSwitch, sub.fragment, sub.prefs.uiContext);
-            sub.leAudio.start();
-        } catch (Throwable t) {
-            MLog.w("wireLeAudio failed", t);
+        ClassLoader cl = context.getClassLoader();
+        Class<?> changeListenerCls = resolveChangeListenerInterface(cl, sub.prefs.leAudioSwitch);
+        if (changeListenerCls != null) {
+            Object listener = Proxy.newProxyInstance(cl, new Class[]{changeListenerCls},
+                    (proxy, method, args) -> {
+                        if (args == null || args.length < 2 || !(args[1] instanceof Boolean)) {
+                            return false;
+                        }
+                        boolean requested = (Boolean) args[1];
+                        leAudioManager.requestToggle(sub.mac, requested);
+                        // Return false: do not flip the switch yet. The wirelesssettings dialog
+                        // confirms first; the authoritative state arrives via the bridge reply
+                        // and applyLeAudioToSwitch flips it then.
+                        return false;
+                    });
+            invokeSetChangeListener(sub.prefs.leAudioSwitch, listener, changeListenerCls);
         }
+        applyLeAudioToSwitch(sub);
+    }
+
+    /** Reflect the tracked LE Audio state onto the switch widget (visibility + checked + summary). */
+    private void applyLeAudioToSwitch(Subscription sub) {
+        Object sw = sub.prefs.leAudioSwitch;
+        if (sw == null) return;
+        boolean supported = leAudioManager.isSupported(sub.mac);
+        PrefRef.setVisible(sw, supported);
+        if (!supported) return;
+        boolean enabled = leAudioManager.isEnabled(sub.mac);
+        PrefRef.setChecked(sw, enabled);
+        PrefRef.setSummary(sw, enabled ? Strings.LE_AUDIO_SUMMARY_ON : Strings.LE_AUDIO_SUMMARY_OFF);
     }
 
     /**
@@ -780,6 +836,24 @@ public final class CodecController {
     }
 
     private void renderUnknown(Subscription sub) {
+        // When LE Audio is enabled the A2DP codec status is unavailable (the device is on the
+        // LE transport), but that is NOT a disconnect — show the LC3 state instead of
+        // "未连接耳机" so the codec block stays meaningful. Only treat it as LE Audio when the
+        // device is not explicitly reported disconnected.
+        if (leAudioManager.isEnabled(sub.mac) && !Boolean.FALSE.equals(sub.connected)) {
+            if (sub.prefs.codecDisplay != null) {
+                PrefRef.setTitle(sub.prefs.codecDisplay,
+                        Strings.CODEC_BLOCK_TITLE + " : " + Strings.CODEC_LABEL_LC3);
+            }
+            PrefRef.setVisible(sub.prefs.qualityOption, false);
+            PrefRef.setVisible(sub.prefs.sampleRateOption, false);
+            setBlockDisabled(sub, false);
+            applyLeAudioToSwitch(sub);
+            if (sub.prefs.rememberToggle != null) {
+                PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+            }
+            return;
+        }
         if (sub.prefs.codecDisplay != null) {
             PrefRef.setTitle(sub.prefs.codecDisplay,
                     Strings.CODEC_BLOCK_TITLE + " : " + Strings.STATE_NO_DEVICE);
@@ -792,11 +866,29 @@ public final class CodecController {
         if (sub.prefs.rememberToggle != null) {
             PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
         }
+        applyLeAudioToSwitch(sub);
     }
 
     private void renderSnapshot(CodecSnapshot snapshot, Subscription sub, boolean fromCache) {
         if (Boolean.FALSE.equals(sub.connected)) {
             renderUnknown(sub);
+            return;
+        }
+        // LE Audio override (TODO B): when LE Audio is on, the device runs LC3 over the LE
+        // transport, so the A2DP codec / quality / sample-rate controls do not apply. Show
+        // "蓝牙音质 : LC3" and hide the quality + sample-rate rows on BOTH surfaces.
+        if (leAudioManager.isEnabled(sub.mac)) {
+            if (sub.prefs.codecDisplay != null) {
+                PrefRef.setTitle(sub.prefs.codecDisplay,
+                        Strings.CODEC_BLOCK_TITLE + " : " + Strings.CODEC_LABEL_LC3);
+            }
+            PrefRef.setVisible(sub.prefs.qualityOption, false);
+            PrefRef.setVisible(sub.prefs.sampleRateOption, false);
+            setBlockDisabled(sub, false);
+            applyLeAudioToSwitch(sub);
+            if (sub.prefs.rememberToggle != null) {
+                PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+            }
             return;
         }
         String codecName = CodecLabelTable.codecLabel(
@@ -816,6 +908,7 @@ public final class CodecController {
 
         renderQuality(snapshot, sub);
         renderSampleRate(snapshot, sub);
+        applyLeAudioToSwitch(sub);
         if (sub.prefs.rememberToggle != null) {
             PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
         }
@@ -990,7 +1083,6 @@ public final class CodecController {
         BroadcastReceiver receiver;
         Boolean connected;
         java.lang.ref.WeakReference<Activity> hostActivity;
-        xyz.melodylsp.codec.leaudio.LeAudioUiController leAudio;
 
         Subscription(String mac, CodecPreferences prefs, Object fragment) {
             this.mac = mac;
@@ -1047,13 +1139,6 @@ public final class CodecController {
         }
 
         void unregisterReceiver() {
-            if (leAudio != null) {
-                try {
-                    leAudio.stop();
-                } catch (Throwable ignored) {
-                }
-                leAudio = null;
-            }
             if (receiver == null) return;
             try {
                 context.unregisterReceiver(receiver);

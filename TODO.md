@@ -15,7 +15,7 @@
 - **A4 LHDC vendor id 放宽** — 范围扩到 `0x10..0x3F`，`0x20+` 用 `looksLikeLhdc()` 二次确认 vendor word。
 - **A5 LifecycleEventObserver 修复** — 改用 `Application.ActivityLifecycleCallbacks` 清理订阅，attach 去重，杜绝 receiver 泄漏。
 - **A6 CDM hook 强化** — `isCdmEnforcementMethod()` 匹配 cdm/association/privileged 系列方法名。
-- **B1 + B2 LE Audio 一键切换** — `LeAudioIpc` / `WirelessSettingsHookInstaller`（com.oplus.wirelesssettings scope）/ `LeAudioUiController`；DetailMain 注入 LE Audio 开关，支持探测 + 状态读取 + 弹窗确认 + 跨进程一键切换。
+- **B1 + B2 LE Audio 一键切换** — `LeAudioIpc` / `WirelessSettingsHookInstaller`（com.oplus.wirelesssettings scope）/ `LeAudioManager`；melody 主面板注入 LE Audio 开关，点击后由 wirelesssettings 进程（system uid）弹出官方 `COUIAlertDialogBuilder` 警告弹窗 → 用户确认 → `LeAudioProfile.setEnabled` → 回传状态。LE Audio 开启时主面板和 OneSpace 都显示"蓝牙音质 : LC3"并隐藏播放质量/采样率选项卡，关闭则恢复。
 
 ---
 

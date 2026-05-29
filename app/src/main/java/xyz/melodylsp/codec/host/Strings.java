@@ -35,6 +35,7 @@ public final class Strings {
     public static final String CODEC_LABEL_LDAC = "LDAC";
     public static final String CODEC_LABEL_LHDC = "LHDC";
     public static final String CODEC_LABEL_OPUS = "Opus";
+    public static final String CODEC_LABEL_LC3 = "LC3";
 
     public static final String QUALITY_LDAC_990 = "990 kbps（音质优先）";
     public static final String QUALITY_LDAC_660 = "660 kbps（标准）";
@@ -43,20 +44,12 @@ public final class Strings {
     public static final String QUALITY_LHDC_BALANCED = "均衡";
     public static final String QUALITY_LHDC_HIGH = "音质优先";
 
-    // LE Audio switch (TODO B1 / B2).
+    // LE Audio switch (TODO B1 / B2). The confirmation dialog text lives in
+    // leaudio.LeAudioStrings because the dialog is shown from the wirelesssettings process.
     public static final String LE_AUDIO_TITLE = "LE Audio";
-    public static final String LE_AUDIO_SUMMARY_ON = "已开启（低功耗音频）";
+    public static final String LE_AUDIO_SUMMARY_ON = "已开启（LC3 低功耗音频）";
     public static final String LE_AUDIO_SUMMARY_OFF = "已关闭（经典蓝牙音频）";
     public static final String LE_AUDIO_SUMMARY_UNKNOWN = "正在获取状态…";
-    public static final String LE_AUDIO_DIALOG_TITLE = "切换 LE Audio";
-    public static final String LE_AUDIO_DIALOG_MSG_ON =
-            "开启 LE Audio 后将使用低功耗音频，耳机会短暂断开重连。是否继续？";
-    public static final String LE_AUDIO_DIALOG_MSG_OFF =
-            "关闭 LE Audio 后将回到经典蓝牙音频，耳机会短暂断开重连。是否继续？";
-    public static final String LE_AUDIO_CONFIRM = "继续";
-    public static final String LE_AUDIO_CANCEL = "取消";
-    public static final String LE_AUDIO_TOAST_SENT = "正在切换 LE Audio…";
-    public static final String LE_AUDIO_TOAST_FAILED = "切换 LE Audio 失败，请到系统设置手动切换";
 
     private Strings() {
     }

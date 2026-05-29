@@ -1,14 +1,20 @@
 package xyz.melodylsp.codec.leaudio;
 
 import android.app.Application;
+import android.app.Dialog;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Binder;
+import android.os.Handler;
+import android.os.Looper;
+import android.view.WindowManager;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 
 import xyz.melodylsp.codec.MelodyCodecLspEntry;
@@ -16,29 +22,40 @@ import xyz.melodylsp.codec.util.MLog;
 
 /**
  * Privileged LE Audio toggle bridge installed inside {@code com.oplus.wirelesssettings}
- * (TODO B2 — Phase 2).
+ * (TODO B2 — Phase 2, redesigned).
  *
- * <p>wirelesssettings bundles {@code com.android.settingslib.bluetooth.*}, whose FQNs survive
- * R8 because the platform reads them reflectively. We register a dynamic
- * {@link BroadcastReceiver} on the app context that, on request from the melody side, calls
- * {@code LocalBluetoothManager.getInstance(ctx,null).getProfileManager().getLeAudioProfile()
- * .setEnabled(device, enable)} entirely through reflection. The result + current state is
- * echoed back so the melody SwitchPreference updates without a trip to system settings.</p>
+ * <p>{@code com.oplus.wirelesssettings} runs as {@code android.uid.system}, so this process can
+ * pop a system-level dialog over melody and call the privileged settingslib API. When melody
+ * requests a toggle we therefore:
+ * <ol>
+ *   <li>build the <strong>official</strong> {@code com.coui.appcompat.dialog.COUIAlertDialogBuilder}
+ *       warning dialog (its FQN is preserved here because settingslib reads it; in melody's APK
+ *       the same class is R8-minified, which is why the dialog must live on this side);</li>
+ *   <li>only on the user tapping the positive button do we call
+ *       {@code LeAudioProfile.setEnabled(device, enable)} via settingslib reflection;</li>
+ *   <li>echo the authoritative support + enabled state back to melody so the codec block
+ *       re-renders (switch on, codec shows LC3, quality / sample-rate rows hidden).</li>
+ * </ol>
+ * Everything reflective; no compile-time settingslib / COUI symbols.</p>
  *
- * <p>Security: the receiver only acts on broadcasts that (a) carry the shared
- * {@link LeAudioIpc#TOKEN} and (b) originate from {@code com.oplus.melody} as verified through
- * {@link Binder#getCallingUid()} when available. The melody side always targets the broadcast
- * with {@code setPackage(com.oplus.wirelesssettings)} so it cannot leak to third parties.</p>
+ * <p>Security: the receiver only acts on broadcasts carrying the shared {@link LeAudioIpc#TOKEN}
+ * and (when the caller identity is available) originating from {@code com.oplus.melody}. melody
+ * always targets the broadcast with {@code setPackage}, so it cannot leak to third parties.</p>
  */
 public final class WirelessSettingsHookInstaller {
 
     private static final String CLASS_LOCAL_BT_MANAGER =
             "com.android.settingslib.bluetooth.LocalBluetoothManager";
+    private static final String CLASS_COUI_ALERT_DIALOG_BUILDER =
+            "com.coui.appcompat.dialog.COUIAlertDialogBuilder";
 
     private final MelodyCodecLspEntry module;
     private final ClassLoader classLoader;
     private final String processName;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile boolean receiverRegistered;
+    private volatile Context appContext;
+    private Dialog visibleDialog;
 
     public WirelessSettingsHookInstaller(
             MelodyCodecLspEntry module, ClassLoader classLoader, String processName) {
@@ -76,6 +93,7 @@ public final class WirelessSettingsHookInstaller {
 
     private synchronized void ensureReceiver(Context context) {
         if (receiverRegistered || context == null) return;
+        this.appContext = context;
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent intent) {
@@ -97,8 +115,7 @@ public final class WirelessSettingsHookInstaller {
     private void handleRequest(Context ctx, Intent intent) {
         try {
             if (intent == null) return;
-            String token = intent.getStringExtra(LeAudioIpc.EXTRA_TOKEN);
-            if (!LeAudioIpc.TOKEN.equals(token)) {
+            if (!LeAudioIpc.TOKEN.equals(intent.getStringExtra(LeAudioIpc.EXTRA_TOKEN))) {
                 MLog.w("LE Audio request rejected: bad token");
                 return;
             }
@@ -114,14 +131,91 @@ public final class WirelessSettingsHookInstaller {
             String action = intent.getAction();
             if (LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)) {
                 boolean enable = intent.getBooleanExtra(LeAudioIpc.EXTRA_ENABLE, false);
-                boolean ok = applyLeAudio(ctx, mac, enable);
-                replyState(ctx, mac, ok);
+                // Show the official COUI warning dialog; only apply on positive confirmation.
+                mainHandler.post(() -> showWarningDialogThenApply(ctx, mac, enable));
             } else if (LeAudioIpc.ACTION_QUERY_LE_AUDIO.equals(action)) {
                 replyState(ctx, mac, true);
             }
         } catch (Throwable t) {
             MLog.e("handleRequest failed", t);
         }
+    }
+
+    /**
+     * Build and show the official {@code COUIAlertDialogBuilder} warning dialog. On the user
+     * confirming, apply the toggle and reply. On cancel, reply with the unchanged state so the
+     * melody switch snaps back.
+     */
+    private void showWarningDialogThenApply(Context ctx, String mac, boolean enable) {
+        try {
+            Class<?> builderCls = Class.forName(CLASS_COUI_ALERT_DIALOG_BUILDER, false, classLoader);
+            Constructor<?> ctor = builderCls.getConstructor(Context.class);
+            Object builder = ctor.newInstance(ctx);
+
+            Method setTitle = builderCls.getMethod("setTitle", CharSequence.class);
+            Method setMessage = builderCls.getMethod("setMessage", CharSequence.class);
+            Method setPositive = builderCls.getMethod("setPositiveButton",
+                    CharSequence.class, DialogInterface.OnClickListener.class);
+            Method setNegative = builderCls.getMethod("setNegativeButton",
+                    CharSequence.class, DialogInterface.OnClickListener.class);
+
+            String title = enable ? LeAudioStrings.DIALOG_TITLE_ON : LeAudioStrings.DIALOG_TITLE_OFF;
+            String message = enable ? LeAudioStrings.DIALOG_MSG_ON : LeAudioStrings.DIALOG_MSG_OFF;
+
+            setTitle.invoke(builder, (CharSequence) title);
+            setMessage.invoke(builder, (CharSequence) message);
+
+            DialogInterface.OnClickListener positive = (d, w) -> {
+                d.dismiss();
+                boolean ok = applyLeAudio(ctx, mac, enable);
+                // Give the stack a moment to settle the connection-policy change, then read back.
+                mainHandler.postDelayed(() -> replyState(ctx, mac, ok), 600L);
+            };
+            DialogInterface.OnClickListener negative = (d, w) -> {
+                d.dismiss();
+                // User declined: report the unchanged state so melody reverts the switch.
+                replyState(ctx, mac, true);
+            };
+            setPositive.invoke(builder,
+                    (CharSequence) (enable ? LeAudioStrings.CONFIRM : LeAudioStrings.CONFIRM_OFF),
+                    positive);
+            setNegative.invoke(builder, (CharSequence) LeAudioStrings.CANCEL, negative);
+
+            Method create = builderCls.getMethod("create");
+            Object dialogObj = create.invoke(builder);
+            if (!(dialogObj instanceof Dialog)) {
+                MLog.w("COUIAlertDialogBuilder.create did not return a Dialog");
+                applyDirectlyAsFallback(ctx, mac, enable);
+                return;
+            }
+            Dialog dialog = (Dialog) dialogObj;
+            // We are a background system-uid process with no foreground Activity, so promote the
+            // dialog window to a system-level type that can draw over melody.
+            if (dialog.getWindow() != null) {
+                try {
+                    dialog.getWindow().setType(
+                            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY);
+                } catch (Throwable t) {
+                    try {
+                        dialog.getWindow().setType(
+                                WindowManager.LayoutParams.TYPE_SYSTEM_ALERT);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            dialog.setOnCancelListener(d -> replyState(ctx, mac, true));
+            visibleDialog = dialog;
+            dialog.show();
+            MLog.event("le.ws.dialog.shown", "enable", enable);
+        } catch (Throwable t) {
+            MLog.e("showWarningDialog failed; applying without dialog", t);
+            applyDirectlyAsFallback(ctx, mac, enable);
+        }
+    }
+
+    private void applyDirectlyAsFallback(Context ctx, String mac, boolean enable) {
+        boolean ok = applyLeAudio(ctx, mac, enable);
+        mainHandler.postDelayed(() -> replyState(ctx, mac, ok), 600L);
     }
 
     /**
@@ -196,27 +290,9 @@ public final class WirelessSettingsHookInstaller {
     /**
      * Resolve {@code LocalBluetoothManager.getInstance(ctx,null).getProfileManager()
      * .getLeAudioProfile()} entirely by reflection. Returns {@code null} on any failure (e.g.
-     * the singleton is not ready yet — the melody side retries).
+     * the singleton is not ready yet — melody retries via the query path).
      */
     private Object resolveLeAudioProfile(Context ctx) {
-        try {
-            Class<?> mgrCls = Class.forName(CLASS_LOCAL_BT_MANAGER, false, classLoader);
-            Method getInstance = mgrCls.getMethod("getInstance", Context.class,
-                    Class.forName("com.android.settingslib.bluetooth.LocalBluetoothManager$BluetoothManagerCallback",
-                            false, classLoader));
-            Object mgr = getInstance.invoke(null, ctx, null);
-            if (mgr == null) return null;
-            Object profileManager = invokeNoArg(mgr, "getProfileManager");
-            if (profileManager == null) return null;
-            return invokeNoArg(profileManager, "getLeAudioProfile");
-        } catch (Throwable t) {
-            // The callback inner-class lookup can fail across builds; retry with a relaxed
-            // getInstance signature search before giving up.
-            return resolveLeAudioProfileRelaxed(ctx);
-        }
-    }
-
-    private Object resolveLeAudioProfileRelaxed(Context ctx) {
         try {
             Class<?> mgrCls = Class.forName(CLASS_LOCAL_BT_MANAGER, false, classLoader);
             Method getInstance = null;
