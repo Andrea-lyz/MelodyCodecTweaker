@@ -85,17 +85,127 @@ public final class CodecController {
         this.replayer = new ConnectionStateReplayer(this.context, bridge, prefs);
         this.replayer.start();
         this.bridge.addSnapshotListener(this::onPushedSnapshot);
+        registerActivityCleanup();
+    }
+
+    /**
+     * Tear down a Subscription when its host Activity is destroyed (TODO A5). The original code
+     * relied on an {@code androidx.lifecycle.LifecycleEventObserver} whose FQN failed to resolve
+     * under R8, so {@link Subscription#unregisterReceiver()} was never called: every OneSpace /
+     * DetailMain visit leaked a {@link BroadcastReceiver} and a {@code subscriptions} map entry.
+     * We instead listen on {@code Application.ActivityLifecycleCallbacks} — a framework class
+     * whose name R8 cannot rename — and drop every subscription bound to the destroyed Activity.
+     */
+    private void registerActivityCleanup() {
+        try {
+            android.app.Application app = resolveApplication(context);
+            if (app == null) {
+                MLog.w("registerActivityCleanup: no Application; subscriptions cleaned lazily only");
+                return;
+            }
+            app.registerActivityLifecycleCallbacks(new SubscriptionCleanupCallbacks());
+            MLog.event("subscription.cleanup.registered");
+        } catch (Throwable t) {
+            MLog.w("registerActivityCleanup failed", t);
+        }
+    }
+
+    private static android.app.Application resolveApplication(Context ctx) {
+        if (ctx instanceof android.app.Application) return (android.app.Application) ctx;
+        Context app = ctx != null ? ctx.getApplicationContext() : null;
+        if (app instanceof android.app.Application) return (android.app.Application) app;
+        return null;
+    }
+
+    /** Drop every subscription whose host Activity matches {@code activity}. */
+    private void onActivityDestroyed(Activity activity) {
+        if (activity == null) return;
+        java.util.Iterator<Map.Entry<Object, Subscription>> it = subscriptions.entrySet().iterator();
+        int removed = 0;
+        while (it.hasNext()) {
+            Subscription sub = it.next().getValue();
+            if (sub == null) {
+                it.remove();
+                continue;
+            }
+            Activity host = sub.hostActivity != null ? sub.hostActivity.get() : null;
+            if (host == null || host == activity) {
+                sub.unregisterReceiver();
+                it.remove();
+                removed++;
+            }
+        }
+        if (removed > 0) {
+            MLog.event("subscription.cleanup", "removed", removed,
+                    "remaining", subscriptions.size());
+        }
+    }
+
+    private final class SubscriptionCleanupCallbacks
+            implements android.app.Application.ActivityLifecycleCallbacks {
+        @Override
+        public void onActivityCreated(Activity activity, android.os.Bundle savedInstanceState) {
+        }
+
+        @Override
+        public void onActivityStarted(Activity activity) {
+        }
+
+        @Override
+        public void onActivityResumed(Activity activity) {
+        }
+
+        @Override
+        public void onActivityPaused(Activity activity) {
+        }
+
+        @Override
+        public void onActivityStopped(Activity activity) {
+        }
+
+        @Override
+        public void onActivitySaveInstanceState(Activity activity, android.os.Bundle outState) {
+        }
+
+        @Override
+        public void onActivityDestroyed(Activity activity) {
+            // Guard against the host re-using a config-change-driven destroy: only clean up when
+            // the Activity is really finishing.
+            if (activity != null && !activity.isChangingConfigurations()) {
+                CodecController.this.onActivityDestroyed(activity);
+            }
+        }
     }
 
     /** Bind a {@link CodecPreferences} bag to a fragment lifecycle. */
     public void attach(String mac, CodecPreferences pref, Object fragment) {
+        // If this fragment instance was already attached (host rebuilt its screen), retire the
+        // previous subscription first so its BroadcastReceiver is not orphaned (TODO A5).
+        Subscription previous = subscriptions.remove(fragment);
+        if (previous != null) {
+            previous.unregisterReceiver();
+        }
         Subscription sub = new Subscription(mac, pref, fragment);
+        sub.hostActivity = new java.lang.ref.WeakReference<>(activityFromFragment(fragment));
         subscriptions.put(fragment, sub);
 
         wireClickListeners(sub);
         wireRememberToggle(sub);
+        wireLeAudio(sub);
         sub.registerReceiver();
         mainHandler.post(() -> refreshSnapshot(sub));
+    }
+
+    /** Bring the optional LE Audio switch to life (TODO B1 / B2). No-op when absent. */
+    private void wireLeAudio(Subscription sub) {
+        if (sub.prefs.leAudioSwitch == null) return;
+        try {
+            sub.leAudio = new xyz.melodylsp.codec.leaudio.LeAudioUiController(
+                    context, sub.mac, sub.prefs.leAudioSwitch, sub.fragment, sub.prefs.uiContext);
+            sub.leAudio.start();
+        } catch (Throwable t) {
+            MLog.w("wireLeAudio failed", t);
+        }
     }
 
     /**
@@ -689,7 +799,8 @@ public final class CodecController {
             renderUnknown(sub);
             return;
         }
-        String codecName = CodecLabelTable.codecLabel(context, snapshot.activeCodecType);
+        String codecName = CodecLabelTable.codecLabel(
+                context, snapshot.activeCodecType, snapshot.activeCodecSpecific1);
         String header;
         if (fromCache) {
             String stamp = new SimpleDateFormat("HH:mm:ss", Locale.ROOT).format(new Date());
@@ -878,6 +989,8 @@ public final class CodecController {
         final Object fragment;
         BroadcastReceiver receiver;
         Boolean connected;
+        java.lang.ref.WeakReference<Activity> hostActivity;
+        xyz.melodylsp.codec.leaudio.LeAudioUiController leAudio;
 
         Subscription(String mac, CodecPreferences prefs, Object fragment) {
             this.mac = mac;
@@ -934,6 +1047,13 @@ public final class CodecController {
         }
 
         void unregisterReceiver() {
+            if (leAudio != null) {
+                try {
+                    leAudio.stop();
+                } catch (Throwable ignored) {
+                }
+                leAudio = null;
+            }
             if (receiver == null) return;
             try {
                 context.unregisterReceiver(receiver);

@@ -47,6 +47,15 @@ public final class HostHookInstaller {
             "com.oplus.melody.ui.component.detail.highaudio.HighAudioPreferenceFragment";
     private static final String CLASS_ONE_SPACE_FRAGMENT = "com.oplus.melody.onespace.d";
     /**
+     * OneSpace detail Activity. Unlike the R8-hashed fragment ({@link #CLASS_ONE_SPACE_FRAGMENT}),
+     * this FQN is preserved because it is registered in the host manifest
+     * ({@code <activity android:name="com.oplus.melody.onespace.OneSpaceDetailActivity">}). We
+     * hook its {@code onResume} as a version-resilient fallback and locate the Preference
+     * fragment by scanning the FragmentManager (TODO A1).
+     */
+    private static final String CLASS_ONE_SPACE_ACTIVITY =
+            "com.oplus.melody.onespace.OneSpaceDetailActivity";
+    /**
      * The shared base class for every OPLUS Preference-Fragment in the host APK
      * ({@code DetailMainPreferenceFragment}, {@code MoreSettingFragment},
      * {@code HighAudioPreferenceFragment}, {@code OneSpaceListFragment}, &c.). The package /
@@ -58,6 +67,14 @@ public final class HostHookInstaller {
 
     /** {@code PreferenceCategory.setKey(cls.getSimpleName())} stamps this on the Hi-Res item. */
     private static final String KEY_HIRES_ITEM = "HiQualityAudioItem";
+    /**
+     * Secondary DetailMain anchor (TODO A3). The equalizer row is present on nearly every
+     * earphone, including the open-fit / low-end models that have no Hi-Res switch, so it lets
+     * us still inject the codec block when {@link #KEY_HIRES_ITEM} is absent. The host stamps
+     * the simple class name {@code EqualizerItem} as the key via the same MoreSetting
+     * machinery that produces {@code HiQualityAudioItem}.
+     */
+    private static final String KEY_EQUALIZER_ITEM = "EqualizerItem";
     private static final String KEY_CODEC_HEADER = "melody_codec_lsp_header";
     private static final String KEY_CODEC_CATEGORY = "melody_codec_lsp_category";
     private static final String KEY_CODEC_QUALITY = "melody_codec_lsp_quality";
@@ -82,6 +99,7 @@ public final class HostHookInstaller {
         hookHighAudio();
         hookBasePreferenceFragment();
         hookOneSpace();
+        hookOneSpaceActivity();
     }
 
     private void hookApplicationOnCreate() {
@@ -220,7 +238,77 @@ public final class HostHookInstaller {
             return injectIntoOneSpace(fragment, screen);
         }
 
+        // DetailMain fallback anchors (TODO A3) for earphones without a Hi-Res switch:
+        // anchor after the Equalizer row, else after the first visible PreferenceCategory.
+        if (PrefRef.findPreference(screen, KEY_EQUALIZER_ITEM) != null) {
+            return injectAfterAnchorKey(fragment, screen, KEY_EQUALIZER_ITEM);
+        }
+        Object firstCategory = findFirstVisibleCategory(screen);
+        if (firstCategory != null) {
+            return injectAfterPreference(fragment, screen, firstCategory);
+        }
+
         return false;
+    }
+
+    /**
+     * Find the first visible {@code PreferenceCategory}-shaped child on the screen (TODO A3
+     * last-resort anchor). Detected by runtime class-name containing {@code PreferenceCategory}
+     * so it works against the host's R8-minified COUI category subclasses.
+     */
+    private static Object findFirstVisibleCategory(Object screen) {
+        int count = PrefRef.getPreferenceCount(screen);
+        for (int i = 0; i < count; i++) {
+            Object pref = PrefRef.getPreference(screen, i);
+            if (pref == null) continue;
+            if (!PrefRef.isVisible(pref)) continue;
+            String name = pref.getClass().getName();
+            if (name.contains("PreferenceCategory")) {
+                return pref;
+            }
+        }
+        return null;
+    }
+
+    /** Inject the DetailMain codec block right after the preference identified by {@code key}. */
+    private boolean injectAfterAnchorKey(Object fragment, Object screen, String key) {
+        Object anchor = PrefRef.findPreference(screen, key);
+        if (anchor == null) return false;
+        return injectAfterPreference(fragment, screen, anchor);
+    }
+
+    /**
+     * Shared DetailMain insertion routine: place the codec block immediately after {@code anchor}
+     * within the anchor's parent group, shifting subsequent orders to make room. Used by both
+     * the Hi-Res path and the A3 fallback anchors so they behave identically.
+     */
+    private boolean injectAfterPreference(Object fragment, Object screen, Object anchor) {
+        if (anchor == null) return false;
+        Context themedContext = resolveThemedContext(fragment);
+        if (themedContext == null) return false;
+
+        Object parent = PrefRef.getParent(anchor);
+        if (parent == null) parent = screen;
+        int anchorOrder = PrefRef.getOrder(anchor);
+        int targetOrder = anchorOrder + 1;
+        shiftPreferenceOrders(parent, targetOrder, +4);
+
+        String mac = resolveMacFromActivityIntent(fragment);
+        if (mac == null) {
+            MLog.w("DetailMain fallback insertion: mac unresolved; skip");
+            return false;
+        }
+        CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(
+                themedContext, parent, targetOrder,
+                /* wrapInCategory= */ false, /* includeRemember= */ true,
+                /* includeLeAudio= */ true);
+        if (prefs == null) return false;
+        controller.attach(mac, prefs, fragment);
+        attachedScreens.add(screen);
+        MLog.event("detailmain_fallback.injected", "mac_len", mac.length(),
+                "order", targetOrder, "anchor", PrefRef.getKey(anchor),
+                "fragment", fragment.getClass().getName());
+        return true;
     }
 
     private boolean injectAfterHires(Object fragment, Object screen) {
@@ -244,7 +332,8 @@ public final class HostHookInstaller {
         // cards visually connect instead of forming double-rounded notches.
         CodecPreferences prefs = CodecBlockBuilder.buildAndInsert(
                 themedContext, parent, targetOrder,
-                /* wrapInCategory= */ false, /* includeRemember= */ true);
+                /* wrapInCategory= */ false, /* includeRemember= */ true,
+                /* includeLeAudio= */ true);
         if (prefs == null) return false;
         controller.attach(mac, prefs, fragment);
         attachedScreens.add(screen);
@@ -442,6 +531,131 @@ public final class HostHookInstaller {
     }
 
     /**
+     * Version-resilient OneSpace fallback (TODO A1). The direct fragment hook
+     * ({@link #hookOneSpace}) targets the R8-hashed class {@code com.oplus.melody.onespace.d},
+     * which is very likely to be renamed on the next host update (to {@code c} / {@code e} /
+     * &c.), silently killing OneSpace injection. {@code OneSpaceDetailActivity} keeps a stable
+     * FQN because it is declared in the host manifest, so we additionally hook its
+     * {@code onResume} and locate the Preference fragment by scanning the FragmentManager for
+     * an instance whose PreferenceScreen carries OneSpace-specific keys.
+     *
+     * <p>This runs alongside the direct fragment hook; {@link #attachedScreens} de-duplicates so
+     * whichever path fires first wins and the other no-ops.</p>
+     */
+    private void hookOneSpaceActivity() {
+        Class<?> actCls = loadHostClass(CLASS_ONE_SPACE_ACTIVITY);
+        if (actCls == null) {
+            MLog.w("OneSpaceDetailActivity class not found; A1 fallback unavailable");
+            return;
+        }
+        Method onResume = findHostDeclaredMethod(actCls, "onResume");
+        if (onResume == null) {
+            // Fall back to onStart, which OneSpaceDetailActivity overrides directly.
+            onResume = findHostDeclaredMethod(actCls, "onStart");
+        }
+        if (onResume == null) {
+            MLog.w("OneSpaceDetailActivity onResume/onStart not found");
+            return;
+        }
+        module.hook(onResume).intercept(chain -> {
+            Object result = chain.proceed();
+            try {
+                Object activity = chain.getThisObject();
+                // onResume may resolve to a shared superclass (androidx FragmentActivity), so
+                // the hook can fire for unrelated activities; only act on OneSpace instances.
+                if (activity != null && actCls.isInstance(activity)) {
+                    scheduleOneSpaceFragmentScan(activity, /* attempt= */ 0);
+                }
+            } catch (Throwable t) {
+                MLog.e("OneSpace activity onResume scan failed", t);
+            }
+            return result;
+        });
+        MLog.event("onespace.activity.hooked");
+    }
+
+    /**
+     * Walk {@code activity.getSupportFragmentManager().getFragments()} (and nested child
+     * managers) looking for a Preference fragment whose screen contains OneSpace markers, then
+     * route it through the normal surface dispatch. Retries on a back-off because the bottom-
+     * sheet fragment + its PreferenceScreen are attached asynchronously after onResume.
+     */
+    private void scheduleOneSpaceFragmentScan(Object activity, int attempt) {
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (controller == null) return;
+            try {
+                java.util.List<Object> fragments = collectFragments(activity);
+                for (Object fragment : fragments) {
+                    Object screen = PrefRef.getPreferenceScreen(fragment);
+                    if (screen == null) continue;
+                    if (!isOneSpaceScreen(screen)) continue;
+                    if (attachedScreens.contains(screen) && hasCodecMarker(screen)) {
+                        return; // Already injected by either path.
+                    }
+                    scheduleSurfaceDispatch(fragment, /* attempt= */ 0);
+                    MLog.event("onespace.activity.fragment_found",
+                            "fragment", fragment.getClass().getName());
+                    return;
+                }
+            } catch (Throwable t) {
+                MLog.e("OneSpace fragment scan failed", t);
+                return;
+            }
+            if (attempt < 12) {
+                scheduleOneSpaceFragmentScan(activity, attempt + 1);
+            }
+        }, attempt == 0 ? 300L : 800L);
+    }
+
+    /** True when a PreferenceScreen carries any OneSpace-specific marker key. */
+    private static boolean isOneSpaceScreen(Object screen) {
+        return PrefRef.findPreference(screen, MelodyResIds.KEY_NOISE_MENU_CATEGORY) != null
+                || PrefRef.findPreference(screen, MelodyResIds.KEY_MORE_SETTING_CATEGORY) != null
+                || PrefRef.findPreference(screen, KEY_NOISE_SWITCH) != null
+                || PrefRef.findPreference(screen, KEY_MORE_SETTING) != null;
+    }
+
+    /**
+     * Collect Fragments reachable from an Activity's support FragmentManager, descending one
+     * level into each fragment's child FragmentManager (OneSpace hosts its Preference list in a
+     * COUIBottomSheetDialogFragment whose content is a child fragment). All reflective so we do
+     * not compile against {@code androidx.fragment}, which the host ships R8-minified.
+     */
+    private static java.util.List<Object> collectFragments(Object activity) {
+        java.util.List<Object> out = new java.util.ArrayList<>();
+        Object fm = invokeNoArg(activity, "getSupportFragmentManager");
+        if (fm == null) return out;
+        collectFromManager(fm, out, /* depth= */ 0);
+        return out;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void collectFromManager(Object fragmentManager, java.util.List<Object> out, int depth) {
+        if (fragmentManager == null || depth > 2) return;
+        Object list = invokeNoArg(fragmentManager, "getFragments");
+        if (!(list instanceof java.util.List)) return;
+        for (Object fragment : (java.util.List<Object>) list) {
+            if (fragment == null) continue;
+            out.add(fragment);
+            Object childFm = invokeNoArg(fragment, "getChildFragmentManager");
+            if (childFm != null && childFm != fragmentManager) {
+                collectFromManager(childFm, out, depth + 1);
+            }
+        }
+    }
+
+    private static Object invokeNoArg(Object target, String name) {
+        if (target == null) return null;
+        try {
+            Method m = target.getClass().getMethod(name);
+            m.setAccessible(true);
+            return m.invoke(target);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
      * Walks the class hierarchy and returns the first method named {@code onViewCreated} that
      * accepts {@code (View, Bundle)}. Doing so avoids depending on the exact declaring class —
      * the host fragment subclass may or may not override the method.
@@ -477,6 +691,29 @@ public final class HostHookInstaller {
             } catch (NoSuchMethodException ignored) {
                 cls = cls.getSuperclass();
             }
+        }
+        return null;
+    }
+
+    /**
+     * Like {@link #findMethodIgnoringDeclared} but only matches a method declared on a host-
+     * owned class (FQN starting with {@code com.oplus.}). This avoids resolving the framework
+     * {@code Activity.onResume} / androidx {@code FragmentActivity.onResume}, which would make
+     * the hook fire for every activity in the process instead of just OneSpace.
+     */
+    private static Method findHostDeclaredMethod(Class<?> startCls, String name) {
+        Class<?> cls = startCls;
+        while (cls != null && cls != Object.class) {
+            String clsName = cls.getName();
+            if (clsName.startsWith("com.oplus.")) {
+                try {
+                    Method m = cls.getDeclaredMethod(name);
+                    m.setAccessible(true);
+                    return m;
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            cls = cls.getSuperclass();
         }
         return null;
     }

@@ -47,6 +47,20 @@ public final class CodecBlockBuilder {
     public static CodecPreferences buildAndInsert(
             Context context, Object container, int order,
             boolean wrapInCategory, boolean includeRemember) {
+        return buildAndInsert(context, container, order, wrapInCategory, includeRemember,
+                /* includeLeAudio= */ false);
+    }
+
+    /**
+     * Insert the codec block into {@code container}.
+     *
+     * @param wrapInCategory   true → DetailMain card style (PreferenceCategory wrapper).
+     * @param includeRemember  true → include the "remember this earphone" SwitchPreference.
+     * @param includeLeAudio   true → include the LE Audio toggle (DetailMain only, TODO B1).
+     */
+    public static CodecPreferences buildAndInsert(
+            Context context, Object container, int order,
+            boolean wrapInCategory, boolean includeRemember, boolean includeLeAudio) {
         Object styleSource = container;
         Object categoryTemplate = findFirstOfType(styleSource, "PreferenceCategory");
         Object prefTemplate = findFirstOfType(styleSource, "Preference");
@@ -138,6 +152,24 @@ public final class CodecBlockBuilder {
             }
         }
 
+        Object leAudio = null;
+        if (includeLeAudio) {
+            leAudio = newOf(context, COUI_SWITCH_PREFERENCE, ANDX_SWITCH_PREFERENCE_COMPAT);
+            if (leAudio != null) {
+                cloneVisualStyleFrom(leAudio, switchTemplate);
+                PrefRef.setKey(leAudio, "melody_codec_lsp_le_audio");
+                PrefRef.setTitle(leAudio, Strings.LE_AUDIO_TITLE);
+                PrefRef.setSummary(leAudio, Strings.LE_AUDIO_SUMMARY_UNKNOWN);
+                PrefRef.setIconSpaceReserved(leAudio, false);
+                PrefRef.setPersistent(leAudio, false);
+                // Hidden until the wirelesssettings bridge confirms the device supports LE
+                // Audio (TODO B1 device-support probe); CodecController flips it visible.
+                PrefRef.setVisible(leAudio, false);
+                PrefRef.setOrder(leAudio, firstChildOrder + 3);
+                PrefRef.addPreference(insertionParent, leAudio);
+            }
+        }
+
         Object codecDisplay;
         // codecDisplay is the row whose title CodecController updates to show
         // "蓝牙音质 · LHDC" / freshness stamps. Always prefer the header row (lives inside the
@@ -149,8 +181,9 @@ public final class CodecBlockBuilder {
         else codecDisplay = remember;
 
         MLog.event("codec_block.inserted", "order", order,
-                "wrapped", wrapInCategory, "remember", includeRemember);
-        return new CodecPreferences(context, category, codecDisplay, quality, sampleRate, remember);
+                "wrapped", wrapInCategory, "remember", includeRemember, "leAudio", includeLeAudio);
+        return new CodecPreferences(
+                context, category, codecDisplay, quality, sampleRate, remember, leAudio);
     }
 
     /** Backwards-compatible overload: wrap in category, include remember toggle. */

@@ -56,8 +56,11 @@ apksigner sign --ks ~/.android/debug.keystore \
 
 A `local.properties.sample` is provided; copy to `local.properties` and set `sdk.dir`.
 
-The APK declares LSPosed scope on `com.oplus.melody` and `com.android.bluetooth`. Enable both
-scopes in LSPosed Manager.
+The APK declares LSPosed scope on `com.oplus.melody`, `com.android.bluetooth`, and
+`com.oplus.wirelesssettings`. Enable all three scopes in LSPosed Manager. The
+`com.oplus.wirelesssettings` scope is only used by the LE Audio one-tap switch (it registers a
+single broadcast receiver that calls `LeAudioProfile.setEnabled` via settingslib reflection);
+if you do not need LE Audio switching you can leave that scope disabled.
 
 ## Master switch
 

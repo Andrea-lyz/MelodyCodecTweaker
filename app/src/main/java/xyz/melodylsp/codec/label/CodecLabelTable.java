@@ -31,12 +31,19 @@ public final class CodecLabelTable {
     public static final int CODEC_APTX_ADAPTIVE = 7;
     public static final int CODEC_LHDC = 8;
     /**
-     * OPPO / OnePlus vendor stack assigns LHDC variants to the 0x10..0x1F range. The exact
-     * sub-id depends on the vendor build (0x13 for the OPPO Enco X3, 0x14 for some Reno
-     * builds). We treat any id in this range as LHDC unless evidence says otherwise.
+     * OPPO / OnePlus vendor stack assigns LHDC variants to a vendor id range. The exact sub-id
+     * depends on the vendor build (0x13 for the OPPO Enco X3, 0x14 for some Reno builds). We
+     * treat any id in this range as LHDC unless evidence says otherwise.
+     *
+     * <p>The window was originally {@code 0x10..0x1F}; it is widened to {@code 0x10..0x3F} so a
+     * future ROM that hands LHDC a fresh vendor id (e.g. 0x20+) is still recognised instead of
+     * collapsing the picker to {@code Codec(0x20)} (TODO A4). The {@link #looksLikeLhdc} probe
+     * adds a second confirmation step for ids outside the original window.</p>
      */
     public static final int OPLUS_VENDOR_LHDC_RANGE_LOW = 0x10;
-    public static final int OPLUS_VENDOR_LHDC_RANGE_HIGH = 0x1F;
+    public static final int OPLUS_VENDOR_LHDC_RANGE_HIGH = 0x3F;
+    /** The original, high-confidence LHDC window. Ids here are LHDC without further checks. */
+    private static final int OPLUS_VENDOR_LHDC_CORE_HIGH = 0x1F;
 
     // LDAC quality (codecSpecific1 values, source: bluetooth/ldac vendor headers).
     public static final long LDAC_QUALITY_HIGH = 1000L;
@@ -75,11 +82,25 @@ public final class CodecLabelTable {
                 return Strings.CODEC_LABEL_LHDC;
             default:
                 if (codecType >= OPLUS_VENDOR_LHDC_RANGE_LOW
-                        && codecType <= OPLUS_VENDOR_LHDC_RANGE_HIGH) {
+                        && codecType <= OPLUS_VENDOR_LHDC_CORE_HIGH) {
                     return Strings.CODEC_LABEL_LHDC;
                 }
                 return "Codec(0x" + Integer.toHexString(codecType) + ")";
         }
+    }
+
+    /**
+     * Codec name resolution that also consults {@code codecSpecific1} (TODO A4). For ids in the
+     * widened {@code 0x20..0x3F} tail this returns the LHDC label only when the vendor word
+     * confirms LHDC via {@link #looksLikeLhdc}; otherwise it defers to the type-only resolution.
+     */
+    public static String codecLabel(Context context, int codecType, long codecSpecific1) {
+        if (codecType > OPLUS_VENDOR_LHDC_CORE_HIGH
+                && codecType <= OPLUS_VENDOR_LHDC_RANGE_HIGH
+                && looksLikeLhdc(codecType, codecSpecific1)) {
+            return Strings.CODEC_LABEL_LHDC;
+        }
+        return codecLabel(context, codecType);
     }
 
     /**
@@ -114,9 +135,8 @@ public final class CodecLabelTable {
 
     /** Returns true when the codec id is one of the LDAC / LHDC family that exposes quality steps. */
     public static boolean isQualityCapable(int codecType) {
-        if (codecType == CODEC_LDAC || codecType == CODEC_LHDC) return true;
-        return codecType >= OPLUS_VENDOR_LHDC_RANGE_LOW
-                && codecType <= OPLUS_VENDOR_LHDC_RANGE_HIGH;
+        if (codecType == CODEC_LDAC) return true;
+        return isLhdc(codecType);
     }
 
     /** Returns true when the codec id should be treated as LHDC for quality decoding. */
@@ -124,6 +144,34 @@ public final class CodecLabelTable {
         if (codecType == CODEC_LHDC) return true;
         return codecType >= OPLUS_VENDOR_LHDC_RANGE_LOW
                 && codecType <= OPLUS_VENDOR_LHDC_RANGE_HIGH;
+    }
+
+    /**
+     * Second-stage LHDC confirmation for codec ids that fall outside the original
+     * {@code 0x10..0x1F} window (TODO A4). Ids inside the core window are accepted outright.
+     * For ids in the widened {@code 0x20..0x3F} tail we additionally require the
+     * {@code codecSpecific1} word to look like an LHDC vendor word: the low byte must match a
+     * known LHDC quality code (CONNECTION / STANDARD / HIGH_LEGACY / HIGH / BALANCED), which is
+     * how every shipping OPPO LHDC build encodes the playback quality. This keeps a brand-new
+     * vendor id recognised while avoiding mis-labelling an unrelated future codec as LHDC.
+     *
+     * @param codecType      the active codec id from {@code BluetoothCodecConfig.getCodecType()}
+     * @param codecSpecific1 the active {@code codecSpecific1} vendor word
+     */
+    public static boolean looksLikeLhdc(int codecType, long codecSpecific1) {
+        if (codecType == CODEC_LHDC) return true;
+        if (codecType < OPLUS_VENDOR_LHDC_RANGE_LOW || codecType > OPLUS_VENDOR_LHDC_RANGE_HIGH) {
+            return false;
+        }
+        if (codecType <= OPLUS_VENDOR_LHDC_CORE_HIGH) {
+            return true;
+        }
+        long lowByte = codecSpecific1 & 0xFFL;
+        return lowByte == LHDC_QUALITY_CONNECTION
+                || lowByte == LHDC_QUALITY_STANDARD
+                || lowByte == LHDC_QUALITY_HIGH_LEGACY
+                || lowByte == LHDC_QUALITY_HIGH
+                || lowByte == LHDC_QUALITY_BALANCED;
     }
 
     /** Resolve the LDAC / LHDC quality label, or fall back to {@code "档位 (rawValue)"}. */

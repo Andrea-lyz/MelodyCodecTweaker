@@ -5,6 +5,10 @@
 # AIDL-generated stubs and the parcelable types we hand across the bridge.
 -keep class xyz.melodylsp.codec.bridge.** { *; }
 
+# LE Audio cross-process bridge: receiver + IPC constants are reached reflectively from the
+# entry across two scopes (melody + wirelesssettings); keep names stable.
+-keep class xyz.melodylsp.codec.leaudio.** { *; }
+
 # Master-switch Activity (referenced via the launcher intent filter).
 -keep class xyz.melodylsp.codec.ui.MasterSwitchActivity { *; }
 

@@ -15,6 +15,8 @@ public final class CodecPreferences {
     public final Object qualityOption;
     public final Object sampleRateOption;
     public final Object rememberToggle;
+    /** Optional LE Audio toggle (DetailMain only). Null on surfaces that omit it. */
+    public final Object leAudioSwitch;
 
     public CodecPreferences(
             Context uiContext,
@@ -23,11 +25,24 @@ public final class CodecPreferences {
             Object qualityOption,
             Object sampleRateOption,
             Object rememberToggle) {
+        this(uiContext, category, codecDisplay, qualityOption, sampleRateOption,
+                rememberToggle, null);
+    }
+
+    public CodecPreferences(
+            Context uiContext,
+            Object category,
+            Object codecDisplay,
+            Object qualityOption,
+            Object sampleRateOption,
+            Object rememberToggle,
+            Object leAudioSwitch) {
         this.uiContext = uiContext;
         this.category = category;
         this.codecDisplay = codecDisplay;
         this.qualityOption = qualityOption;
         this.sampleRateOption = sampleRateOption;
         this.rememberToggle = rememberToggle;
+        this.leAudioSwitch = leAudioSwitch;
     }
 }

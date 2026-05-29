@@ -63,11 +63,11 @@ public final class PrefRef {
      * {@code PreferenceDialogFragmentCompat} tries to look itself back up by key.
      */
     public static void setKey(Object pref, String key) {
-        invokeVoid(pref, "setKey", new Class[]{String.class}, new Object[]{key});
+        invokeSetter(pref, "setKey", String.class, key);
     }
 
     public static void setTitle(Object pref, CharSequence title) {
-        invokeVoid(pref, "setTitle", new Class[]{CharSequence.class}, new Object[]{title});
+        invokeSetter(pref, "setTitle", CharSequence.class, title);
     }
 
     public static CharSequence getTitle(Object pref) {
@@ -76,7 +76,7 @@ public final class PrefRef {
     }
 
     public static void setSummary(Object pref, CharSequence summary) {
-        invokeVoid(pref, "setSummary", new Class[]{CharSequence.class}, new Object[]{summary});
+        invokeSetter(pref, "setSummary", CharSequence.class, summary);
     }
 
     public static CharSequence getSummary(Object pref) {
@@ -85,11 +85,11 @@ public final class PrefRef {
     }
 
     public static void setOrder(Object pref, int order) {
-        invokeVoid(pref, "setOrder", new Class[]{int.class}, new Object[]{order});
+        invokeSetter(pref, "setOrder", int.class, order);
     }
 
     public static void setVisible(Object pref, boolean visible) {
-        invokeVoid(pref, "setVisible", new Class[]{boolean.class}, new Object[]{visible});
+        invokeSetter(pref, "setVisible", boolean.class, visible);
     }
 
     public static boolean isVisible(Object pref) {
@@ -98,19 +98,19 @@ public final class PrefRef {
     }
 
     public static void setSelectable(Object pref, boolean selectable) {
-        invokeVoid(pref, "setSelectable", new Class[]{boolean.class}, new Object[]{selectable});
+        invokeSetter(pref, "setSelectable", boolean.class, selectable);
     }
 
     public static void setIconSpaceReserved(Object pref, boolean reserved) {
-        invokeVoid(pref, "setIconSpaceReserved", new Class[]{boolean.class}, new Object[]{reserved});
+        invokeSetter(pref, "setIconSpaceReserved", boolean.class, reserved);
     }
 
     public static void setPersistent(Object pref, boolean persistent) {
-        invokeVoid(pref, "setPersistent", new Class[]{boolean.class}, new Object[]{persistent});
+        invokeSetter(pref, "setPersistent", boolean.class, persistent);
     }
 
     public static void setEnabled(Object pref, boolean enabled) {
-        invokeVoid(pref, "setEnabled", new Class[]{boolean.class}, new Object[]{enabled});
+        invokeSetter(pref, "setEnabled", boolean.class, enabled);
     }
 
     public static void setDisabled(Object pref, boolean disabled) {
@@ -121,7 +121,7 @@ public final class PrefRef {
     }
 
     public static void setChecked(Object pref, boolean checked) {
-        invokeVoid(pref, "setChecked", new Class[]{boolean.class}, new Object[]{checked});
+        invokeSetter(pref, "setChecked", boolean.class, checked);
     }
 
     public static int getLayoutResource(Object pref) {
@@ -130,7 +130,7 @@ public final class PrefRef {
     }
 
     public static void setLayoutResource(Object pref, int resId) {
-        invokeVoid(pref, "setLayoutResource", new Class[]{int.class}, new Object[]{resId});
+        invokeSetter(pref, "setLayoutResource", int.class, resId);
     }
 
     public static int getWidgetLayoutResource(Object pref) {
@@ -139,7 +139,7 @@ public final class PrefRef {
     }
 
     public static void setWidgetLayoutResource(Object pref, int resId) {
-        invokeVoid(pref, "setWidgetLayoutResource", new Class[]{int.class}, new Object[]{resId});
+        invokeSetter(pref, "setWidgetLayoutResource", int.class, resId);
     }
 
     public static int getOrder(Object pref) {
@@ -430,6 +430,88 @@ public final class PrefRef {
             xyz.melodylsp.codec.util.MLog.w("PrefRef." + name + " failed: " + t.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Invoke a 1-arg {@code void} setter by name, falling back to a signature-based lookup when
+     * the literal name has been stripped / renamed by R8 (TODO A2).
+     *
+     * <p>Historically every setter resolved purely by name; an R8 rename therefore failed
+     * <em>silently</em> (no exception — the value just never landed, leaving the UI blank, as
+     * with the {@code setKey} regression we already hit). The fallback below re-discovers the
+     * setter by its parameter type when, and only when, the resolution is unambiguous:
+     * exactly one declared 1-arg {@code void} method on the whole hierarchy accepts
+     * {@code paramType}. If two or more candidates exist (e.g. several {@code boolean} setters
+     * that R8 renamed to single letters) we deliberately do <strong>not</strong> guess —
+     * writing the value into the wrong setter would be worse than the no-op. {@code String} /
+     * {@code CharSequence} are treated as interchangeable for matching because
+     * {@code androidx.preference} mixes the two across {@code setKey} / {@code setTitle}.</p>
+     */
+    private static void invokeSetter(Object target, String name, Class<?> paramType, Object value) {
+        if (target == null) return;
+        Method byName = findMethod(target.getClass(), name, new Class[]{paramType});
+        if (byName != null) {
+            try {
+                byName.setAccessible(true);
+                byName.invoke(target, value);
+                return;
+            } catch (Throwable t) {
+                xyz.melodylsp.codec.util.MLog.w("PrefRef." + name + " failed: " + t.getMessage());
+                return;
+            }
+        }
+        Method bySig = findUniqueVoidSetter(target.getClass(), paramType);
+        if (bySig == null) {
+            xyz.melodylsp.codec.util.MLog.w("PrefRef." + name
+                    + ": no name match and no unique " + paramType.getName()
+                    + " setter on " + target.getClass().getName());
+            return;
+        }
+        try {
+            bySig.setAccessible(true);
+            bySig.invoke(target, value);
+            xyz.melodylsp.codec.util.MLog.event("prefref.setter.sigfallback",
+                    "logical", name, "resolved", bySig.getName(),
+                    "type", paramType.getSimpleName());
+        } catch (Throwable t) {
+            xyz.melodylsp.codec.util.MLog.w("PrefRef." + name + " sig-fallback failed: "
+                    + t.getMessage());
+        }
+    }
+
+    /**
+     * Find the single 1-arg {@code void} method (any name) on the class hierarchy whose
+     * parameter accepts {@code paramType}. Returns {@code null} when there is no match or the
+     * match is ambiguous (more than one candidate), so callers never write into a wrong setter.
+     * {@code String} and {@code CharSequence} are unified so a {@code CharSequence}-typed
+     * setter still matches a {@code String} request and vice-versa.
+     */
+    private static Method findUniqueVoidSetter(Class<?> startCls, Class<?> paramType) {
+        boolean textType = paramType == String.class || paramType == CharSequence.class;
+        Method match = null;
+        Class<?> cls = startCls;
+        while (cls != null && cls != Object.class) {
+            for (Method m : cls.getDeclaredMethods()) {
+                if (m.getParameterCount() != 1) continue;
+                if (m.getReturnType() != void.class) continue;
+                if (m.isSynthetic() || m.isBridge()) continue;
+                Class<?> p = m.getParameterTypes()[0];
+                boolean accepts;
+                if (textType) {
+                    accepts = p == String.class || p == CharSequence.class;
+                } else {
+                    accepts = p == paramType;
+                }
+                if (!accepts) continue;
+                if (match != null && !match.getName().equals(m.getName())) {
+                    // Ambiguous: two differently-named setters take the same type. Bail.
+                    return null;
+                }
+                match = m;
+            }
+            cls = cls.getSuperclass();
+        }
+        return match;
     }
 
     private static void invokeVoid(Object target, String name, Class<?>[] paramTypes, Object[] args) {

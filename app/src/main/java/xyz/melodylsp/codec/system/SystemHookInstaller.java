@@ -59,7 +59,7 @@ public final class SystemHookInstaller {
         }
         int hooked = 0;
         for (Method m : utilsCls.getDeclaredMethods()) {
-            if (!"enforceCdmAssociation".equals(m.getName())) continue;
+            if (!isCdmEnforcementMethod(m.getName())) continue;
             module.hook(m).intercept(chain -> {
                 Object[] args = chain.getArgs().toArray();
                 if (isMelodyA2dpCodecCall(args)) {
@@ -71,6 +71,26 @@ public final class SystemHookInstaller {
             hooked++;
         }
         MLog.event("cdm.hooks", "count", hooked);
+    }
+
+    /**
+     * Match the CDM / privileged-association enforcement helpers (TODO A6). The canonical name
+     * is {@code enforceCdmAssociation}, but OPPO can rename it on a ROM bump; we additionally
+     * match any helper whose name advertises a CDM / association / privileged check so a rename
+     * does not silently re-block Path A. Matching is conservative — the actual bypass still
+     * requires {@link #isMelodyA2dpCodecCall} to confirm the live call originates from melody's
+     * {@code setCodecConfigPreference} stack, so over-matching a method name cannot let an
+     * unrelated caller through.
+     */
+    private static boolean isCdmEnforcementMethod(String name) {
+        if (name == null) return false;
+        if ("enforceCdmAssociation".equals(name)) return true;
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("cdm") && lower.contains("assoc")) return true;
+        if (lower.contains("enforceassociation")) return true;
+        if (lower.contains("requirebluetoothprivileged")) return true;
+        if (lower.contains("enforcebluetoothprivileged")) return true;
+        return false;
     }
 
     private static Object bypassReturnValue(Class<?> returnType) {
