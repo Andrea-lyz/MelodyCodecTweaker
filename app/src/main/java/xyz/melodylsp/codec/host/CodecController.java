@@ -1,6 +1,7 @@
 package xyz.melodylsp.codec.host;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
@@ -241,15 +242,51 @@ public final class CodecController {
                             return false;
                         }
                         boolean requested = (Boolean) args[1];
-                        leAudioManager.requestToggle(sub.mac, requested);
-                        // Return false: do not flip the switch yet. The wirelesssettings dialog
-                        // confirms first; the authoritative state arrives via the bridge reply
-                        // and applyLeAudioToSwitch flips it then.
+                        // Show a confirmation dialog in melody's Activity context before
+                        // sending the toggle request to the wirelesssettings bridge.
+                        showLeAudioConfirmDialog(sub, requested);
+                        // Return false: do not flip the switch yet. The authoritative state
+                        // arrives via the bridge reply and applyLeAudioToSwitch flips it then.
                         return false;
                     });
             invokeSetChangeListener(sub.prefs.leAudioSwitch, listener, changeListenerCls);
         }
         applyLeAudioToSwitch(sub);
+    }
+
+    /**
+     * Show a confirmation dialog in melody's Activity before toggling LE Audio. The COUI dialog
+     * builder cannot inflate in the background wirelesssettings process (it lacks a themed
+     * Activity context), so we use a standard {@code android.app.AlertDialog} here — melody has
+     * a live Activity with the COUI theme applied, so the dialog renders correctly.
+     */
+    private void showLeAudioConfirmDialog(Subscription sub, boolean enable) {
+        Activity activity = resolveLiveActivity(sub);
+        if (activity == null || activity.isFinishing()) {
+            MLog.w("showLeAudioConfirmDialog: no live activity; skip");
+            return;
+        }
+        String title = enable
+                ? xyz.melodylsp.codec.leaudio.LeAudioStrings.DIALOG_TITLE_ON
+                : xyz.melodylsp.codec.leaudio.LeAudioStrings.DIALOG_TITLE_OFF;
+        String message = enable
+                ? xyz.melodylsp.codec.leaudio.LeAudioStrings.DIALOG_MSG_ON
+                : xyz.melodylsp.codec.leaudio.LeAudioStrings.DIALOG_MSG_OFF;
+        String positive = enable
+                ? xyz.melodylsp.codec.leaudio.LeAudioStrings.CONFIRM
+                : xyz.melodylsp.codec.leaudio.LeAudioStrings.CONFIRM_OFF;
+        String negative = xyz.melodylsp.codec.leaudio.LeAudioStrings.CANCEL;
+
+        new android.app.AlertDialog.Builder(activity)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton(positive, (d, w) -> {
+                    d.dismiss();
+                    leAudioManager.requestToggle(sub.mac, enable);
+                })
+                .setNegativeButton(negative, (d, w) -> d.dismiss())
+                .setCancelable(true)
+                .show();
     }
 
     /** Reflect the tracked LE Audio state onto the switch widget (visibility + checked + summary). */
