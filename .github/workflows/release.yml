@@ -112,7 +112,7 @@ jobs:
 
           print(f"version={new_name}")
           print(f"version_code={new_code}")
-          print(f"tag=v{new_name}")
+          print(f"tag={new_code}-{new_name}")
           PY
 
       - name: Generate release notes
