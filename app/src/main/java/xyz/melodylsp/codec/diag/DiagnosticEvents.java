@@ -115,10 +115,14 @@ public final class DiagnosticEvents {
                 || message.contains("evt=bt.a2dp.resolved")
                 || message.contains("evt=codec.updated.hooks")
                 || message.contains("evt=cdm.hooks")
+                || message.contains("evt=codec.bt.")
                 || message.contains("evt=le.bt.")) {
             mark(editor, "scope.bluetooth", "已加载", message, time);
         }
         if (message.contains("evt=system.bridge.registered")
+                || message.contains("evt=codec.bt.receiver.registered")
+                || message.contains("evt=codec.bt.reply")
+                || message.contains("evt=codec.bt.set")
                 || message.contains("evt=bt.a2dp.resolved")
                 || message.contains("evt=codec.updated.hooks")
                 || message.contains("evt=a2dp.setCodecConfigPreference")

@@ -5,13 +5,18 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
 import android.os.RemoteException;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.UUID;
 
+import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.bridge.ICodecBridge;
@@ -45,12 +50,14 @@ public final class CodecBridgeClient {
             "android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED";
     private static final long CONFIRM_TIMEOUT_MS = 3_000L;
     private static final long LHDC_SECOND_STEP_DELAY_MS = 250L;
+    private static final long CODEC_BROADCAST_TIMEOUT_MS = 1_500L;
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
     private final SettingsGlobalFallback settingsFallback;
     private final RootShellFallback rootFallback;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Handler ipcHandler;
 
     private final CopyOnWriteArrayList<SnapshotListener> listeners = new CopyOnWriteArrayList<>();
     private volatile ICodecBridge cachedBridge;
@@ -72,6 +79,9 @@ public final class CodecBridgeClient {
         this.reflect = reflect;
         this.settingsFallback = settingsFallback;
         this.rootFallback = rootFallback;
+        HandlerThread ipcThread = new HandlerThread("MelodyCodecLsp-codecIpc");
+        ipcThread.start();
+        this.ipcHandler = new Handler(ipcThread.getLooper());
     }
 
     public void addSnapshotListener(SnapshotListener listener) {
@@ -89,19 +99,21 @@ public final class CodecBridgeClient {
     /** Returns the latest snapshot for {@code mac}; null when status is unavailable. */
     public CodecSnapshot getStatus(String mac) {
         try {
-            return reflect.readStatus(mac);
+            CodecSnapshot snapshot = reflect.readStatus(mac);
+            if (snapshot != null) return snapshot;
         } catch (Throwable t) {
             MLog.w("getStatus(" + mac + ") failed via direct API, trying bridge", t);
-            ICodecBridge bridge = ensureBridge();
-            if (bridge != null) {
-                try {
-                    return bridge.getStatus(mac);
-                } catch (RemoteException re) {
-                    MLog.w("bridge.getStatus failed", re);
-                }
-            }
-            return null;
         }
+        ICodecBridge bridge = ensureBridge();
+        if (bridge != null) {
+            try {
+                CodecSnapshot snapshot = bridge.getStatus(mac);
+                if (snapshot != null) return snapshot;
+            } catch (RemoteException re) {
+                MLog.w("bridge.getStatus failed", re);
+            }
+        }
+        return queryCodecViaBroadcast(mac, CODEC_BROADCAST_TIMEOUT_MS);
     }
 
     /** Writes the request and resolves with the eventual outcome (confirmed / rolled back). */
@@ -191,14 +203,34 @@ public final class CodecBridgeClient {
             }
         }
 
-        return setCodecViaSettingsOrRoot(request);
+        return setCodecViaBroadcast(request)
+                .thenCompose(code -> {
+                    if (code == CodecRequest.RESULT_OK) {
+                        return awaitConfirmation(request, WriteResult.Path.SYSTEM_BROADCAST)
+                                .thenCompose(result -> {
+                                    if (result.outcome == WriteResult.Outcome.CONFIRMED) {
+                                        return CompletableFuture.completedFuture(result);
+                                    }
+                                    MLog.w("Path-B broadcast accepted but not confirmed; trying settings/root");
+                                    return setCodecViaSettingsOrRoot(
+                                            request, WriteResult.Path.SYSTEM_BROADCAST);
+                                });
+                    }
+                    MLog.w("Path-B broadcast setCodec returned " + code);
+                    return setCodecViaSettingsOrRoot(request, WriteResult.Path.SYSTEM_BROADCAST);
+                });
     }
 
     private CompletableFuture<WriteResult> setCodecViaSettingsOrRoot(CodecRequest request) {
+        return setCodecViaSettingsOrRoot(request, WriteResult.Path.SYSTEM_BRIDGE);
+    }
+
+    private CompletableFuture<WriteResult> setCodecViaSettingsOrRoot(
+            CodecRequest request, WriteResult.Path failedPath) {
         if (CodecLabelTable.isLhdc(request.codecType)) {
             MLog.w("LHDC realtime write was not confirmed; skip settings/root reconnect fallback");
             return CompletableFuture.completedFuture(WriteResult.failed(
-                    WriteResult.Path.SYSTEM_BRIDGE,
+                    failedPath,
                     new IllegalStateException("LHDC realtime write path unavailable")));
         }
 
@@ -283,6 +315,167 @@ public final class CodecBridgeClient {
         }
     }
 
+    private CompletableFuture<Integer> setCodecViaBroadcast(CodecRequest request) {
+        return CompletableFuture.supplyAsync(() ->
+                sendCodecSetBroadcast(request, CODEC_BROADCAST_TIMEOUT_MS));
+    }
+
+    private CodecSnapshot queryCodecViaBroadcast(String mac, long timeoutMs) {
+        if (mac == null || mac.isEmpty()) return null;
+        String requestId = UUID.randomUUID().toString();
+        AtomicReference<CodecSnapshot> snapshotRef = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(1);
+        BroadcastReceiver receiver = codecReplyReceiver(requestId, intent -> {
+            CodecSnapshot snapshot = readSnapshot(intent);
+            if (snapshot != null) {
+                snapshotRef.set(snapshot);
+            }
+            latch.countDown();
+        });
+        registerCodecReplyReceiver(receiver);
+        try {
+            Intent intent = new Intent(CodecIpc.ACTION_QUERY_CODEC);
+            intent.setPackage(CodecIpc.BLUETOOTH_PKG);
+            intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+            intent.putExtra(CodecIpc.EXTRA_REQUEST_ID, requestId);
+            intent.putExtra(CodecIpc.EXTRA_MAC, mac);
+            context.sendBroadcast(intent);
+            boolean delivered = latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+            if (!delivered) {
+                MLog.w("codec broadcast query timed out");
+            }
+            CodecSnapshot snapshot = snapshotRef.get();
+            if (snapshot != null) {
+                MLog.event("codec.broadcast.query", "ok", true);
+            }
+            return snapshot;
+        } catch (Throwable t) {
+            MLog.w("codec broadcast query failed", t);
+            return null;
+        } finally {
+            unregisterQuietly(receiver);
+        }
+    }
+
+    private int sendCodecSetBroadcast(CodecRequest request, long timeoutMs) {
+        if (request == null || request.mac == null || request.mac.isEmpty()) {
+            return CodecRequest.RESULT_INVALID;
+        }
+        String requestId = UUID.randomUUID().toString();
+        AtomicReference<Integer> resultRef = new AtomicReference<>(CodecRequest.RESULT_TIMEOUT);
+        CountDownLatch latch = new CountDownLatch(1);
+        BroadcastReceiver receiver = codecReplyReceiver(requestId, intent -> {
+            resultRef.set(intent.getIntExtra(CodecIpc.EXTRA_RESULT, CodecRequest.RESULT_ERROR));
+            CodecSnapshot snapshot = readSnapshot(intent);
+            if (snapshot != null) {
+                dispatchSnapshot(snapshot);
+            }
+            latch.countDown();
+        });
+        registerCodecReplyReceiver(receiver);
+        try {
+            Intent intent = new Intent(CodecIpc.ACTION_SET_CODEC);
+            intent.setPackage(CodecIpc.BLUETOOTH_PKG);
+            writeRequest(intent, requestId, request);
+            context.sendBroadcast(intent);
+            boolean delivered = latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+            if (!delivered) {
+                MLog.w("codec broadcast set timed out");
+                return CodecRequest.RESULT_TIMEOUT;
+            }
+            return resultRef.get();
+        } catch (Throwable t) {
+            MLog.w("codec broadcast set failed", t);
+            return CodecRequest.RESULT_ERROR;
+        } finally {
+            unregisterQuietly(receiver);
+        }
+    }
+
+    private interface CodecReplyHandler {
+        void onReply(Intent intent);
+    }
+
+    private BroadcastReceiver codecReplyReceiver(String requestId, CodecReplyHandler handler) {
+        return new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                if (intent == null || !CodecIpc.ACTION_CODEC_STATE.equals(intent.getAction())) {
+                    return;
+                }
+                if (!CodecIpc.TOKEN.equals(intent.getStringExtra(CodecIpc.EXTRA_TOKEN))) {
+                    return;
+                }
+                String incomingId = intent.getStringExtra(CodecIpc.EXTRA_REQUEST_ID);
+                if (requestId != null && !requestId.equals(incomingId)) {
+                    return;
+                }
+                handler.onReply(intent);
+            }
+        };
+    }
+
+    private void registerCodecReplyReceiver(BroadcastReceiver receiver) {
+        IntentFilter filter = new IntentFilter(CodecIpc.ACTION_CODEC_STATE);
+        try {
+            context.registerReceiver(receiver, filter, null, ipcHandler, Context.RECEIVER_EXPORTED);
+        } catch (Throwable t) {
+            context.registerReceiver(receiver, filter, null, ipcHandler);
+        }
+    }
+
+    private void unregisterQuietly(BroadcastReceiver receiver) {
+        try {
+            context.unregisterReceiver(receiver);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private void dispatchSnapshot(CodecSnapshot snapshot) {
+        if (snapshot == null) return;
+        for (SnapshotListener l : listeners) {
+            try {
+                l.onSnapshot(snapshot);
+            } catch (Throwable t) {
+                MLog.w("snapshot listener threw", t);
+            }
+        }
+    }
+
+    private static void writeRequest(Intent intent, String requestId, CodecRequest request) {
+        intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+        intent.putExtra(CodecIpc.EXTRA_REQUEST_ID, requestId);
+        intent.putExtra(CodecIpc.EXTRA_MAC, request.mac);
+        intent.putExtra(CodecIpc.EXTRA_CODEC_TYPE, request.codecType);
+        intent.putExtra(CodecIpc.EXTRA_SAMPLE_RATE, request.sampleRate);
+        intent.putExtra(CodecIpc.EXTRA_BITS_PER_SAMPLE, request.bitsPerSample);
+        intent.putExtra(CodecIpc.EXTRA_CHANNEL_MODE, request.channelMode);
+        intent.putExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_1, request.codecSpecific1);
+        intent.putExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_2, request.codecSpecific2);
+        intent.putExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_3, request.codecSpecific3);
+        intent.putExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_4, request.codecSpecific4);
+    }
+
+    private static CodecSnapshot readSnapshot(Intent intent) {
+        if (intent == null || !intent.hasExtra(CodecIpc.EXTRA_SAMPLE_RATE)) return null;
+        String mac = intent.getStringExtra(CodecIpc.EXTRA_MAC);
+        long[] selectableSpecific1 =
+                intent.getLongArrayExtra(CodecIpc.EXTRA_SELECTABLE_SPECIFIC_1);
+        return new CodecSnapshot(
+                mac,
+                intent.getIntExtra(CodecIpc.EXTRA_CODEC_TYPE, 0),
+                intent.getIntExtra(CodecIpc.EXTRA_SAMPLE_RATE, 0),
+                intent.getIntExtra(CodecIpc.EXTRA_BITS_PER_SAMPLE, 0),
+                intent.getIntExtra(CodecIpc.EXTRA_CHANNEL_MODE, 0),
+                intent.getLongExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_1, 0L),
+                intent.getLongExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_2, 0L),
+                intent.getLongExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_3, 0L),
+                intent.getLongExtra(CodecIpc.EXTRA_CODEC_SPECIFIC_4, 0L),
+                selectableSpecific1,
+                intent.getIntExtra(CodecIpc.EXTRA_SELECTABLE_SAMPLE_RATE_MASK, 0),
+                intent.getLongExtra(CodecIpc.EXTRA_READ_TIMESTAMP_MS, 0L));
+    }
+
     /**
      * Wait for a {@code ACTION_CODEC_CONFIG_CHANGED} broadcast; if the active config matches the
      * request within {@link #CONFIRM_TIMEOUT_MS}, resolve as {@link WriteResult.Outcome#CONFIRMED};
@@ -329,7 +522,7 @@ public final class CodecBridgeClient {
 
     private CodecSnapshot safeReadStatus(String mac) {
         try {
-            return reflect.readStatus(mac);
+            return getStatus(mac);
         } catch (Throwable t) {
             MLog.w("safeReadStatus failed", t);
             return null;

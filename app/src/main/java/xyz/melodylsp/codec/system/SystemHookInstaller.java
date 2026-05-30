@@ -38,7 +38,9 @@ public final class SystemHookInstaller {
     private final ClassLoader classLoader;
     private final String sourceDir;
     private CodecBridgeService bridgeService;
+    private CodecBroadcastBridge codecBroadcastBridge;
     private BluetoothLeAudioBridge leAudioBridge;
+    private boolean serviceManagerAttempted;
 
     public SystemHookInstaller(
             MelodyCodecLspEntry module, ClassLoader classLoader, String sourceDir) {
@@ -135,6 +137,7 @@ public final class SystemHookInstaller {
                     MLog.setDiagnosticContext((Context) app, "bluetooth");
                     MLog.event("scope.system.context.ready");
                     ensureLeAudioBridge((Context) app);
+                    ensureCodecBroadcastBridge((Context) app, bridgeService);
                 }
                 return result;
             });
@@ -246,20 +249,33 @@ public final class SystemHookInstaller {
     }
 
     private synchronized void ensureBridgeRegistered(Object a2dpService) {
-        if (a2dpService instanceof Context) {
-            ensureLeAudioBridge((Context) a2dpService);
+        Context context = a2dpService instanceof Context
+                ? (Context) a2dpService
+                : currentApplication();
+        if (context != null) {
+            ensureLeAudioBridge(context);
         }
-        if (bridgeService != null || a2dpService == null) return;
+        if (a2dpService == null) return;
         try {
-            bridgeService = new CodecBridgeService(a2dpService);
-            bridgeService.registerToServiceManager();
-            MLog.event("system.bridge.registered");
+            if (bridgeService == null) {
+                bridgeService = new CodecBridgeService(a2dpService);
+            }
+            if (context != null) {
+                ensureCodecBroadcastBridge(context, bridgeService);
+            }
+            if (!serviceManagerAttempted) {
+                serviceManagerAttempted = true;
+                try {
+                    bridgeService.registerToServiceManager();
+                    MLog.event("system.bridge.registered");
+                } catch (Throwable t) {
+                    MLog.w("system bridge service-manager register failed; broadcast bridge kept");
+                }
+            }
         } catch (Throwable t) {
-            // Most ROMs deny ServiceManager.addService from com.android.bluetooth via SELinux.
-            // This is expected; the host-side falls back to the direct A2DP API and finally to
-            // Settings.Global, so failure here is not fatal. Demote to WARN once per process.
-            MLog.w("ensureBridgeRegistered failed (likely SELinux) — host-side fallback will be used");
+            MLog.w("ensureBridgeRegistered failed", t);
             bridgeService = null;
+            codecBroadcastBridge = null;
         }
     }
 
@@ -271,6 +287,18 @@ public final class SystemHookInstaller {
         } catch (Throwable t) {
             leAudioBridge = null;
             MLog.w("ensureLeAudioBridge failed", t);
+        }
+    }
+
+    private synchronized void ensureCodecBroadcastBridge(
+            Context context, CodecBridgeService service) {
+        if (codecBroadcastBridge != null || context == null || service == null) return;
+        try {
+            codecBroadcastBridge = new CodecBroadcastBridge(context, service);
+            codecBroadcastBridge.register();
+        } catch (Throwable t) {
+            codecBroadcastBridge = null;
+            MLog.w("ensureCodecBroadcastBridge failed", t);
         }
     }
 

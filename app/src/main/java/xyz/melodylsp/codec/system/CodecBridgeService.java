@@ -47,6 +47,10 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
         if (!isMelodyCaller()) {
             return null;
         }
+        return getStatusUnchecked(mac);
+    }
+
+    CodecSnapshot getStatusUnchecked(String mac) {
         try {
             BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(mac);
             Method m = a2dpClass.getMethod("getCodecStatus", BluetoothDevice.class);
@@ -64,6 +68,10 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
         if (!isMelodyCaller()) {
             return CodecRequest.RESULT_DENIED;
         }
+        return setCodecUnchecked(request);
+    }
+
+    int setCodecUnchecked(CodecRequest request) {
         if (request == null || request.mac == null) return CodecRequest.RESULT_INVALID;
         try {
             BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(request.mac);
