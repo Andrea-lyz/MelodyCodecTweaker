@@ -101,11 +101,15 @@ public final class BluetoothLeAudioBridge {
             ok = setEnabled(proxy, device, enable);
         }
         if (ok) {
-            sendTransportSwitch(device, enable);
-            if (!enable) {
-                reconnectA2dpLater(device, 1800L, 1);
-                reconnectA2dpLater(device, 3600L, 2);
-                reconnectA2dpLater(device, 6500L, 3);
+            if (enable) {
+                sendTransportSwitch(device, true);
+            } else {
+                MLog.event("le.bt.transport.skipped",
+                        "connect", false,
+                        "reason", "policy_disconnect");
+                reconnectA2dpLater(device, 2400L, 1);
+                reconnectA2dpLater(device, 4600L, 2);
+                reconnectA2dpLater(device, 8000L, 3);
             }
         }
         return ok;
@@ -236,12 +240,12 @@ public final class BluetoothLeAudioBridge {
             MLog.w("le.bt.a2dp.reconnect skipped");
             return;
         }
-        boolean policyOk = setConnectionPolicy(proxy, device, CONNECTION_POLICY_ALLOWED);
         int stateBefore = getProfileConnectionState(proxy, device);
+        Integer policyBefore = getConnectionPolicy(proxy, device);
         if (stateBefore == BluetoothProfile.STATE_CONNECTED) {
             MLog.event("le.bt.a2dp.reconnect",
                     "attempt", attempt,
-                    "policyOk", policyOk,
+                    "policyBefore", policyBefore,
                     "stateBefore", stateBefore,
                     "action", "already_connected");
             return;
@@ -249,7 +253,7 @@ public final class BluetoothLeAudioBridge {
         if (stateBefore == BluetoothProfile.STATE_CONNECTING) {
             MLog.event("le.bt.a2dp.reconnect",
                     "attempt", attempt,
-                    "policyOk", policyOk,
+                    "policyBefore", policyBefore,
                     "stateBefore", stateBefore,
                     "action", "already_connecting");
             return;
@@ -257,21 +261,47 @@ public final class BluetoothLeAudioBridge {
         if (stateBefore == BluetoothProfile.STATE_DISCONNECTING) {
             MLog.event("le.bt.a2dp.reconnect",
                     "attempt", attempt,
-                    "policyOk", policyOk,
+                    "policyBefore", policyBefore,
                     "stateBefore", stateBefore,
                     "action", "disconnecting");
             return;
+        }
+        Boolean policyOk = null;
+        if (policyBefore != null && policyBefore < CONNECTION_POLICY_ALLOWED) {
+            policyOk = setConnectionPolicy(proxy, device, CONNECTION_POLICY_ALLOWED);
+            sleepQuietly(250L);
+            int stateAfterPolicy = getProfileConnectionState(proxy, device);
+            if (stateAfterPolicy == BluetoothProfile.STATE_CONNECTED
+                    || stateAfterPolicy == BluetoothProfile.STATE_CONNECTING) {
+                MLog.event("le.bt.a2dp.reconnect",
+                        "attempt", attempt,
+                        "policyBefore", policyBefore,
+                        "policyOk", policyOk,
+                        "stateBefore", stateBefore,
+                        "stateAfterPolicy", stateAfterPolicy,
+                        "action", "policy_restored");
+                return;
+            }
         }
         Boolean connectOk = invokeBoolean(proxy, "connect",
                 new Class[]{BluetoothDevice.class}, new Object[]{device});
         int stateAfter = getProfileConnectionState(proxy, device);
         MLog.event("le.bt.a2dp.reconnect",
                 "attempt", attempt,
+                "policyBefore", policyBefore,
                 "policyOk", policyOk,
                 "connectOk", connectOk,
                 "stateBefore", stateBefore,
                 "stateAfter", stateAfter,
                 "action", "connect");
+    }
+
+    private static void sleepQuietly(long delayMs) {
+        try {
+            Thread.sleep(delayMs);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void replyLater(String mac, boolean ok, long delayMs) {
