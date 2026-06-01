@@ -206,8 +206,8 @@ jobs:
           git config --global --unset-all http.https://github.com/.extraheader || true
           git remote remove lsp 2>/dev/null || true
           git remote add lsp "https://x-access-token:${LSP_REPO_TOKEN}@github.com/Xposed-Modules-Repo/xyz.melodylsp.codec.git"
-          git push lsp "HEAD:${GITHUB_REF_NAME}"
-          git push lsp "${{ steps.version.outputs.tag }}"
+          git push --force lsp "HEAD:${GITHUB_REF_NAME}"
+          git push --force lsp "${{ steps.version.outputs.tag }}"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
