@@ -237,30 +237,42 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
     }
 
     private int readOptionalCodecsSupported(String mac) {
-        return readOptionalCodecInt(mac, "isOptionalCodecsSupported");
+        return readOptionalCodecInt(mac,
+                "getSupportsOptionalCodecs", "isOptionalCodecsSupported");
     }
 
     private int readOptionalCodecsEnabled(String mac) {
-        return readOptionalCodecInt(mac, "isOptionalCodecsEnabled");
+        return readOptionalCodecInt(mac,
+                "getOptionalCodecsEnabled", "isOptionalCodecsEnabled");
     }
 
-    private int readOptionalCodecInt(String mac, String methodName) {
+    private int readOptionalCodecInt(String mac, String... methodNames) {
         if (mac == null || mac.isEmpty()) return OPTIONAL_CODECS_UNKNOWN;
         try {
             BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(mac);
-            Method m = a2dpClass.getMethod(methodName, BluetoothDevice.class);
-            Object out = m.invoke(a2dpService, device);
-            if (out instanceof Number) return ((Number) out).intValue();
-            if (out instanceof Boolean) return (Boolean) out ? 1 : 0;
+            Throwable last = null;
+            for (String methodName : methodNames) {
+                try {
+                    Method m = findA2dpMethod(methodName, BluetoothDevice.class);
+                    Object out = m.invoke(a2dpService, device);
+                    if (out instanceof Number) return ((Number) out).intValue();
+                    if (out instanceof Boolean) return (Boolean) out ? 1 : 0;
+                } catch (Throwable t) {
+                    last = t;
+                }
+            }
+            if (last != null) {
+                MLog.w("bridge optional codec read failed: " + joinMethodNames(methodNames), last);
+            }
         } catch (Throwable t) {
-            MLog.w("bridge optional codec read failed: " + methodName, t);
+            MLog.w("bridge optional codec read failed: " + joinMethodNames(methodNames), t);
         }
         return OPTIONAL_CODECS_UNKNOWN;
     }
 
     private boolean invokeOptionalCodecPreference(BluetoothDevice device, boolean enable) {
         try {
-            Method m = a2dpClass.getMethod(
+            Method m = findA2dpMethod(
                     "setOptionalCodecsEnabled", BluetoothDevice.class, int.class);
             m.invoke(a2dpService, device,
                     enable ? OPTIONAL_CODECS_PREF_ENABLED : OPTIONAL_CODECS_PREF_DISABLED);
@@ -274,13 +286,33 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
     private boolean invokeOptionalCodecToggle(BluetoothDevice device, boolean enable) {
         String name = enable ? "enableOptionalCodecs" : "disableOptionalCodecs";
         try {
-            Method m = a2dpClass.getMethod(name, BluetoothDevice.class);
+            Method m = findA2dpMethod(name, BluetoothDevice.class);
             m.invoke(a2dpService, device);
             return true;
         } catch (Throwable t) {
             MLog.w("bridge." + name + " failed", t);
             return false;
         }
+    }
+
+    private Method findA2dpMethod(String name, Class<?>... parameterTypes)
+            throws NoSuchMethodException {
+        try {
+            return a2dpClass.getMethod(name, parameterTypes);
+        } catch (NoSuchMethodException ignored) {
+            Method m = a2dpClass.getDeclaredMethod(name, parameterTypes);
+            m.setAccessible(true);
+            return m;
+        }
+    }
+
+    private static String joinMethodNames(String[] names) {
+        if (names == null || names.length == 0) return "optional";
+        StringBuilder sb = new StringBuilder(names[0]);
+        for (int i = 1; i < names.length; i++) {
+            sb.append('/').append(names[i]);
+        }
+        return sb.toString();
     }
 
     private Object newCodecConfig(Class<?> cfgCls, CodecRequest req) throws Exception {

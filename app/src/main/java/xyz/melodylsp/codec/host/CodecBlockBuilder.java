@@ -94,13 +94,13 @@ public final class CodecBlockBuilder {
 
         // First child row — header. Lives inside the white card whether or not we wrapped it
         // in a Category, so the visual is "蓝牙音质 · LHDC" stacked above 播放质量 / 采样率 in
-        // a single connected card. Non-selectable; no click ripple.
+        // a single connected card. It is also the codec-mode picker entry.
         header = newOf(context, COUI_PREFERENCE, ANDX_PREFERENCE);
         if (header != null) {
             cloneVisualStyleFrom(header, prefTemplate);
             PrefRef.setKey(header, "melody_codec_lsp_header");
             PrefRef.setTitle(header, Strings.CODEC_BLOCK_TITLE);
-            PrefRef.setSelectable(header, false);
+            PrefRef.setSelectable(header, true);
             PrefRef.setIconSpaceReserved(header, false);
             PrefRef.setPersistent(header, false);
             PrefRef.setWidgetLayoutResource(header, 0);

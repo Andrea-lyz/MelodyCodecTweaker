@@ -32,9 +32,9 @@ public final class CodecSnapshot implements Parcelable {
     public final int selectableSampleRateMask;
     /** Codec types exposed by {@code getCodecsSelectableCapabilities()}, in platform order. */
     public final int[] selectableCodecTypes;
-    /** {@code BluetoothA2dp.isOptionalCodecsSupported}: 1 supported, 0 unsupported, -1 unknown. */
+    /** Optional codec support: 1 supported, 0 unsupported, -1 unknown. */
     public final int optionalCodecsSupported;
-    /** {@code BluetoothA2dp.isOptionalCodecsEnabled}: 1 high-quality, 0 standard, -1 unknown. */
+    /** Optional codec state: 1 high-quality, 0 standard, -1 unknown. */
     public final int optionalCodecsEnabled;
 
     public final long readTimestampMs;

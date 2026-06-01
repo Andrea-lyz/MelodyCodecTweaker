@@ -794,7 +794,7 @@ public final class CodecController {
     }
 
     /**
-     * Wire up click listeners on the quality and sample-rate Preferences. Tap → pop a
+     * Wire up click listeners on the codec, quality and sample-rate Preferences. Tap → pop a
      * hand-rolled floating dialog with the current options. We resolve
      * {@code OnPreferenceClickListener} via reflection because the inner-class FQN is
      * R8-renamed inside the host APK.
@@ -842,6 +842,10 @@ public final class CodecController {
                     }
                     return true;
                 });
+        if (sub.prefs.codecDisplay != null
+                && sub.prefs.codecDisplay != sub.prefs.codecModeOption) {
+            invokeSetClickListener(sub.prefs.codecDisplay, codecModeListener, clickListenerCls);
+        }
         invokeSetClickListener(sub.prefs.codecModeOption, codecModeListener, clickListenerCls);
         invokeSetClickListener(sub.prefs.qualityOption, qualityListener, clickListenerCls);
         invokeSetClickListener(sub.prefs.sampleRateOption, sampleListener, clickListenerCls);
@@ -871,7 +875,7 @@ public final class CodecController {
             Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
             return;
         }
-        if (!snapshot.supportsOptionalCodecs()) {
+        if (!isCodecModeSwitchAvailable(snapshot)) {
             Toast.makeText(context,
                     Strings.TOAST_CODEC_MODE_UNSUPPORTED, Toast.LENGTH_SHORT).show();
             return;
@@ -1365,7 +1369,7 @@ public final class CodecController {
     }
 
     private void applyOptionalCodecWrite(Subscription sub, boolean enable) {
-        PrefRef.setSummary(sub.prefs.codecModeOption, Strings.STATE_SWITCHING_CODEC);
+        setCodecModeStatus(sub, Strings.STATE_SWITCHING_CODEC);
         setBlockDisabled(sub, true);
         bridge.setOptionalCodecs(sub.mac, enable).whenComplete((result, ex) -> mainHandler.post(() -> {
             setBlockDisabled(sub, false);
@@ -1555,7 +1559,12 @@ public final class CodecController {
     private void renderCodecMode(CodecSnapshot snapshot, Subscription sub) {
         Object mode = sub.prefs.codecModeOption;
         if (mode == null) return;
-        if (!snapshot.supportsOptionalCodecs()) {
+        if (!isCodecModeSwitchAvailable(snapshot)) {
+            PrefRef.setVisible(mode, false);
+            return;
+        }
+        if (codecModeUsesHeader(sub)) {
+            PrefRef.setSummary(sub.prefs.codecDisplay, "");
             PrefRef.setVisible(mode, false);
             return;
         }
@@ -1612,6 +1621,30 @@ public final class CodecController {
                 : standardCodecLabel(snapshot);
         return (highQuality ? Strings.CODEC_MODE_HIGH_QUALITY : Strings.CODEC_MODE_STANDARD)
                 + "（" + label + "）";
+    }
+
+    private boolean codecModeUsesHeader(Subscription sub) {
+        return sub != null
+                && sub.prefs != null
+                && sub.prefs.codecDisplay != null
+                && sub.prefs.codecDisplay != sub.prefs.codecModeOption;
+    }
+
+    private void setCodecModeStatus(Subscription sub, CharSequence summary) {
+        if (sub == null || sub.prefs == null) return;
+        Object mode = sub.prefs.codecModeOption;
+        if (mode != null && PrefRef.isVisible(mode)) {
+            PrefRef.setSummary(mode, summary);
+        } else if (codecModeUsesHeader(sub)) {
+            PrefRef.setSummary(sub.prefs.codecDisplay, summary);
+        }
+    }
+
+    private static boolean isCodecModeSwitchAvailable(CodecSnapshot snapshot) {
+        if (snapshot == null) return false;
+        if (snapshot.supportsOptionalCodecs()) return true;
+        if (bestSelectableHighQualityCodec(snapshot.selectableCodecTypes) >= 0) return true;
+        return snapshot.activeCodecType != CodecLabelTable.CODEC_SBC;
     }
 
     private String bestHighQualityCodecLabel(CodecSnapshot snapshot) {
