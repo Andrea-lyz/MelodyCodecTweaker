@@ -12,6 +12,7 @@ import android.content.IntentFilter;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
@@ -1029,10 +1030,10 @@ public final class CodecController {
         if (root == null) return;
 
         final PopupWindow[] popupRef = new PopupWindow[1];
-        FrameLayout shell = new FrameLayout(popupContext);
+        PopupShadowLayout shell = new PopupShadowLayout(popupContext, dp(popupContext, 12));
         shell.setClipToPadding(false);
         shell.setClipChildren(false);
-        int shadowPad = dp(popupContext, 24);
+        int shadowPad = dp(popupContext, 32);
         shell.setPadding(shadowPad, shadowPad, shadowPad, shadowPad);
 
         LinearLayout list = new LinearLayout(popupContext);
@@ -1051,10 +1052,6 @@ public final class CodecController {
         list.setBackground(bg);
         if (Build.VERSION.SDK_INT >= 21) {
             list.setClipToOutline(true);
-            list.setElevation(dp(popupContext, 30));
-            if (Build.VERSION.SDK_INT >= 28) {
-                list.setOutlineSpotShadowColor(Color.argb(128, 0, 0, 0));
-            }
         }
 
         for (int i = 0; i < entries.length; i++) {
@@ -1143,6 +1140,44 @@ public final class CodecController {
         popup.showAtLocation(root, Gravity.TOP | Gravity.START, x, y);
     }
 
+    private static final class PopupShadowLayout extends FrameLayout {
+        private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF shadowRect = new RectF();
+        private final float cornerRadius;
+        private final float density;
+
+        PopupShadowLayout(Context context, float cornerRadius) {
+            super(context);
+            this.cornerRadius = cornerRadius;
+            this.density = Math.max(1f, context.getResources().getDisplayMetrics().density);
+            setWillNotDraw(false);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            drawShadowLayer(canvas, 27f, 5f, 3);
+            drawShadowLayer(canvas, 22f, 4f, 4);
+            drawShadowLayer(canvas, 16f, 3f, 5);
+            drawShadowLayer(canvas, 10f, 2f, 6);
+            drawShadowLayer(canvas, 5f, 1f, 7);
+            drawShadowLayer(canvas, 2f, 0f, 5);
+            super.onDraw(canvas);
+        }
+
+        private void drawShadowLayer(Canvas canvas, float spreadDp, float dyDp, int alpha) {
+            float spread = spreadDp * density;
+            float dy = dyDp * density;
+            shadowRect.set(
+                    getPaddingLeft() - spread,
+                    getPaddingTop() - spread + dy,
+                    getWidth() - getPaddingRight() + spread,
+                    getHeight() - getPaddingBottom() + spread + dy);
+            shadowPaint.setColor(Color.argb(alpha, 0, 0, 0));
+            canvas.drawRoundRect(shadowRect,
+                    cornerRadius + spread, cornerRadius + spread, shadowPaint);
+        }
+    }
+
     private static final class CheckMarkView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
@@ -1151,7 +1186,7 @@ public final class CodecController {
             float density = context.getResources().getDisplayMetrics().density;
             paint.setColor(color);
             paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Math.max(2f, 2.4f * density));
+            paint.setStrokeWidth(Math.max(1.5f, 1.7f * density));
             paint.setStrokeCap(Paint.Cap.ROUND);
             paint.setStrokeJoin(Paint.Join.ROUND);
         }
