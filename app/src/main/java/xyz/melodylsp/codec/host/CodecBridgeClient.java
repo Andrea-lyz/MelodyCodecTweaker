@@ -53,6 +53,7 @@ public final class CodecBridgeClient {
     private static final long OPTIONAL_CONFIRM_TIMEOUT_MS = 4_000L;
     private static final long LHDC_SECOND_STEP_DELAY_MS = 250L;
     private static final long CODEC_BROADCAST_TIMEOUT_MS = 1_500L;
+    private static final int SAMPLE_RATE_48000_BIT = 0x2;
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
@@ -149,6 +150,10 @@ public final class CodecBridgeClient {
                                 if (!shouldContinue(shouldContinue)) {
                                     return staleWriteResult(request, result.path);
                                 }
+                                if (CodecLabelTable.isLhdc(request.codecType)) {
+                                    MLog.w("Path-A LHDC accepted but not confirmed; skip bridge retry");
+                                    return CompletableFuture.completedFuture(result);
+                                }
                                 MLog.w("Path-A accepted but not confirmed; trying bridge/settings/root");
                                 return setCodecViaBridgeOrFallback(request, shouldContinue);
                             });
@@ -208,7 +213,7 @@ public final class CodecBridgeClient {
                 request.codecSpecific2,
                 request.codecSpecific3,
                 request.codecSpecific4,
-                request.sampleRate,
+                lhdcPrimeSampleRate(request),
                 request.bitsPerSample,
                 request.channelMode);
         try {
@@ -230,6 +235,13 @@ public final class CodecBridgeClient {
             }
         }, LHDC_SECOND_STEP_DELAY_MS);
         return future;
+    }
+
+    private static int lhdcPrimeSampleRate(CodecRequest request) {
+        if (request == null || request.sampleRate == 0) return 0;
+        return request.sampleRate == SAMPLE_RATE_48000_BIT
+                ? request.sampleRate
+                : SAMPLE_RATE_48000_BIT;
     }
 
     private CompletableFuture<Void> applyDirectOptionalCodecs(String mac, boolean enable) {

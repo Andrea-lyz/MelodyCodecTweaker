@@ -82,6 +82,7 @@ public final class CodecController {
     private static final int CODEC_MODE_AAC = 1;
     private static final int CODEC_MODE_STANDARD = 2;
     private static final long CLASSIC_RESTORE_WINDOW_MS = 30_000L;
+    private static final long HIGH_QUALITY_RETRY_DELAY_MS = 900L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
 
@@ -1708,17 +1709,48 @@ public final class CodecController {
         MLog.event("write.high_quality.fastpath",
                 "from", snapshot.activeCodecType,
                 "request", request);
+        long generation = nextCodecWriteGeneration(sub);
+        applyHighQualityCodecWriteAttempt(sub, request, generation, 0);
+    }
+
+    private void applyHighQualityCodecWriteAttempt(
+            Subscription sub, CodecRequest request, long generation, int attempt) {
         applyWrite(sub, request, (result, error) -> {
             if (error != null) {
-                MLog.w("High-quality fast path failed; falling back to optional codecs", error);
+                MLog.w("High-quality fast path failed", error);
             } else {
                 MLog.event("write.high_quality.fastpath.fallback",
                         "outcome", result != null ? result.outcome : "unknown",
-                        "path", result != null ? result.path : "unknown");
+                        "path", result != null ? result.path : "unknown",
+                        "attempt", attempt);
+            }
+            CodecSnapshot live = result != null ? result.rollbackSnapshot : lastSnapshot.get();
+            if (isHighQualityMode(live)) {
+                MLog.event("write.high_quality.partial_confirmed",
+                        "attempt", attempt,
+                        "live", live);
+                refreshSnapshot(sub);
+                return true;
+            }
+            if (attempt == 0 && isCurrentCodecWrite(sub, generation)) {
+                MLog.event("write.high_quality.retry",
+                        "attempt", attempt + 1,
+                        "delayMs", HIGH_QUALITY_RETRY_DELAY_MS,
+                        "request", request);
+                mainHandler.postDelayed(() -> {
+                    if (!isCurrentCodecWrite(sub, generation)) {
+                        MLog.event("write.high_quality.retry.stale",
+                                "attempt", attempt + 1,
+                                "request", request);
+                        return;
+                    }
+                    applyHighQualityCodecWriteAttempt(sub, request, generation, attempt + 1);
+                }, HIGH_QUALITY_RETRY_DELAY_MS);
+                return true;
             }
             applyOptionalCodecWrite(sub, true);
             return true;
-        });
+        }, generation);
     }
 
     private CodecRequest buildHighQualityCodecRequest(Subscription sub, CodecSnapshot live) {
