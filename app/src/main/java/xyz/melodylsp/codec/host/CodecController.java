@@ -83,6 +83,7 @@ public final class CodecController {
     private static final int CODEC_MODE_STANDARD = 2;
     private static final long CLASSIC_RESTORE_WINDOW_MS = 30_000L;
     private static final long HIGH_QUALITY_RETRY_DELAY_MS = 900L;
+    private static final long AAC_HIGH_QUALITY_WARMUP_DELAY_MS = 650L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
 
@@ -1570,6 +1571,15 @@ public final class CodecController {
             CodecRequest request,
             WriteFailureHandler failureHandler,
             long generation) {
+        applyWrite(sub, request, failureHandler, generation, null);
+    }
+
+    private void applyWrite(
+            Subscription sub,
+            CodecRequest request,
+            WriteFailureHandler failureHandler,
+            long generation,
+            WriteSuccessHandler successHandler) {
         bridge.setCodec(request, () -> isCurrentCodecWrite(sub, generation))
                 .whenComplete((result, ex) -> mainHandler.post(() -> {
             if (!isCurrentCodecWrite(sub, generation)) {
@@ -1596,6 +1606,7 @@ public final class CodecController {
                     if (prefs.isRemembered(sub.mac) && request.sampleRate != 0) {
                         prefs.writeSnapshot(sub.mac, request.codecSpecific1, request.sampleRate);
                     }
+                    if (successHandler != null && successHandler.onConfirmed(result)) return;
                     refreshSnapshot(sub);
                     break;
                 case TIMEOUT_ROLLED_BACK:
@@ -1619,6 +1630,10 @@ public final class CodecController {
 
     private interface WriteFailureHandler {
         boolean onFailure(WriteResult result, Throwable error);
+    }
+
+    private interface WriteSuccessHandler {
+        boolean onConfirmed(WriteResult result);
     }
 
     private synchronized long nextCodecWriteGeneration(Subscription sub) {
@@ -1710,11 +1725,16 @@ public final class CodecController {
                 "from", snapshot.activeCodecType,
                 "request", request);
         long generation = nextCodecWriteGeneration(sub);
-        applyHighQualityCodecWriteAttempt(sub, request, generation, 0);
+        boolean fromAac = snapshot.activeCodecType == CodecLabelTable.CODEC_AAC;
+        applyHighQualityCodecWriteAttempt(sub, request, generation, 0, fromAac);
     }
 
     private void applyHighQualityCodecWriteAttempt(
-            Subscription sub, CodecRequest request, long generation, int attempt) {
+            Subscription sub,
+            CodecRequest request,
+            long generation,
+            int attempt,
+            boolean fromAac) {
         applyWrite(sub, request, (result, error) -> {
             if (error != null) {
                 MLog.w("High-quality fast path failed", error);
@@ -1744,13 +1764,71 @@ public final class CodecController {
                                 "request", request);
                         return;
                     }
-                    applyHighQualityCodecWriteAttempt(sub, request, generation, attempt + 1);
+                    applyHighQualityCodecWriteAttempt(
+                            sub, request, generation, attempt + 1, fromAac);
                 }, HIGH_QUALITY_RETRY_DELAY_MS);
+                return true;
+            }
+            if (fromAac && isCurrentCodecWrite(sub, generation)) {
+                applyAacHighQualityWarmupFallback(sub, request, live, generation);
                 return true;
             }
             applyOptionalCodecWrite(sub, true);
             return true;
         }, generation);
+    }
+
+    private void applyAacHighQualityWarmupFallback(
+            Subscription sub,
+            CodecRequest highQualityRequest,
+            CodecSnapshot live,
+            long generation) {
+        if (!isCurrentCodecWrite(sub, generation)) return;
+        if (live == null || live.mac == null || !live.mac.equals(highQualityRequest.mac)) {
+            MLog.event("write.high_quality.aac_warmup.skip",
+                    "reason", "no_live_snapshot",
+                    "request", highQualityRequest);
+            applyOptionalCodecWrite(sub, true);
+            return;
+        }
+        CodecRequest warmup = CodecRequest.fromActive(live)
+                .codecType(CodecLabelTable.CODEC_SBC)
+                .codecSpecific1(0L)
+                .codecSpecific2(0L)
+                .codecSpecific3(0L)
+                .codecSpecific4(0L)
+                .sampleRate(0)
+                .bitsPerSample(0)
+                .channelMode(0)
+                .build();
+        MLog.event("write.high_quality.aac_warmup",
+                "warmup", warmup,
+                "target", highQualityRequest);
+        applyWrite(sub, warmup, (result, error) -> {
+            if (error != null) {
+                MLog.w("AAC high-quality SBC warmup failed", error);
+            } else {
+                MLog.event("write.high_quality.aac_warmup.fallback",
+                        "outcome", result != null ? result.outcome : "unknown",
+                        "path", result != null ? result.path : "unknown");
+            }
+            applyOptionalCodecWrite(sub, true);
+            return true;
+        }, generation, result -> {
+            mainHandler.postDelayed(() -> {
+                if (!isCurrentCodecWrite(sub, generation)) {
+                    MLog.event("write.high_quality.aac_warmup.stale",
+                            "target", highQualityRequest);
+                    return;
+                }
+                MLog.event("write.high_quality.aac_warmup.target",
+                        "delayMs", AAC_HIGH_QUALITY_WARMUP_DELAY_MS,
+                        "request", highQualityRequest);
+                applyHighQualityCodecWriteAttempt(
+                        sub, highQualityRequest, generation, 1, false);
+            }, AAC_HIGH_QUALITY_WARMUP_DELAY_MS);
+            return true;
+        });
     }
 
     private CodecRequest buildHighQualityCodecRequest(Subscription sub, CodecSnapshot live) {
