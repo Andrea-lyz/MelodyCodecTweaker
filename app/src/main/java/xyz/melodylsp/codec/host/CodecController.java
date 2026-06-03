@@ -98,6 +98,7 @@ public final class CodecController {
     private final Set<String> classicRestorePending = new LinkedHashSet<>();
     private final Map<String, Long> classicRestoreDeadlines = new HashMap<>();
     private final Map<String, CodecSnapshot> lastHighQualitySnapshots = new HashMap<>();
+    private final Map<String, Long> codecWriteGenerations = new HashMap<>();
 
     public interface SurfaceRescanRequester {
         void request(String reason);
@@ -942,7 +943,6 @@ public final class CodecController {
                     }
                 } else if (action == CODEC_MODE_STANDARD
                         && isStandardMode(snapshot)) {
-                    setOptionalCodecsQuietly(sub, false, "standard_already_active");
                     refreshSnapshot(sub);
                 } else if (action == CODEC_MODE_HIGH) {
                     applyHighQualityCodecWrite(sub, snapshot);
@@ -1561,15 +1561,23 @@ public final class CodecController {
     }
 
     private void applyWrite(Subscription sub, CodecRequest request, WriteFailureHandler failureHandler) {
-        applyWrite(sub, request, failureHandler, null);
+        applyWrite(sub, request, failureHandler, nextCodecWriteGeneration(sub));
     }
 
     private void applyWrite(
             Subscription sub,
             CodecRequest request,
             WriteFailureHandler failureHandler,
-            WriteSuccessHandler successHandler) {
-        bridge.setCodec(request).whenComplete((result, ex) -> mainHandler.post(() -> {
+            long generation) {
+        bridge.setCodec(request, () -> isCurrentCodecWrite(sub, generation))
+                .whenComplete((result, ex) -> mainHandler.post(() -> {
+            if (!isCurrentCodecWrite(sub, generation)) {
+                MLog.event("write.stale.ignore",
+                        "generation", generation,
+                        "request", request,
+                        "outcome", result != null ? result.outcome : "exception");
+                return;
+            }
             if (ex != null) {
                 MLog.e("setCodec future failed", ex);
                 if (failureHandler != null && failureHandler.onFailure(null, ex)) return;
@@ -1587,7 +1595,6 @@ public final class CodecController {
                     if (prefs.isRemembered(sub.mac) && request.sampleRate != 0) {
                         prefs.writeSnapshot(sub.mac, request.codecSpecific1, request.sampleRate);
                     }
-                    if (successHandler != null) successHandler.onConfirmed(result);
                     refreshSnapshot(sub);
                     break;
                 case TIMEOUT_ROLLED_BACK:
@@ -1613,14 +1620,35 @@ public final class CodecController {
         boolean onFailure(WriteResult result, Throwable error);
     }
 
-    private interface WriteSuccessHandler {
-        void onConfirmed(WriteResult result);
+    private synchronized long nextCodecWriteGeneration(Subscription sub) {
+        if (sub == null || sub.mac == null) return 0L;
+        long next = codecWriteGenerations.containsKey(sub.mac)
+                ? codecWriteGenerations.get(sub.mac) + 1L
+                : 1L;
+        codecWriteGenerations.put(sub.mac, next);
+        return next;
+    }
+
+    private synchronized boolean isCurrentCodecWrite(Subscription sub, long generation) {
+        if (generation == 0L || sub == null || sub.mac == null) return true;
+        Long current = codecWriteGenerations.get(sub.mac);
+        return current != null && current == generation;
     }
 
     private void applyOptionalCodecWrite(Subscription sub, boolean enable) {
         setCodecModeStatus(sub, Strings.STATE_SWITCHING_CODEC);
         setBlockDisabled(sub, true);
-        bridge.setOptionalCodecs(sub.mac, enable).whenComplete((result, ex) -> mainHandler.post(() -> {
+        long generation = nextCodecWriteGeneration(sub);
+        bridge.setOptionalCodecs(sub.mac, enable, () -> isCurrentCodecWrite(sub, generation))
+                .whenComplete((result, ex) -> mainHandler.post(() -> {
+            if (!isCurrentCodecWrite(sub, generation)) {
+                MLog.event("write.optional.stale.ignore",
+                        "generation", generation,
+                        "mac", sub != null ? sub.mac : "?",
+                        "enable", enable,
+                        "outcome", result != null ? result.outcome : "exception");
+                return;
+            }
             setBlockDisabled(sub, false);
             if (ex != null) {
                 MLog.e("setOptionalCodecs future failed", ex);
@@ -1690,7 +1718,7 @@ public final class CodecController {
             }
             applyOptionalCodecWrite(sub, true);
             return true;
-        }, result -> setOptionalCodecsQuietly(sub, true, "high_quality_fastpath"));
+        });
     }
 
     private CodecRequest buildHighQualityCodecRequest(Subscription sub, CodecSnapshot live) {
@@ -1764,12 +1792,7 @@ public final class CodecController {
                 .channelMode(0)
                 .build();
         MLog.event("write.codec.fastpath", "from", snapshot.activeCodecType, "request", request);
-        applyWrite(sub, request, null, result -> {
-            if (codecType == CodecLabelTable.CODEC_AAC
-                    || codecType == CodecLabelTable.CODEC_SBC) {
-                setOptionalCodecsQuietly(sub, false, "low_quality_fastpath");
-            }
-        });
+        applyWrite(sub, request);
     }
 
     private void applyStandardCodecWrite(Subscription sub, CodecSnapshot snapshot) {
@@ -1787,7 +1810,6 @@ public final class CodecController {
         MLog.event("write.standard.fastpath",
                 "from", snapshot.activeCodecType,
                 "request", request);
-        setOptionalCodecsQuietly(sub, false, "standard_fastpath_parallel");
         applyWrite(sub, request, (result, error) -> {
             if (error != null) {
                 MLog.w("Standard fast path failed; falling back to optional codecs", error);
@@ -1798,22 +1820,6 @@ public final class CodecController {
             }
             applyOptionalCodecWrite(sub, false);
             return true;
-        });
-    }
-
-    private void setOptionalCodecsQuietly(Subscription sub, boolean enable, String reason) {
-        if (sub == null || sub.mac == null) return;
-        bridge.setOptionalCodecs(sub.mac, enable).whenComplete((result, ex) -> {
-            if (ex != null) {
-                MLog.w("Optional codec background sync failed: reason="
-                        + reason + " enable=" + enable, ex);
-                return;
-            }
-            MLog.event("write.optional.background",
-                    "reason", reason,
-                    "enable", enable,
-                    "outcome", result != null ? result.outcome : "unknown",
-                    "path", result != null ? result.path : "unknown");
         });
     }
 

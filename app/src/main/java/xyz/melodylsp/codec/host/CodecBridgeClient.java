@@ -14,6 +14,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import java.util.UUID;
 
 import xyz.melodylsp.codec.bridge.CodecIpc;
@@ -119,41 +120,70 @@ public final class CodecBridgeClient {
 
     /** Writes the request and resolves with the eventual outcome (confirmed / rolled back). */
     public CompletableFuture<WriteResult> setCodec(CodecRequest request) {
+        return setCodec(request, () -> true);
+    }
+
+    /**
+     * Writes the request and only advances to slower fallback paths while {@code shouldContinue}
+     * remains true. The first direct request is never delayed; the guard only prevents stale
+     * operations from reviving after their confirmation window timed out.
+     */
+    public CompletableFuture<WriteResult> setCodec(
+            CodecRequest request, BooleanSupplier shouldContinue) {
         // Path A.
         return applyDirectWrite(request)
                 .handle((ignored, error) -> error)
                 .thenCompose(error -> {
                     if (error != null) {
                         MLog.w("Path-A setCodec failed", unwrap(error));
-                        return setCodecViaBridgeOrFallback(request);
+                        if (!shouldContinue(shouldContinue)) {
+                            return staleWriteResult(request, WriteResult.Path.DIRECT_API);
+                        }
+                        return setCodecViaBridgeOrFallback(request, shouldContinue);
                     }
                     return awaitConfirmation(request, WriteResult.Path.DIRECT_API)
                             .thenCompose(result -> {
                                 if (result.outcome == WriteResult.Outcome.CONFIRMED) {
                                     return CompletableFuture.completedFuture(result);
                                 }
+                                if (!shouldContinue(shouldContinue)) {
+                                    return staleWriteResult(request, result.path);
+                                }
                                 MLog.w("Path-A accepted but not confirmed; trying bridge/settings/root");
-                                return setCodecViaBridgeOrFallback(request);
+                                return setCodecViaBridgeOrFallback(request, shouldContinue);
                             });
                 });
     }
 
     /** Toggle the platform high-quality audio preference (official SettingsLib path). */
     public CompletableFuture<WriteResult> setOptionalCodecs(String mac, boolean enable) {
+        return setOptionalCodecs(mac, enable, () -> true);
+    }
+
+    public CompletableFuture<WriteResult> setOptionalCodecs(
+            String mac, boolean enable, BooleanSupplier shouldContinue) {
         return applyDirectOptionalCodecs(mac, enable)
                 .handle((ignored, error) -> error)
                 .thenCompose(error -> {
                     if (error != null) {
                         MLog.w("Path-A setOptionalCodecs failed", unwrap(error));
-                        return setOptionalCodecsViaBridgeOrBroadcast(mac, enable);
+                        if (!shouldContinue(shouldContinue)) {
+                            return staleWriteResult(mac, enable, WriteResult.Path.DIRECT_API);
+                        }
+                        return setOptionalCodecsViaBridgeOrBroadcast(
+                                mac, enable, shouldContinue);
                     }
                     return awaitOptionalConfirmation(mac, enable, WriteResult.Path.DIRECT_API)
                             .thenCompose(result -> {
                                 if (result.outcome == WriteResult.Outcome.CONFIRMED) {
                                     return CompletableFuture.completedFuture(result);
                                 }
+                                if (!shouldContinue(shouldContinue)) {
+                                    return staleWriteResult(mac, enable, result.path);
+                                }
                                 MLog.w("Path-A optional codecs accepted but not confirmed; trying bridge/broadcast");
-                                return setOptionalCodecsViaBridgeOrBroadcast(mac, enable);
+                                return setOptionalCodecsViaBridgeOrBroadcast(
+                                        mac, enable, shouldContinue);
                             });
                 });
     }
@@ -215,6 +245,14 @@ public final class CodecBridgeClient {
 
     private CompletableFuture<WriteResult> setOptionalCodecsViaBridgeOrBroadcast(
             String mac, boolean enable) {
+        return setOptionalCodecsViaBridgeOrBroadcast(mac, enable, () -> true);
+    }
+
+    private CompletableFuture<WriteResult> setOptionalCodecsViaBridgeOrBroadcast(
+            String mac, boolean enable, BooleanSupplier shouldContinue) {
+        if (!shouldContinue(shouldContinue)) {
+            return staleWriteResult(mac, enable, WriteResult.Path.SYSTEM_BRIDGE);
+        }
         ICodecBridge bridge = ensureBridge();
         if (bridge != null) {
             try {
@@ -225,8 +263,12 @@ public final class CodecBridgeClient {
                                 if (result.outcome == WriteResult.Outcome.CONFIRMED) {
                                     return CompletableFuture.completedFuture(result);
                                 }
+                                if (!shouldContinue(shouldContinue)) {
+                                    return staleWriteResult(mac, enable, result.path);
+                                }
                                 MLog.w("Path-B optional codecs accepted but not confirmed; trying broadcast");
-                                return setOptionalCodecsViaBroadcast(mac, enable);
+                                return setOptionalCodecsViaBroadcast(
+                                        mac, enable, shouldContinue);
                             });
                 }
                 MLog.w("Path-B bridge.setOptionalCodecs returned " + code);
@@ -234,14 +276,25 @@ public final class CodecBridgeClient {
                 MLog.w("Path-B bridge.setOptionalCodecs RemoteException", re);
             }
         }
-        return setOptionalCodecsViaBroadcast(mac, enable);
+        return setOptionalCodecsViaBroadcast(mac, enable, shouldContinue);
     }
 
     private CompletableFuture<WriteResult> setOptionalCodecsViaBroadcast(
             String mac, boolean enable) {
+        return setOptionalCodecsViaBroadcast(mac, enable, () -> true);
+    }
+
+    private CompletableFuture<WriteResult> setOptionalCodecsViaBroadcast(
+            String mac, boolean enable, BooleanSupplier shouldContinue) {
+        if (!shouldContinue(shouldContinue)) {
+            return staleWriteResult(mac, enable, WriteResult.Path.SYSTEM_BROADCAST);
+        }
         return CompletableFuture.supplyAsync(() ->
                         sendOptionalCodecSetBroadcast(mac, enable, CODEC_BROADCAST_TIMEOUT_MS))
                 .thenCompose(code -> {
+                    if (!shouldContinue(shouldContinue)) {
+                        return staleWriteResult(mac, enable, WriteResult.Path.SYSTEM_BROADCAST);
+                    }
                     if (code == CodecRequest.RESULT_OK) {
                         return awaitOptionalConfirmation(
                                 mac, enable, WriteResult.Path.SYSTEM_BROADCAST);
@@ -254,6 +307,14 @@ public final class CodecBridgeClient {
     }
 
     private CompletableFuture<WriteResult> setCodecViaBridgeOrFallback(CodecRequest request) {
+        return setCodecViaBridgeOrFallback(request, () -> true);
+    }
+
+    private CompletableFuture<WriteResult> setCodecViaBridgeOrFallback(
+            CodecRequest request, BooleanSupplier shouldContinue) {
+        if (!shouldContinue(shouldContinue)) {
+            return staleWriteResult(request, WriteResult.Path.SYSTEM_BRIDGE);
+        }
         // Path B.
         ICodecBridge bridge = ensureBridge();
         if (bridge != null) {
@@ -265,8 +326,12 @@ public final class CodecBridgeClient {
                                 if (result.outcome == WriteResult.Outcome.CONFIRMED) {
                                     return CompletableFuture.completedFuture(result);
                                 }
+                                if (!shouldContinue(shouldContinue)) {
+                                    return staleWriteResult(request, result.path);
+                                }
                                 MLog.w("Path-B accepted but not confirmed; trying settings/root");
-                                return setCodecViaSettingsOrRoot(request);
+                                return setCodecViaSettingsOrRoot(
+                                        request, WriteResult.Path.SYSTEM_BRIDGE, shouldContinue);
                             });
                 }
                 MLog.w("Path-B bridge.setCodec returned " + code);
@@ -275,21 +340,32 @@ public final class CodecBridgeClient {
             }
         }
 
+        if (!shouldContinue(shouldContinue)) {
+            return staleWriteResult(request, WriteResult.Path.SYSTEM_BROADCAST);
+        }
         return setCodecViaBroadcast(request)
                 .thenCompose(code -> {
+                    if (!shouldContinue(shouldContinue)) {
+                        return staleWriteResult(request, WriteResult.Path.SYSTEM_BROADCAST);
+                    }
                     if (code == CodecRequest.RESULT_OK) {
                         return awaitConfirmation(request, WriteResult.Path.SYSTEM_BROADCAST)
                                 .thenCompose(result -> {
                                     if (result.outcome == WriteResult.Outcome.CONFIRMED) {
                                         return CompletableFuture.completedFuture(result);
                                     }
+                                    if (!shouldContinue(shouldContinue)) {
+                                        return staleWriteResult(request, result.path);
+                                    }
                                     MLog.w("Path-B broadcast accepted but not confirmed; trying settings/root");
                                     return setCodecViaSettingsOrRoot(
-                                            request, WriteResult.Path.SYSTEM_BROADCAST);
+                                            request, WriteResult.Path.SYSTEM_BROADCAST,
+                                            shouldContinue);
                                 });
                     }
                     MLog.w("Path-B broadcast setCodec returned " + code);
-                    return setCodecViaSettingsOrRoot(request, WriteResult.Path.SYSTEM_BROADCAST);
+                    return setCodecViaSettingsOrRoot(
+                            request, WriteResult.Path.SYSTEM_BROADCAST, shouldContinue);
                 });
     }
 
@@ -299,6 +375,16 @@ public final class CodecBridgeClient {
 
     private CompletableFuture<WriteResult> setCodecViaSettingsOrRoot(
             CodecRequest request, WriteResult.Path failedPath) {
+        return setCodecViaSettingsOrRoot(request, failedPath, () -> true);
+    }
+
+    private CompletableFuture<WriteResult> setCodecViaSettingsOrRoot(
+            CodecRequest request,
+            WriteResult.Path failedPath,
+            BooleanSupplier shouldContinue) {
+        if (!shouldContinue(shouldContinue)) {
+            return staleWriteResult(request, failedPath);
+        }
         if (CodecLabelTable.isLhdc(request.codecType)) {
             MLog.w("LHDC realtime write was not confirmed; skip settings/root reconnect fallback");
             return CompletableFuture.completedFuture(WriteResult.failed(
@@ -731,6 +817,31 @@ public final class CodecBridgeClient {
         }
         return snapshot.optionalCodecsEnabled == 0
                 && snapshot.activeCodecType != CodecLabelTable.CODEC_AAC;
+    }
+
+    private static boolean shouldContinue(BooleanSupplier shouldContinue) {
+        if (shouldContinue == null) return true;
+        try {
+            return shouldContinue.getAsBoolean();
+        } catch (Throwable t) {
+            MLog.w("write continuation guard failed", t);
+            return false;
+        }
+    }
+
+    private static CompletableFuture<WriteResult> staleWriteResult(
+            CodecRequest request, WriteResult.Path path) {
+        MLog.event("write.stale.skip_fallback", "path", path, "request", request);
+        return CompletableFuture.completedFuture(WriteResult.failed(
+                path, new IllegalStateException("stale codec write")));
+    }
+
+    private static CompletableFuture<WriteResult> staleWriteResult(
+            String mac, boolean enable, WriteResult.Path path) {
+        MLog.event("write.optional.stale.skip_fallback",
+                "path", path, "mac", mac, "enable", enable);
+        return CompletableFuture.completedFuture(WriteResult.failed(
+                path, new IllegalStateException("stale optional codec write")));
     }
 
     private static Throwable unwrap(Throwable t) {
