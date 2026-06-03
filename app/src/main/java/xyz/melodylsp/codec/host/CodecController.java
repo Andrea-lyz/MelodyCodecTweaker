@@ -36,6 +36,7 @@ import android.widget.Toast;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.Date;
 import java.util.HashMap;
@@ -77,6 +78,9 @@ public final class CodecController {
     private static final int SAMPLE_RATE_96000_BIT = 0x8;
     private static final int SAMPLE_RATE_192000_BIT = 0x20;
     private static final int SAMPLE_RATE_48000_HZ = 48_000;
+    private static final int CODEC_MODE_HIGH = 0;
+    private static final int CODEC_MODE_AAC = 1;
+    private static final int CODEC_MODE_STANDARD = 2;
     private static final long CLASSIC_RESTORE_WINDOW_MS = 30_000L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
@@ -888,11 +892,40 @@ public final class CodecController {
                     Strings.TOAST_CODEC_MODE_UNSUPPORTED, Toast.LENGTH_SHORT).show();
             return;
         }
-        CharSequence[] entries = {
-                codecModeEntry(snapshot, true),
-                codecModeEntry(snapshot, false)
-        };
-        int checked = snapshot.optionalCodecsEnabled() ? 0 : 1;
+        ArrayList<CharSequence> entryList = new ArrayList<>();
+        ArrayList<Integer> actionList = new ArrayList<>();
+        int checked = -1;
+        if (isHighQualityChoiceAvailable(snapshot)) {
+            if (snapshot.activeCodecType != CodecLabelTable.CODEC_AAC
+                    && snapshot.optionalCodecsEnabled()) {
+                checked = entryList.size();
+            }
+            entryList.add(codecModeEntry(snapshot, true));
+            actionList.add(CODEC_MODE_HIGH);
+        }
+        if (isAacChoiceAvailable(snapshot)) {
+            if (snapshot.activeCodecType == CodecLabelTable.CODEC_AAC) {
+                checked = entryList.size();
+            }
+            entryList.add(Strings.CODEC_LABEL_AAC);
+            actionList.add(CODEC_MODE_AAC);
+        }
+        if (isStandardChoiceAvailable(snapshot)) {
+            if (snapshot.activeCodecType != CodecLabelTable.CODEC_AAC
+                    && !snapshot.optionalCodecsEnabled()) {
+                checked = entryList.size();
+            }
+            entryList.add(codecModeEntry(snapshot, false));
+            actionList.add(CODEC_MODE_STANDARD);
+        }
+        if (entryList.isEmpty()) {
+            Toast.makeText(context,
+                    Strings.TOAST_CODEC_MODE_UNSUPPORTED, Toast.LENGTH_SHORT).show();
+            return;
+        }
+        CharSequence[] entries = entryList.toArray(new CharSequence[0]);
+        int[] actions = new int[actionList.size()];
+        for (int i = 0; i < actionList.size(); i++) actions[i] = actionList.get(i);
         Context dialogContext = resolveLiveDialogContext(sub);
         if (dialogContext == null) {
             MLog.w("showCodecModePicker skipped: no live activity context");
@@ -900,8 +933,22 @@ public final class CodecController {
         }
         try {
             showChoicePopup(sub, sourcePref, dialogContext, entries, checked, which -> {
-                boolean enable = which == 0;
-                applyOptionalCodecWrite(sub, enable);
+                int action = actions[which];
+                if (action == CODEC_MODE_AAC) {
+                    if (snapshot.activeCodecType == CodecLabelTable.CODEC_AAC) {
+                        refreshSnapshot(sub);
+                    } else {
+                        applyCodecTypeWrite(sub, snapshot, CodecLabelTable.CODEC_AAC);
+                    }
+                } else if (action == CODEC_MODE_STANDARD
+                        && snapshot.activeCodecType == CodecLabelTable.CODEC_AAC) {
+                    applyCodecTypeWrite(sub, snapshot, CodecLabelTable.CODEC_SBC);
+                } else if (action == CODEC_MODE_STANDARD
+                        && snapshot.activeCodecType == CodecLabelTable.CODEC_SBC) {
+                    refreshSnapshot(sub);
+                } else {
+                    applyOptionalCodecWrite(sub, action == CODEC_MODE_HIGH);
+                }
             });
         } catch (Throwable t) {
             MLog.e("showCodecModePicker dialog.show failed", t);
@@ -1524,7 +1571,7 @@ public final class CodecController {
                     } else if (result.path == WriteResult.Path.ROOT_SHELL) {
                         Toast.makeText(context, Strings.BANNER_VIA_ROOT, Toast.LENGTH_LONG).show();
                     }
-                    if (prefs.isRemembered(sub.mac)) {
+                    if (prefs.isRemembered(sub.mac) && request.sampleRate != 0) {
                         prefs.writeSnapshot(sub.mac, request.codecSpecific1, request.sampleRate);
                     }
                     refreshSnapshot(sub);
@@ -1579,6 +1626,21 @@ public final class CodecController {
                     break;
             }
         }));
+    }
+
+    private void applyCodecTypeWrite(Subscription sub, CodecSnapshot snapshot, int codecType) {
+        setCodecModeStatus(sub, Strings.STATE_SWITCHING_CODEC);
+        CodecRequest request = CodecRequest.fromActive(snapshot)
+                .codecType(codecType)
+                .codecSpecific1(0L)
+                .codecSpecific2(0L)
+                .codecSpecific3(0L)
+                .codecSpecific4(0L)
+                .sampleRate(0)
+                .bitsPerSample(0)
+                .channelMode(0)
+                .build();
+        applyWrite(sub, request);
     }
 
     private void refreshSnapshot(Subscription sub) {
@@ -1746,6 +1808,11 @@ public final class CodecController {
             PrefRef.setVisible(mode, false);
             return;
         }
+        if (snapshot.activeCodecType == CodecLabelTable.CODEC_AAC) {
+            PrefRef.setSummary(mode, Strings.CODEC_LABEL_AAC);
+            PrefRef.setVisible(mode, true);
+            return;
+        }
         PrefRef.setSummary(mode, codecModeEntry(snapshot, snapshot.optionalCodecsEnabled()));
         PrefRef.setVisible(mode, true);
     }
@@ -1820,14 +1887,37 @@ public final class CodecController {
 
     private static boolean isCodecModeSwitchAvailable(CodecSnapshot snapshot) {
         if (snapshot == null) return false;
+        return isHighQualityChoiceAvailable(snapshot)
+                || isAacChoiceAvailable(snapshot)
+                || isStandardChoiceAvailable(snapshot);
+    }
+
+    private static boolean isHighQualityChoiceAvailable(CodecSnapshot snapshot) {
+        if (snapshot == null) return false;
         if (snapshot.supportsOptionalCodecs()) return true;
         if (bestSelectableHighQualityCodec(snapshot.selectableCodecTypes) >= 0) return true;
-        return snapshot.activeCodecType != CodecLabelTable.CODEC_SBC;
+        return snapshot.activeCodecType != CodecLabelTable.CODEC_SBC
+                && snapshot.activeCodecType != CodecLabelTable.CODEC_AAC;
+    }
+
+    private static boolean isAacChoiceAvailable(CodecSnapshot snapshot) {
+        if (snapshot == null) return false;
+        return snapshot.activeCodecType != CodecLabelTable.CODEC_LC3;
+    }
+
+    private static boolean isStandardChoiceAvailable(CodecSnapshot snapshot) {
+        if (snapshot == null) return false;
+        if (snapshot.activeCodecType != CodecLabelTable.CODEC_SBC) return true;
+        if (isAacChoiceAvailable(snapshot)) return true;
+        return snapshot.supportsOptionalCodecs()
+                || bestSelectableHighQualityCodec(snapshot.selectableCodecTypes) >= 0;
     }
 
     private String bestHighQualityCodecLabel(CodecSnapshot snapshot) {
         if (snapshot == null) return Strings.STATE_CODEC_UNKNOWN;
-        if (snapshot.optionalCodecsEnabled()) {
+        if (snapshot.optionalCodecsEnabled()
+                && snapshot.activeCodecType != CodecLabelTable.CODEC_SBC
+                && snapshot.activeCodecType != CodecLabelTable.CODEC_AAC) {
             return CodecLabelTable.codecLabel(
                     context, snapshot.activeCodecType, snapshot.activeCodecSpecific1);
         }
@@ -1856,8 +1946,7 @@ public final class CodecController {
                 CodecLabelTable.CODEC_LDAC,
                 CodecLabelTable.CODEC_APTX_ADAPTIVE,
                 CodecLabelTable.CODEC_APTX_HD,
-                CodecLabelTable.CODEC_APTX,
-                CodecLabelTable.CODEC_AAC
+                CodecLabelTable.CODEC_APTX
         };
         for (int preferred : priority) {
             for (int type : codecTypes) {
@@ -1868,7 +1957,8 @@ public final class CodecController {
             }
         }
         for (int type : codecTypes) {
-            if (type != CodecLabelTable.CODEC_SBC) return type;
+            if (type != CodecLabelTable.CODEC_SBC
+                    && type != CodecLabelTable.CODEC_AAC) return type;
         }
         return -1;
     }

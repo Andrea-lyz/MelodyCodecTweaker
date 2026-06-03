@@ -684,10 +684,13 @@ public final class CodecBridgeClient {
     }
 
     private static boolean matches(CodecSnapshot snapshot, CodecRequest request) {
-        if (snapshot.activeCodecType != request.codecType
-                || snapshot.activeSampleRate != request.sampleRate) {
+        if (snapshot.activeCodecType != request.codecType) {
             return false;
         }
+        if (request.sampleRate != 0 && snapshot.activeSampleRate != request.sampleRate) {
+            return false;
+        }
+        if (request.codecType == CodecLabelTable.CODEC_AAC) return true;
         if (CodecLabelTable.isLhdc(request.codecType)) {
             long active = snapshot.activeCodecSpecific1 & 0xFFL;
             long requested = request.codecSpecific1 & 0xFFL;
