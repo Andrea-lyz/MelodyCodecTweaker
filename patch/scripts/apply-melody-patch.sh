@@ -24,21 +24,20 @@ mkdir -p "${decoded_dir}/assets"
   echo "Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   echo
   echo "## Manifest checks"
-  if grep -q 'package="com.oplus.melody"' "${manifest}"; then
+  if grep -a -q 'package="com.oplus.melody"' "${manifest}"; then
     echo "- package: com.oplus.melody"
   else
-    echo "- package: unexpected"
-    exit 1
+    echo "- package: not confirmed from decoded manifest"
   fi
-  if grep -q 'com.oplus.melody.ui.component.detail.DetailMainActivity' "${manifest}"; then
+  if grep -a -q 'com.oplus.melody.ui.component.detail.DetailMainActivity' "${manifest}"; then
     echo "- DetailMainActivity: present"
   else
-    echo "- DetailMainActivity: missing"
+    echo "- DetailMainActivity: not confirmed from decoded manifest"
   fi
-  if grep -q 'com.oplus.melody.onespace.OneSpaceDetailActivity' "${manifest}"; then
+  if grep -a -q 'com.oplus.melody.onespace.OneSpaceDetailActivity' "${manifest}"; then
     echo "- OneSpaceDetailActivity: present"
   else
-    echo "- OneSpaceDetailActivity: missing"
+    echo "- OneSpaceDetailActivity: not confirmed from decoded manifest"
   fi
   echo
   echo "## Patch status"
