@@ -65,7 +65,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          apktool d -f "${{ steps.paths.outputs.apk }}" -o "${{ steps.paths.outputs.decoded }}"
+          # Keep vendor resources raw. Melody contains generated resource names such as
+          # "$melody_ui_no_content__0.xml" that aapt refuses to rebuild after full decode.
+          # We only need smali / manifest level patching for the non-root experiment.
+          apktool d -r -f "${{ steps.paths.outputs.apk }}" -o "${{ steps.paths.outputs.decoded }}"
 
       - name: Apply current patch stage
         shell: bash
