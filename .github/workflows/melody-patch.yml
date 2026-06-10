@@ -1,0 +1,116 @@
+name: Melody Patch APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_path:
+        description: Path to the Melody APK stored in this branch
+        required: true
+        default: patch/apks/com.oplus.melody-16.7.1.apk
+        type: string
+
+jobs:
+  repack-smoke:
+    name: Repack smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: |
+          sdkmanager "platforms;android-36" "build-tools;35.0.0"
+
+      - name: Install apktool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apktool
+
+      - name: Prepare paths
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="${{ inputs.apk_path }}"
+          if [[ ! -f "$APK" ]]; then
+            echo "::error::APK not found: $APK"
+            exit 1
+          fi
+          mkdir -p build/melody-patch
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "decoded=build/melody-patch/decoded" >> "$GITHUB_OUTPUT"
+          echo "unsigned=build/melody-patch/com.oplus.melody-16.7.1-repacked-unsigned.apk" >> "$GITHUB_OUTPUT"
+          echo "aligned=build/melody-patch/com.oplus.melody-16.7.1-repacked-aligned.apk" >> "$GITHUB_OUTPUT"
+          echo "signed=build/melody-patch/com.oplus.melody-16.7.1-repacked-test-signed.apk" >> "$GITHUB_OUTPUT"
+          sha256sum "$APK" | tee build/melody-patch/source-apk.sha256
+
+      - name: Decode Melody APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apktool d -f "${{ steps.paths.outputs.apk }}" -o "${{ steps.paths.outputs.decoded }}"
+
+      - name: Apply current patch stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash patch/scripts/apply-melody-patch.sh "${{ steps.paths.outputs.decoded }}"
+
+      - name: Rebuild APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apktool b "${{ steps.paths.outputs.decoded }}" -o "${{ steps.paths.outputs.unsigned }}"
+
+      - name: Align and sign APK with test key
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+          keytool -genkeypair \
+            -keystore build/melody-patch/melody-patch-test.jks \
+            -storepass android \
+            -keypass android \
+            -alias melody-patch \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Melody Patch Test,O=Local,C=CN"
+          "$BUILD_TOOLS/zipalign" -p -f 4 \
+            "${{ steps.paths.outputs.unsigned }}" \
+            "${{ steps.paths.outputs.aligned }}"
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks build/melody-patch/melody-patch-test.jks \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --out "${{ steps.paths.outputs.signed }}" \
+            "${{ steps.paths.outputs.aligned }}"
+          "$BUILD_TOOLS/apksigner" verify --verbose "${{ steps.paths.outputs.signed }}"
+          sha256sum "${{ steps.paths.outputs.signed }}" | tee build/melody-patch/signed-apk.sha256
+
+      - name: Collect patch report
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp "${{ steps.paths.outputs.decoded }}/melody_patch_report.md" build/melody-patch/
+
+      - name: Upload patched APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: melody-16.7.1-repack-smoke
+          path: |
+            build/melody-patch/com.oplus.melody-16.7.1-repacked-test-signed.apk
+            build/melody-patch/source-apk.sha256
+            build/melody-patch/signed-apk.sha256
+            build/melody-patch/melody_patch_report.md
+          retention-days: 14
