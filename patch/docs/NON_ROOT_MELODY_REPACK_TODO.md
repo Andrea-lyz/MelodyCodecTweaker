@@ -10,6 +10,8 @@
 
 已知前提：Bluetooth Codec Changer 已经在当前一加 13 / 欧加 ROM 上验证可用。因此 Phase 1 不再是“从零判断是否存在非 Root 可能性”，而是把 BCC 已验证的能力放到 Melody / 改包环境里复核一遍，确认权限、进程、目标设备解析、回读确认和 UI 集成没有额外变量。
 
+Phase 0 的一加 13 设备检查已经确认：当前 `com.oplus.melody` 位于 `/data/app/.../base.apk`，`scannedAsStoppedSystemApp=false`，包标志不含 `SYSTEM`。这支持同包名改包路线继续推进。当前安装版本是 `16.1.1`，本分支目标 APK 是 `16.7.1`，版本号方向没有 downgrade 风险。详见 `patch/docs/PHASE0_ONEPLUS13_DEVICE_CHECK.md`。
+
 `Bluetooth Codec Changer` 已经证明：普通 App 在不少 ROM 上可以通过反射调用：
 
 - `BluetoothA2dp.getCodecStatus(BluetoothDevice)`
@@ -35,14 +37,15 @@ LE Audio 开关先不纳入非 Root 版目标。它目前更依赖 `com.android.
 ## 关键风险
 
 1. **同包名安装风险**
-   - 如果目标机上的 `com.oplus.melody` 真的是用户 App，卸载后安装我们重签版本应该可行。
+   - 一加 13 输出显示当前 `com.oplus.melody` 在 `/data/app` 且不是 scanned system app，卸载后安装我们重签版本的可行性较高。
    - 如果它实际仍是系统预装包，只是允许“卸载更新”或“为当前用户卸载”，同包名重签 APK 可能因为签名不一致而安装失败。
    - 必须先用真机验证，不要凭 UI 上“可卸载”判断。
 
 2. **签名权限损失**
    - Melody manifest 里有不少 OPlus 私有权限，例如 `com.oplus.permission.safe.BLUETOOTH`、`OPLUS_COMPONENT_SAFE`、`IOT` 等。
-   - 重签后这些 signature 权限大概率拿不到。
+   - 一加 13 上当前 OEM 签名版本确实拿到了大量 OPlus safe/signature 权限；重签后这些权限大概率拿不到。
    - 我们的音质控制核心不依赖这些权限，但 Melody 原有部分生态能力、Provider、Receiver、系统设置入口可能降级。
+   - 当前 `BLUETOOTH_CONNECT` / `BLUETOOTH_SCAN` 是 runtime permission 且未授予；改包版必须在使用 A2DP API 前主动请求。
 
 3. **隐藏 API / 蓝牙栈 ROM 差异**
    - `Bluetooth Codec Changer` 已在当前一加 13 上证明此路可行。
@@ -93,14 +96,17 @@ Bluetooth Codec Changer 关键文件：
 
 ## Phase 0：安装可行性预检
 
-- [ ] 在目标手机执行：
+- [x] 在目标手机执行：
   - `adb shell pm path com.oplus.melody`
   - `adb shell dumpsys package com.oplus.melody`
   - 记录它是 `/data/app/...` 还是 `/system` / `/product` / `/vendor` 下的预装包。
+  - 结果：一加 13 当前为 `/data/app/.../base.apk`，`scannedAsStoppedSystemApp=false`，不是系统分区 APK。
 - [ ] 测试用户侧完整卸载：
   - 普通卸载是否能彻底移除。
-  - 卸载后 `adb shell pm list packages | grep melody` 是否还存在。
+  - 卸载后 `adb shell "pm list packages | grep melody"` 是否还存在。
+  - PowerShell 也可用：`adb shell pm list packages | Select-String melody`。
 - [ ] 准备一个仅重签、未改代码的 Melody APK。
+  - 结果：GitHub Actions 已产出 `melody-16.7.1-repack-smoke` artifact，属于仅重包/测试签名烟测包。
 - [ ] 安装仅重签 APK，确认是否出现：
   - `INSTALL_FAILED_UPDATE_INCOMPATIBLE`
   - `INSTALL_FAILED_SHARED_USER_INCOMPATIBLE`

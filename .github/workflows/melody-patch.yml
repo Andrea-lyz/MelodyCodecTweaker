@@ -5,7 +5,8 @@ on:
     branches: [ patch/Melody-Patch ]
     paths:
       - .github/workflows/melody-patch.yml
-      - patch/**
+      - patch/apks/**
+      - patch/scripts/**
   workflow_dispatch:
     inputs:
       apk_path:
