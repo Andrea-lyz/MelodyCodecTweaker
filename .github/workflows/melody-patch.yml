@@ -1,6 +1,11 @@
 name: Melody Patch APK
 
 on:
+  push:
+    branches: [ patch/Melody-Patch ]
+    paths:
+      - .github/workflows/melody-patch.yml
+      - patch/**
   workflow_dispatch:
     inputs:
       apk_path:
@@ -39,9 +44,11 @@ jobs:
       - name: Prepare paths
         id: paths
         shell: bash
+        env:
+          INPUT_APK_PATH: ${{ inputs.apk_path || 'patch/apks/com.oplus.melody-16.7.1.apk' }}
         run: |
           set -euo pipefail
-          APK="${{ inputs.apk_path }}"
+          APK="$INPUT_APK_PATH"
           if [[ ! -f "$APK" ]]; then
             echo "::error::APK not found: $APK"
             exit 1
