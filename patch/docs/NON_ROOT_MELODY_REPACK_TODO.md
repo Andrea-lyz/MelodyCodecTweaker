@@ -1,16 +1,32 @@
-# 非 Root 改包版 Melody 音质控制 TODO
+# 非 Root Melody 音质控制 TODO
 
-目标：评估并推进一个“不依赖 Root / LSPosed”的版本，通过修改并重签 `com.oplus.melody` APK，把当前模块里的协议显示、LDAC/LHDC 播放质量、采样率、按耳机记忆选择迁移到改包版 Melody 内。
+原目标：评估并推进一个“不依赖 Root / LSPosed”的版本，通过修改并重签 `com.oplus.melody` APK，把当前模块里的协议显示、LDAC/LHDC 播放质量、采样率、按耳机记忆选择迁移到改包版 Melody 内。
 
 本文件只作为本地推进清单，不上传云端、不提交发布。
 
+## 当前结论
+
+同包名重签 `com.oplus.melody` 路线在一加 13 stock 非 Root 环境验证失败：
+
+```text
+Failure [INSTALL_FAILED_SHARED_USER_INCOMPATIBLE: oplus named app is not match signature]
+```
+
+这说明问题不只是 APK 位于 `/data/app` 或版本号方向，而是 OPlus 对 named app / shared-user 关系做了签名匹配。没有 OEM 签名、Root、核心破解或系统签名校验绕过时，修改后的 `com.oplus.melody` 无法作为同包名替换包安装。
+
+因此：
+
+- Melody 同包名改包注入路线：归档，不继续投入。
+- 非 Root codec 控制路线：仍可做，但应改成独立 App，复用 Bluetooth Codec Changer 的 A2DP 反射读写思路。
+- Melody 原生 UI 内嵌路线：只适合 Root / LSPosed / OEM 签名 / 系统签名绕过环境，不作为普通用户方案。
+
 ## 快速结论
 
-方向可做，且比 AndroGhostInjector 更适合非 Root 用户。
+非 Root 音质控制本身可做，且比 AndroGhostInjector 更适合普通用户；但“重签并替换 `com.oplus.melody`”不可做。
 
-已知前提：Bluetooth Codec Changer 已经在当前一加 13 / 欧加 ROM 上验证可用。因此 Phase 1 不再是“从零判断是否存在非 Root 可能性”，而是把 BCC 已验证的能力放到 Melody / 改包环境里复核一遍，确认权限、进程、目标设备解析、回读确认和 UI 集成没有额外变量。
+已知前提：Bluetooth Codec Changer 已经在当前一加 13 / 欧加 ROM 上验证可用。因此非 Root 方向不再是“从零判断是否存在可能性”，而是把 BCC 已验证的能力整理成我们自己的独立控制器，确认权限、目标设备解析、回读确认、按耳机记忆和 UI 表达。
 
-Phase 0 的一加 13 设备检查已经确认：当前 `com.oplus.melody` 位于 `/data/app/.../base.apk`，`scannedAsStoppedSystemApp=false`，包标志不含 `SYSTEM`。这支持同包名改包路线继续推进。当前安装版本是 `16.1.1`，本分支目标 APK 是 `16.7.1`，版本号方向没有 downgrade 风险。详见 `patch/docs/PHASE0_ONEPLUS13_DEVICE_CHECK.md`。
+Phase 0 的一加 13 设备检查曾确认：当前 `com.oplus.melody` 位于 `/data/app/.../base.apk`，`scannedAsStoppedSystemApp=false`，包标志不含 `SYSTEM`，且本分支目标 APK `16.7.1` 高于当前安装版本 `16.1.1`。但真机安装重签包失败，错误为 `INSTALL_FAILED_SHARED_USER_INCOMPATIBLE: oplus named app is not match signature`。结论以安装失败为准。详见 `patch/docs/PHASE0_ONEPLUS13_DEVICE_CHECK.md`。
 
 `Bluetooth Codec Changer` 已经证明：普通 App 在不少 ROM 上可以通过反射调用：
 
@@ -37,15 +53,15 @@ LE Audio 开关先不纳入非 Root 版目标。它目前更依赖 `com.android.
 ## 关键风险
 
 1. **同包名安装风险**
-   - 一加 13 输出显示当前 `com.oplus.melody` 在 `/data/app` 且不是 scanned system app，卸载后安装我们重签版本的可行性较高。
-   - 如果它实际仍是系统预装包，只是允许“卸载更新”或“为当前用户卸载”，同包名重签 APK 可能因为签名不一致而安装失败。
-   - 必须先用真机验证，不要凭 UI 上“可卸载”判断。
+   - 已触发：重签包安装失败，错误为 `INSTALL_FAILED_SHARED_USER_INCOMPATIBLE: oplus named app is not match signature`。
+   - 一加 13 虽显示 `com.oplus.melody` 在 `/data/app` 且不是 scanned system app，但 OPlus 仍对 named app / shared-user 关系做签名匹配。
+   - 结论：同包名替换 `com.oplus.melody` 在 stock 非 Root 环境不可作为可分发方案。
 
 2. **签名权限损失**
    - Melody manifest 里有不少 OPlus 私有权限，例如 `com.oplus.permission.safe.BLUETOOTH`、`OPLUS_COMPONENT_SAFE`、`IOT` 等。
    - 一加 13 上当前 OEM 签名版本确实拿到了大量 OPlus safe/signature 权限；重签后这些权限大概率拿不到。
-   - 我们的音质控制核心不依赖这些权限，但 Melody 原有部分生态能力、Provider、Receiver、系统设置入口可能降级。
-   - 当前 `BLUETOOTH_CONNECT` / `BLUETOOTH_SCAN` 是 runtime permission 且未授予；改包版必须在使用 A2DP API 前主动请求。
+   - 现在已不是“权限降级后功能是否可用”的问题，而是安装阶段直接被签名匹配拦截。
+   - 独立 App 路线仍需要主动请求 `BLUETOOTH_CONNECT` / `BLUETOOTH_SCAN`，并在使用 A2DP API 前处理 runtime permission。
 
 3. **隐藏 API / 蓝牙栈 ROM 差异**
    - `Bluetooth Codec Changer` 已在当前一加 13 上证明此路可行。
@@ -101,34 +117,32 @@ Bluetooth Codec Changer 关键文件：
   - `adb shell dumpsys package com.oplus.melody`
   - 记录它是 `/data/app/...` 还是 `/system` / `/product` / `/vendor` 下的预装包。
   - 结果：一加 13 当前为 `/data/app/.../base.apk`，`scannedAsStoppedSystemApp=false`，不是系统分区 APK。
-- [ ] 测试用户侧完整卸载：
+- [x] 测试用户侧完整卸载 / 替换安装：
   - 普通卸载是否能彻底移除。
   - 卸载后 `adb shell "pm list packages | grep melody"` 是否还存在。
   - PowerShell 也可用：`adb shell pm list packages | Select-String melody`。
-- [ ] 准备一个仅重签、未改代码的 Melody APK。
+- [x] 准备一个仅重签、未改代码的 Melody APK。
   - 结果：GitHub Actions 已产出 `melody-16.7.1-repack-smoke` artifact，属于仅重包/测试签名烟测包。
-- [ ] 安装仅重签 APK，确认是否出现：
+- [x] 安装仅重签 APK，确认是否出现：
   - `INSTALL_FAILED_UPDATE_INCOMPATIBLE`
   - `INSTALL_FAILED_SHARED_USER_INCOMPATIBLE`
   - `INSTALL_FAILED_DUPLICATE_PERMISSION`
   - `INSTALL_FAILED_VERSION_DOWNGRADE`
-- [ ] 安装成功后验证原 Melody 基础功能：
-  - App 能启动。
-  - 耳机详情页能打开。
-  - OneSpace 能打开。
-  - 电量、降噪、EQ、空间音频等原功能是否正常。
-- [ ] 记录重签后实际授予的权限：
-  - `adb shell dumpsys package com.oplus.melody | grep granted=true`
-  - 重点看 `BLUETOOTH_CONNECT`、`BLUETOOTH_SCAN`、位置权限、OPlus safe 权限。
+  - 结果：失败，`INSTALL_FAILED_SHARED_USER_INCOMPATIBLE: oplus named app is not match signature`。
+- [x] 停止后续同包名改包验证：
+  - 安装阶段已失败，无法验证原 Melody 基础功能。
+  - 无法记录重签后权限，因为 APK 没有安装成功。
 
-验收：同包名重签 Melody 能在非 Root 设备上安装并保持主要原功能，否则该路线需要改为“独立 App 版”或“不同包名克隆版”，价值会明显下降。
+验收：失败。同包名重签 Melody 在 stock 非 Root 设备上不可安装，路线归档。
 
-## Phase 1：无 Root A2DP 直连固化
+## Phase 1：独立 App 无 Root A2DP 直连固化
 
-目标：基于 BCC 在一加 13 已经可用的事实，快速做一个 Melody 侧最小闭环。重点不是证明“能不能无 Root”，而是确认改包版 Melody 的身份、权限和页面设备解析不会破坏 BCC 同款读写路径。
+目标：基于 BCC 在一加 13 已经可用的事实，快速做一个不替换 Melody 的独立控制器。重点是复用当前模块的标签、快照、写入确认和按耳机记忆策略，而不是继续做 Melody UI 注入。
 
-- [ ] 做一个最小测试入口，推荐直接放进改包 Melody helper dex，而不是另做独立 App。
-  - 原因：BCC 已经证明独立 App 路线可用；我们真正需要验证的是 Melody 改包环境。
+- [ ] 新建独立 App 或独立 demo module：
+  - 包名不要使用 `com.oplus.melody`。
+  - 不声明 OPlus private/signature 权限。
+  - targetSdk 维持当前 Android 要求，显式处理 runtime permission。
 - [ ] 请求运行时权限：
   - `BLUETOOTH_CONNECT`
   - Android 12+ 需要用户显式授权。
@@ -159,11 +173,13 @@ Bluetooth Codec Changer 关键文件：
   - `android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED`
   - 3 秒内再次 `getCodecStatus`
 - [ ] 判断结果：
-  - 成功：进入 Phase 2，直接开始 UI 注入。
-  - 抛 `SecurityException` 或含 `BLUETOOTH_PRIVILEGED`：记录为 Melody 改包身份差异；用同设备 BCC 对照排查是否权限、targetSdk、调用时机、设备对象来源不同。
+  - 成功：进入独立 App UI 和记忆功能。
+  - 抛 `SecurityException` 或含 `BLUETOOTH_PRIVILEGED`：记录 ROM 不允许该隐藏 API，非 Root 版只能提示不支持。
   - 无异常但不生效：优先套用 BCC two-step、250ms 延迟、active 字段保留策略，再判断是否需要组合修正。
 
-验收：在改包 Melody 内能非 Root 写入并回读确认至少一个 LDAC/LHDC quality 或 sampleRate。由于 BCC 已在一加 13 上可用，这一阶段预期应当能跑通；如果跑不通，优先排查我们集成方式，而不是立即否定路线。
+验收：独立 App 能非 Root 写入并回读确认至少一个 LDAC/LHDC quality 或 sampleRate。
+
+以下 Phase 2-7 是同包名 Melody 改包历史计划。除非后续拥有 OEM 签名、Root、LSPosed 或系统签名校验绕过，否则不执行。
 
 ## Phase 2：确定改包注入方式
 
@@ -410,14 +426,14 @@ Bluetooth Codec Changer 关键文件：
 
 ## 第一轮最小闭环
 
-第一轮不要追求 UI 完整，先做最小可验证闭环：
+第一轮不要追求 UI 完整，先做独立 App 最小可验证闭环：
 
-1. 同包名重签 Melody 可安装。
-2. Patch `DetailMainActivity.onResume` 调到 helper。
-3. helper 能输出当前 active codec 到 logcat。
-4. helper 能插入一个只读 `蓝牙音质 · <codec>` Preference。
-5. helper 能弹一个简单列表切 LDAC quality。
+1. 独立 App 能请求并拿到 `BLUETOOTH_CONNECT`。
+2. 能通过 `BluetoothAdapter.getProfileProxy(..., A2DP)` 拿到 A2DP proxy。
+3. 能列出当前连接设备并输出 active codec 到 logcat。
+4. 能显示只读 `蓝牙音质 · <codec>` 状态。
+5. 能弹一个简单列表切 LDAC quality 或 sampleRate。
 6. 写入后 3 秒内回读确认。
-7. 成功后再补采样率、LHDC、记忆开关、OneSpace。
+7. 成功后再补 LHDC、记忆开关、重连自动恢复和更接近 Melody 的 UI。
 
-考虑到 BCC 已经在一加 13 上跑通，第一轮最小闭环可以直接开做；这不是高风险探索，而是把已验证能力搬进 Melody。只要第 1 步“同包名重签 Melody 可安装”成立，后续 2-7 步就很值得投入。
+考虑到 BCC 已经在一加 13 上跑通，第一轮独立 App 闭环可以直接开做；这不是高风险探索，而是把已验证能力整理成我们自己的产品形态。同包名 Melody 改包安装失败后，后续不再依赖 `com.oplus.melody` 身份。

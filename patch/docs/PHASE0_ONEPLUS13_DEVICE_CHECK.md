@@ -12,6 +12,8 @@ Source: user-provided ADB output from `adb shell pm path com.oplus.melody` and
 - Target patch APK in this branch is `16.7.1`, so it is version-up relative to the currently installed package.
 - Installer / initiating package is `com.oplus.exsystemservice` with uid `1000`.
 - Current package signature is the OEM signature, so many OPlus safe/signature permissions are granted.
+- Repack-smoke install failed on stock non-root with:
+  - `Failure [INSTALL_FAILED_SHARED_USER_INCOMPATIBLE: oplus named app is not match signature]`
 - Runtime permissions are not currently granted:
   - `android.permission.BLUETOOTH_CONNECT`
   - `android.permission.BLUETOOTH_SCAN`
@@ -22,19 +24,21 @@ Source: user-provided ADB output from `adb shell pm path com.oplus.melody` and
 
 ## Interpretation
 
-The same-package repack path is still viable enough to continue:
+The same-package repack path is blocked on this stock non-root device:
 
-- The installed Melody package is a data app path, not a mounted `/system` or `/product` APK.
+- Although the installed Melody package is a data app path, OPlus still enforces a named-app / shared-user signature match.
+- The failure happens before app launch, so runtime permission handling or code changes cannot fix it.
 - Because the current package is OEM-signed, it has OPlus private permissions today. A repacked APK will lose those signature grants unless signed with the OEM key.
 - Codec control itself should not need those OPlus private permissions if we mirror the Bluetooth Codec Changer direct A2DP reflection path.
-- After installing a repacked APK, we must explicitly request `BLUETOOTH_CONNECT` before attempting `getProfileProxy`, `getConnectedDevices`, `getCodecStatus`, or `setCodecConfigPreference`.
+- Therefore the non-root route should pivot away from replacing `com.oplus.melody`.
+- The viable non-root path is a standalone app or differently named experimental shell that mirrors the Bluetooth Codec Changer direct A2DP reflection path and requests `BLUETOOTH_CONNECT` itself.
 
-## Remaining Phase 0 Checks
+## Phase 0 Result
 
-- Test installing the repack-smoke artifact after uninstalling the current OEM package.
-- Record whether install fails with signature/update errors.
-- If install succeeds, verify whether core Melody surfaces still open despite losing OPlus private grants.
-- Re-run `dumpsys package com.oplus.melody` after repack install and compare granted install/runtime permissions.
+- Same-package Melody replacement: blocked without root, OEM signing key, or a system signature check bypass.
+- LSPatch / APK patching cannot preserve the original OEM signature after modifying the APK.
+- `adb install -r`, downgrade flags, or runtime permission changes do not address this error class.
+- Keep the GitHub Actions repack workflow as a smoke/forensics artifact only; do not invest in Melody UI injection for stock non-root users.
 
 ## PowerShell Note
 
