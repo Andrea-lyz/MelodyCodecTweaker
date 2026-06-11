@@ -5,6 +5,7 @@ import android.bluetooth.BluetoothDevice;
 import android.content.Context;
 import android.os.Binder;
 
+import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -31,6 +32,8 @@ import xyz.melodylsp.codec.util.MLog;
 public final class SystemHookInstaller {
 
     private static final String CLASS_A2DP_SERVICE = "com.android.bluetooth.a2dp.A2dpService";
+    private static final String CLASS_A2DP_NATIVE_INTERFACE =
+            "com.android.bluetooth.a2dp.A2dpNativeInterface";
     private static final String CLASS_BT_UTILS = "com.android.bluetooth.Utils";
     private static final String MELODY_PKG = "com.oplus.melody";
 
@@ -60,6 +63,7 @@ public final class SystemHookInstaller {
         hookConstructors(a2dpCls);
         hookLifecycle(a2dpCls);
         hookCodecConfigUpdated(a2dpCls);
+        hookNativeCodecPreferenceLogger();
     }
 
     private Class<?> resolveA2dpServiceClass() {
@@ -123,6 +127,30 @@ public final class SystemHookInstaller {
                     && "android.bluetooth.BluetoothCodecConfig".equals(p[1].getName())) {
                 return true;
             }
+        }
+        return false;
+    }
+
+    private Class<?> resolveA2dpNativeInterfaceClass() {
+        try {
+            Class<?> cls = Class.forName(CLASS_A2DP_NATIVE_INTERFACE, false, classLoader);
+            MLog.event("bt.a2dp.native.resolved", "mode", "fqn", "class", cls.getName());
+            return cls;
+        } catch (Throwable ignored) {
+        }
+        for (Class<?> cls : scanBluetoothClasses()) {
+            if (looksLikeA2dpNativeInterface(cls)) {
+                MLog.event("bt.a2dp.native.resolved", "mode", "scan", "class", cls.getName());
+                return cls;
+            }
+        }
+        return null;
+    }
+
+    private static boolean looksLikeA2dpNativeInterface(Class<?> cls) {
+        if (cls == null) return false;
+        for (Method m : cls.getDeclaredMethods()) {
+            if (isNativeCodecPreferenceMethod(m)) return true;
         }
         return false;
     }
@@ -323,6 +351,50 @@ public final class SystemHookInstaller {
         MLog.event("codec.updated.hooks", "count", hooked);
     }
 
+    private void hookNativeCodecPreferenceLogger() {
+        Class<?> nativeCls = resolveA2dpNativeInterfaceClass();
+        if (nativeCls == null) {
+            MLog.w("A2dpNativeInterface not found; native codec preference logging unavailable");
+            return;
+        }
+        int hooked = 0;
+        for (Method m : nativeCls.getDeclaredMethods()) {
+            if (!isNativeCodecPreferenceMethod(m)) continue;
+            try {
+                m.setAccessible(true);
+            } catch (Throwable ignored) {
+            }
+            module.hook(m).intercept(chain -> {
+                Object[] args = chain.getArgs().toArray();
+                MLog.event("bt.native.setCodecConfigPreference",
+                        "device", args.length > 0 ? describeDevice(args[0]) : "?",
+                        "configs", args.length > 1 ? describeCodecConfigArray(args[1]) : "[]");
+                try {
+                    Object result = chain.proceed();
+                    MLog.event("bt.native.setCodecConfigPreference.done",
+                            "device", args.length > 0 ? describeDevice(args[0]) : "?",
+                            "configs", args.length > 1 ? describeCodecConfigArray(args[1]) : "[]");
+                    return result;
+                } catch (Throwable t) {
+                    MLog.w("bt.native.setCodecConfigPreference failed", t);
+                    throw t;
+                }
+            });
+            hooked++;
+        }
+        MLog.event("bt.native.codec.hooks", "count", hooked, "class", nativeCls.getName());
+    }
+
+    private static boolean isNativeCodecPreferenceMethod(Method m) {
+        if (m == null || !"setCodecConfigPreference".equals(m.getName())) return false;
+        Class<?>[] p = m.getParameterTypes();
+        return p.length == 2
+                && p[0] == BluetoothDevice.class
+                && p[1].isArray()
+                && "android.bluetooth.BluetoothCodecConfig".equals(
+                p[1].getComponentType().getName());
+    }
+
     private static boolean isCodecConfigUpdatedMethod(Method m) {
         if (m == null) return false;
         if ("codecConfigUpdated".equals(m.getName())) return true;
@@ -333,6 +405,59 @@ public final class SystemHookInstaller {
             if ("android.bluetooth.BluetoothCodecStatus".equals(p.getName())) hasStatus = true;
         }
         return hasDevice && hasStatus;
+    }
+
+    private static String describeDevice(Object device) {
+        if (device instanceof BluetoothDevice) {
+            try {
+                return ((BluetoothDevice) device).getAddress();
+            } catch (Throwable ignored) {
+            }
+        }
+        return String.valueOf(device);
+    }
+
+    private static String describeCodecConfigArray(Object configs) {
+        if (configs == null || !configs.getClass().isArray()) return "[]";
+        int length = Array.getLength(configs);
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(describeCodecConfig(Array.get(configs, i)));
+        }
+        return sb.append(']').toString();
+    }
+
+    private static String describeCodecConfig(Object config) {
+        if (config == null) return "null";
+        return "{codec=0x" + Integer.toHexString(readInt(config, "getCodecType"))
+                + " rate=0x" + Integer.toHexString(readInt(config, "getSampleRate"))
+                + " bits=0x" + Integer.toHexString(readInt(config, "getBitsPerSample"))
+                + " channel=0x" + Integer.toHexString(readInt(config, "getChannelMode"))
+                + " s1=" + readLong(config, "getCodecSpecific1")
+                + " s2=" + readLong(config, "getCodecSpecific2")
+                + " s3=" + readLong(config, "getCodecSpecific3")
+                + " s4=" + readLong(config, "getCodecSpecific4")
+                + '}';
+    }
+
+    private static int readInt(Object target, String methodName) {
+        Object value = invokeNoArg(target, methodName);
+        return value instanceof Number ? ((Number) value).intValue() : 0;
+    }
+
+    private static long readLong(Object target, String methodName) {
+        Object value = invokeNoArg(target, methodName);
+        return value instanceof Number ? ((Number) value).longValue() : 0L;
+    }
+
+    private static Object invokeNoArg(Object target, String methodName) {
+        try {
+            Method m = target.getClass().getMethod(methodName);
+            return m.invoke(target);
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     private static Method findMethod(Class<?> startCls, String name, Class<?>... params) {

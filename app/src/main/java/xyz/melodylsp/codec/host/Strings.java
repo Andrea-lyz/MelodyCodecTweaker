@@ -43,7 +43,13 @@ public final class Strings {
     public static final String QUALITY_LDAC_990 = "990 kbps（音质优先）";
     public static final String QUALITY_LDAC_660 = "660 kbps（标准）";
     public static final String QUALITY_LDAC_330 = "330 kbps（连接优先）";
-    public static final String QUALITY_LHDC_CONNECTION = "连接优先";
+    public static final String QUALITY_LHDC_CONNECTION = "64 kbps（连接优先）";
+    public static final String QUALITY_LHDC_STANDARD = "标准";
+    public static final String QUALITY_LHDC_LOW_400 = "400 kbps";
+    public static final String QUALITY_LHDC_MID_500 = "500 kbps";
+    public static final String QUALITY_LHDC_FIXED_900 = "900 kbps（固定）";
+    public static final String QUALITY_LHDC_FIXED_1000 = "1000 kbps（固定）";
+    public static final String QUALITY_LHDC_ABR = "自适应（ABR）";
     public static final String QUALITY_LHDC_BALANCED = "均衡";
     public static final String QUALITY_LHDC_HIGH = "音质优先";
     public static final String CODEC_MODE_HIGH_QUALITY = "高品质";

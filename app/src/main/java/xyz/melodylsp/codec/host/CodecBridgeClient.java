@@ -51,7 +51,9 @@ public final class CodecBridgeClient {
             "android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED";
     private static final long CONFIRM_TIMEOUT_MS = 3_000L;
     private static final long OPTIONAL_CONFIRM_TIMEOUT_MS = 4_000L;
-    private static final long LHDC_SECOND_STEP_DELAY_MS = 250L;
+    private static final long LHDC_PRIME_FIRST_CHECK_DELAY_MS = 350L;
+    private static final long LHDC_PRIME_CONFIRM_TIMEOUT_MS = 1_500L;
+    private static final long LHDC_PRIME_CONFIRM_POLL_MS = 250L;
     private static final long CODEC_BROADCAST_TIMEOUT_MS = 1_500L;
     private static final int SAMPLE_RATE_48000_BIT = 0x2;
 
@@ -226,15 +228,46 @@ public final class CodecBridgeClient {
             future.completeExceptionally(t);
             return future;
         }
-        mainHandler.postDelayed(() -> {
-            try {
-                reflect.setCodec(request);
-                future.complete(null);
-            } catch (Throwable t) {
-                future.completeExceptionally(t);
-            }
-        }, LHDC_SECOND_STEP_DELAY_MS);
+        long deadlineMs = System.currentTimeMillis() + LHDC_PRIME_CONFIRM_TIMEOUT_MS;
+        ipcHandler.postDelayed(() -> {
+            waitForLhdcPrimeThenWrite(request, priming, future, deadlineMs);
+        }, LHDC_PRIME_FIRST_CHECK_DELAY_MS);
         return future;
+    }
+
+    private void waitForLhdcPrimeThenWrite(
+            CodecRequest request,
+            CodecRequest priming,
+            CompletableFuture<Void> future,
+            long deadlineMs) {
+        if (future.isDone()) return;
+        CodecSnapshot live = safeReadStatus(request.mac);
+        boolean ready = isLhdcPrimeReady(live, request, priming);
+        boolean timedOut = System.currentTimeMillis() >= deadlineMs;
+        if (!ready && !timedOut) {
+            MLog.event("write.lhdc.prime.wait", "target", request, "live", String.valueOf(live));
+            ipcHandler.postDelayed(() -> {
+                waitForLhdcPrimeThenWrite(request, priming, future, deadlineMs);
+            }, LHDC_PRIME_CONFIRM_POLL_MS);
+            return;
+        }
+        MLog.event("write.lhdc.prime.ready",
+                "ready", ready, "timeout", timedOut, "target", request,
+                "live", String.valueOf(live));
+        try {
+            reflect.setCodec(request);
+            MLog.event("write.lhdc.target", "request", request);
+            future.complete(null);
+        } catch (Throwable t) {
+            future.completeExceptionally(t);
+        }
+    }
+
+    private static boolean isLhdcPrimeReady(
+            CodecSnapshot snapshot, CodecRequest request, CodecRequest priming) {
+        if (snapshot == null || request == null || priming == null) return false;
+        if (snapshot.activeCodecType != request.codecType) return false;
+        return priming.sampleRate == 0 || snapshot.activeSampleRate == priming.sampleRate;
     }
 
     private static int lhdcPrimeSampleRate(CodecRequest request) {
@@ -804,15 +837,7 @@ public final class CodecBridgeClient {
         if (CodecLabelTable.isLhdc(request.codecType)) {
             long active = snapshot.activeCodecSpecific1 & 0xFFL;
             long requested = request.codecSpecific1 & 0xFFL;
-            if (active == requested) return true;
-            return (active == CodecLabelTable.LHDC_QUALITY_BALANCED
-                    && requested == CodecLabelTable.LHDC_QUALITY_STANDARD)
-                    || (active == CodecLabelTable.LHDC_QUALITY_STANDARD
-                    && requested == CodecLabelTable.LHDC_QUALITY_BALANCED)
-                    || (active == CodecLabelTable.LHDC_QUALITY_HIGH
-                    && requested == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY)
-                    || (active == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY
-                    && requested == CodecLabelTable.LHDC_QUALITY_HIGH);
+            return active == requested;
         }
         return snapshot.activeCodecSpecific1 == request.codecSpecific1;
     }
