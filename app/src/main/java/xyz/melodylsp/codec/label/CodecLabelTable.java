@@ -122,16 +122,14 @@ public final class CodecLabelTable {
     };
 
     /**
-     * Quality steps the LHDC family exposes on the OPPO stack. Recent ColorOS builds report
-     * 0x09 as ABR/adaptive, while 0x07/0x08 may be accepted by Java and ignored by native.
+     * User-facing LHDC choices are kept aligned with the original three-mode OPPO UI.
+     * Diagnostic labels for 0x00/0x05/0x07 remain below, but the picker exposes only:
+     * ABR/adaptive, connection priority (0x06), and quality priority (0x08).
      */
     public static final long[] LHDC_QUALITY_STEPS = {
-            LHDC_QUALITY_CONNECTION,
-            LHDC_QUALITY_LOW_400,
+            LHDC_QUALITY_ABR,
             LHDC_QUALITY_MID_500,
-            LHDC_QUALITY_FIXED_900,
-            LHDC_QUALITY_FIXED_1000,
-            LHDC_QUALITY_ABR
+            LHDC_QUALITY_FIXED_1000
     };
 
     /** Returns the protocol-defined quality steps for {@code codecType} when the platform
