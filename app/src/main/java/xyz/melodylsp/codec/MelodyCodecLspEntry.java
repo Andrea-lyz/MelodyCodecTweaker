@@ -10,6 +10,7 @@ import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 import xyz.melodylsp.codec.host.HostHookInstaller;
 import xyz.melodylsp.codec.leaudio.WirelessSettingsHookInstaller;
+import xyz.melodylsp.codec.settings.SettingsHookInstaller;
 import xyz.melodylsp.codec.system.SystemHookInstaller;
 import xyz.melodylsp.codec.util.MLog;
 
@@ -27,6 +28,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
     private static final String HOST_PKG = "com.oplus.melody";
     private static final String BT_PKG = "com.android.bluetooth";
     private static final String WIRELESS_SETTINGS_PKG = "com.oplus.wirelesssettings";
+    private static final String SETTINGS_PKG = "com.android.settings";
 
     /** Single shared instance referenced by hooker callbacks via {@link #current()}. */
     private static volatile MelodyCodecLspEntry INSTANCE;
@@ -59,6 +61,8 @@ public final class MelodyCodecLspEntry extends XposedModule {
             installSystemScope(param);
         } else if (WIRELESS_SETTINGS_PKG.equals(pkg)) {
             installWirelessSettingsScope(param);
+        } else if (SETTINGS_PKG.equals(pkg)) {
+            installSettingsScope(param);
         }
     }
 
@@ -92,6 +96,20 @@ public final class MelodyCodecLspEntry extends XposedModule {
         new WirelessSettingsHookInstaller(this, param.getDefaultClassLoader(), processName,
                 param.getApplicationInfo().sourceDir)
                 .install();
+    }
+
+    private void installSettingsScope(PackageLoadedParam param) {
+        if (!moduleEnabled()) {
+            log(Log.INFO, MLog.TAG, "module disabled by master switch; skipping settings hooks");
+            return;
+        }
+        String processName = param.getApplicationInfo().processName;
+        if (processName != null && processName.contains(":")) {
+            MLog.event("scope.settings.skip_subprocess", "process", processName);
+            return;
+        }
+        MLog.event("scope.settings.start", "process", processName);
+        new SettingsHookInstaller(this).install();
     }
 
     /**

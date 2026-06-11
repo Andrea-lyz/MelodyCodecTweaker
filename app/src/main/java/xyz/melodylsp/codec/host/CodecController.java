@@ -2111,9 +2111,6 @@ public final class CodecController {
         Thread worker = new Thread(() -> {
             CodecSnapshot snapshot;
             try {
-                snapshot = reflect.readStatus(sub.mac);
-            } catch (BluetoothCodecReflect.BluetoothCodecReflectException e) {
-                MLog.w("refreshSnapshot reflect failed", e);
                 snapshot = bridge.getStatus(sub.mac);
             } catch (Throwable t) {
                 MLog.e("refreshSnapshot threw", t);

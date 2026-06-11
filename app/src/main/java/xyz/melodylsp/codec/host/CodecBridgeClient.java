@@ -15,6 +15,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
+import java.util.Locale;
 import java.util.UUID;
 
 import xyz.melodylsp.codec.bridge.CodecIpc;
@@ -68,6 +69,7 @@ public final class CodecBridgeClient {
     private final CopyOnWriteArrayList<SnapshotListener> listeners = new CopyOnWriteArrayList<>();
     private volatile ICodecBridge cachedBridge;
     private volatile ICodecBridgeListener registeredListener;
+    private volatile boolean directStatusBlocked;
 
     public CodecBridgeClient(
             Context context,
@@ -107,22 +109,41 @@ public final class CodecBridgeClient {
 
     /** Returns the latest snapshot for {@code mac}; null when status is unavailable. */
     public CodecSnapshot getStatus(String mac) {
-        try {
-            CodecSnapshot snapshot = reflect.readStatus(mac);
+        CodecSnapshot snapshot = getStatusViaBridge(mac);
+        if (snapshot != null) return snapshot;
+
+        if (!directStatusBlocked) {
+            snapshot = getStatusViaDirectApi(mac);
             if (snapshot != null) return snapshot;
-        } catch (Throwable t) {
-            MLog.w("getStatus(" + mac + ") failed via direct API, trying bridge", t);
         }
-        ICodecBridge bridge = ensureBridge();
-        if (bridge != null) {
-            try {
-                CodecSnapshot snapshot = bridge.getStatus(mac);
-                if (snapshot != null) return snapshot;
-            } catch (RemoteException re) {
-                MLog.w("bridge.getStatus failed", re);
-            }
-        }
+
         return queryCodecViaBroadcast(mac, CODEC_BROADCAST_TIMEOUT_MS);
+    }
+
+    private CodecSnapshot getStatusViaBridge(String mac) {
+        ICodecBridge bridge = ensureBridge();
+        if (bridge == null) return null;
+        try {
+            CodecSnapshot snapshot = bridge.getStatus(mac);
+            if (snapshot != null) return snapshot;
+        } catch (RemoteException re) {
+            MLog.w("bridge.getStatus failed", re);
+        }
+        return null;
+    }
+
+    private CodecSnapshot getStatusViaDirectApi(String mac) {
+        try {
+            return reflect.readStatus(mac);
+        } catch (Throwable t) {
+            if (isCdmStatusBlock(t)) {
+                directStatusBlocked = true;
+                MLog.w("direct codec status API blocked by CDM; using bridge/broadcast status path");
+            } else {
+                MLog.w("getStatus(" + mac + ") failed via direct API", t);
+            }
+            return null;
+        }
     }
 
     /** Writes the request and resolves with the eventual outcome (confirmed / rolled back). */
@@ -893,6 +914,21 @@ public final class CodecBridgeClient {
             cur = cur.getCause();
         }
         return cur;
+    }
+
+    private static boolean isCdmStatusBlock(Throwable t) {
+        Throwable cur = t;
+        while (cur != null) {
+            String className = cur.getClass().getName();
+            String message = cur.getMessage();
+            if (className.contains("SecurityException")
+                    && message != null
+                    && message.toLowerCase(Locale.ROOT).contains("cdm association")) {
+                return true;
+            }
+            cur = cur.getCause();
+        }
+        return false;
     }
 
     private void completeWith(
