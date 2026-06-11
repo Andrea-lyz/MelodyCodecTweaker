@@ -10,8 +10,8 @@ android {
         applicationId = "xyz.melodylsp.codec"
         minSdk = 31
         targetSdk = 36
-        versionCode = 11
-        versionName = "1.5.1"
+        versionCode = 12
+        versionName = "1.6.0"
     }
 
     buildFeatures {
