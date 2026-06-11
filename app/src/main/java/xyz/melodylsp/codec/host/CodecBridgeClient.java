@@ -53,11 +53,7 @@ public final class CodecBridgeClient {
             "android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED";
     private static final long CONFIRM_TIMEOUT_MS = 3_000L;
     private static final long OPTIONAL_CONFIRM_TIMEOUT_MS = 4_000L;
-    private static final long LHDC_PRIME_FIRST_CHECK_DELAY_MS = 350L;
-    private static final long LHDC_PRIME_CONFIRM_TIMEOUT_MS = 1_500L;
-    private static final long LHDC_PRIME_CONFIRM_POLL_MS = 250L;
     private static final long CODEC_BROADCAST_TIMEOUT_MS = 1_500L;
-    private static final int SAMPLE_RATE_48000_BIT = 0x2;
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
@@ -226,85 +222,14 @@ public final class CodecBridgeClient {
     }
 
     private CompletableFuture<Void> applyDirectWrite(CodecRequest request) {
-        if (!CodecLabelTable.isLhdc(request.codecType) || request.codecSpecific1 == 0L) {
-            try {
-                reflect.setCodec(request);
-                return CompletableFuture.completedFuture(null);
-            } catch (Throwable t) {
-                CompletableFuture<Void> failed = new CompletableFuture<>();
-                failed.completeExceptionally(t);
-                return failed;
-            }
-        }
-
-        CompletableFuture<Void> future = new CompletableFuture<>();
-        CodecRequest priming = new CodecRequest(
-                request.mac,
-                request.codecType,
-                0L,
-                request.codecSpecific2,
-                request.codecSpecific3,
-                request.codecSpecific4,
-                lhdcPrimeSampleRate(request),
-                request.bitsPerSample,
-                request.channelMode);
-        try {
-            // Bluetooth Codec Changer primes LHDC by briefly applying codecSpecific1=0 before
-            // writing the target quality/sample tuple. OPPO's stack accepts this as a real-time
-            // renegotiation path instead of waiting for the next reconnect.
-            reflect.setCodec(priming);
-            MLog.event("write.lhdc.prime", "request", priming);
-        } catch (Throwable t) {
-            future.completeExceptionally(t);
-            return future;
-        }
-        long deadlineMs = System.currentTimeMillis() + LHDC_PRIME_CONFIRM_TIMEOUT_MS;
-        statusHandler.postDelayed(() -> {
-            waitForLhdcPrimeThenWrite(request, priming, future, deadlineMs);
-        }, LHDC_PRIME_FIRST_CHECK_DELAY_MS);
-        return future;
-    }
-
-    private void waitForLhdcPrimeThenWrite(
-            CodecRequest request,
-            CodecRequest priming,
-            CompletableFuture<Void> future,
-            long deadlineMs) {
-        if (future.isDone()) return;
-        CodecSnapshot live = safeReadStatus(request.mac);
-        boolean ready = isLhdcPrimeReady(live, request, priming);
-        boolean timedOut = System.currentTimeMillis() >= deadlineMs;
-        if (!ready && !timedOut) {
-            MLog.event("write.lhdc.prime.wait", "target", request, "live", String.valueOf(live));
-            statusHandler.postDelayed(() -> {
-                waitForLhdcPrimeThenWrite(request, priming, future, deadlineMs);
-            }, LHDC_PRIME_CONFIRM_POLL_MS);
-            return;
-        }
-        MLog.event("write.lhdc.prime.ready",
-                "ready", ready, "timeout", timedOut, "target", request,
-                "live", String.valueOf(live));
         try {
             reflect.setCodec(request);
-            MLog.event("write.lhdc.target", "request", request);
-            future.complete(null);
+            return CompletableFuture.completedFuture(null);
         } catch (Throwable t) {
-            future.completeExceptionally(t);
+            CompletableFuture<Void> failed = new CompletableFuture<>();
+            failed.completeExceptionally(t);
+            return failed;
         }
-    }
-
-    private static boolean isLhdcPrimeReady(
-            CodecSnapshot snapshot, CodecRequest request, CodecRequest priming) {
-        if (snapshot == null || request == null || priming == null) return false;
-        if (snapshot.activeCodecType != request.codecType) return false;
-        return priming.sampleRate == 0 || snapshot.activeSampleRate == priming.sampleRate;
-    }
-
-    private static int lhdcPrimeSampleRate(CodecRequest request) {
-        if (request == null || request.sampleRate == 0) return 0;
-        return request.sampleRate == SAMPLE_RATE_48000_BIT
-                ? request.sampleRate
-                : SAMPLE_RATE_48000_BIT;
     }
 
     private CompletableFuture<Void> applyDirectOptionalCodecs(String mac, boolean enable) {
