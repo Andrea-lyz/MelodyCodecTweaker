@@ -63,6 +63,7 @@ public final class CodecBridgeClient {
     private final RootShellFallback rootFallback;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Handler ipcHandler;
+    private final Handler statusHandler;
 
     private final CopyOnWriteArrayList<SnapshotListener> listeners = new CopyOnWriteArrayList<>();
     private volatile ICodecBridge cachedBridge;
@@ -87,6 +88,9 @@ public final class CodecBridgeClient {
         HandlerThread ipcThread = new HandlerThread("MelodyCodecLsp-codecIpc");
         ipcThread.start();
         this.ipcHandler = new Handler(ipcThread.getLooper());
+        HandlerThread statusThread = new HandlerThread("MelodyCodecLsp-codecStatus");
+        statusThread.start();
+        this.statusHandler = new Handler(statusThread.getLooper());
     }
 
     public void addSnapshotListener(SnapshotListener listener) {
@@ -229,7 +233,7 @@ public final class CodecBridgeClient {
             return future;
         }
         long deadlineMs = System.currentTimeMillis() + LHDC_PRIME_CONFIRM_TIMEOUT_MS;
-        ipcHandler.postDelayed(() -> {
+        statusHandler.postDelayed(() -> {
             waitForLhdcPrimeThenWrite(request, priming, future, deadlineMs);
         }, LHDC_PRIME_FIRST_CHECK_DELAY_MS);
         return future;
@@ -246,7 +250,7 @@ public final class CodecBridgeClient {
         boolean timedOut = System.currentTimeMillis() >= deadlineMs;
         if (!ready && !timedOut) {
             MLog.event("write.lhdc.prime.wait", "target", request, "live", String.valueOf(live));
-            ipcHandler.postDelayed(() -> {
+            statusHandler.postDelayed(() -> {
                 waitForLhdcPrimeThenWrite(request, priming, future, deadlineMs);
             }, LHDC_PRIME_CONFIRM_POLL_MS);
             return;
