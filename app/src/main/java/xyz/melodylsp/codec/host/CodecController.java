@@ -2349,7 +2349,7 @@ public final class CodecController {
 
     private static long defaultHighQualitySpecific1(int codecType) {
         if (CodecLabelTable.isLhdc(codecType)) {
-            return 0x8000L | CodecLabelTable.LHDC_QUALITY_BALANCED;
+            return 0x8000L | CodecLabelTable.LHDC_QUALITY_ABR;
         }
         if (codecType == CodecLabelTable.CODEC_LDAC) {
             return CodecLabelTable.LDAC_QUALITY_MID;
@@ -2383,12 +2383,12 @@ public final class CodecController {
         long quality = snapshot.activeCodecSpecific1 & 0xFFL;
         if (sampleRateBit == SAMPLE_RATE_48000_BIT && isLhdcHighQuality(quality)) {
             return replaceLhdcQuality(snapshot.activeCodecSpecific1,
-                    CodecLabelTable.LHDC_QUALITY_BALANCED);
+                    CodecLabelTable.LHDC_QUALITY_ABR);
         }
         if (isHighQualityRate(sampleRateBit)
                 && quality == CodecLabelTable.LHDC_QUALITY_CONNECTION) {
             return replaceLhdcQuality(snapshot.activeCodecSpecific1,
-                    CodecLabelTable.LHDC_QUALITY_BALANCED);
+                    CodecLabelTable.LHDC_QUALITY_ABR);
         }
         return snapshot.activeCodecSpecific1;
     }
@@ -2408,8 +2408,8 @@ public final class CodecController {
     }
 
     private static boolean isLhdcHighQuality(long lowByte) {
-        return lowByte == CodecLabelTable.LHDC_QUALITY_HIGH
-                || lowByte == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY;
+        return lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900
+                || lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_1000;
     }
 
     private static boolean isHighQualityRate(int sampleRateBit) {
@@ -2443,15 +2443,7 @@ public final class CodecController {
         if (CodecLabelTable.isLhdc(codecType)) {
             long optionByte = option & 0xFFL;
             long activeByte = active & 0xFFL;
-            if (optionByte == activeByte) return true;
-            return (optionByte == CodecLabelTable.LHDC_QUALITY_BALANCED
-                    && activeByte == CodecLabelTable.LHDC_QUALITY_STANDARD)
-                    || (optionByte == CodecLabelTable.LHDC_QUALITY_STANDARD
-                    && activeByte == CodecLabelTable.LHDC_QUALITY_BALANCED)
-                    || (optionByte == CodecLabelTable.LHDC_QUALITY_HIGH
-                    && activeByte == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY)
-                    || (optionByte == CodecLabelTable.LHDC_QUALITY_HIGH_LEGACY
-                    && activeByte == CodecLabelTable.LHDC_QUALITY_HIGH);
+            return optionByte == activeByte;
         }
         return option == active;
     }

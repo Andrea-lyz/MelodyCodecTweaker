@@ -55,9 +55,15 @@ public final class CodecLabelTable {
     // vendor flags and must be preserved when writing a new value.
     public static final long LHDC_QUALITY_CONNECTION = 0L;
     public static final long LHDC_QUALITY_STANDARD = 3L;
-    public static final long LHDC_QUALITY_HIGH_LEGACY = 5L;
-    public static final long LHDC_QUALITY_HIGH = 8L;
-    public static final long LHDC_QUALITY_BALANCED = 9L;
+    public static final long LHDC_QUALITY_LOW_400 = 5L;
+    public static final long LHDC_QUALITY_MID_500 = 6L;
+    public static final long LHDC_QUALITY_FIXED_900 = 7L;
+    public static final long LHDC_QUALITY_FIXED_1000 = 8L;
+    public static final long LHDC_QUALITY_ABR = 9L;
+    // Compatibility names kept for older call sites; the V5 mapping above is authoritative.
+    public static final long LHDC_QUALITY_HIGH_LEGACY = LHDC_QUALITY_LOW_400;
+    public static final long LHDC_QUALITY_HIGH = LHDC_QUALITY_FIXED_1000;
+    public static final long LHDC_QUALITY_BALANCED = LHDC_QUALITY_ABR;
 
     private CodecLabelTable() {
     }
@@ -116,13 +122,16 @@ public final class CodecLabelTable {
     };
 
     /**
-     * Quality steps the LHDC family exposes on the OPPO stack. The active Enco X3 default in
-     * logs is 0x8009, which corresponds to the balanced profile on this ROM.
+     * Quality steps the LHDC family exposes on the OPPO stack. Recent ColorOS builds report
+     * 0x09 as ABR/adaptive, while 0x07/0x08 may be accepted by Java and ignored by native.
      */
     public static final long[] LHDC_QUALITY_STEPS = {
             LHDC_QUALITY_CONNECTION,
-            LHDC_QUALITY_BALANCED,
-            LHDC_QUALITY_HIGH
+            LHDC_QUALITY_LOW_400,
+            LHDC_QUALITY_MID_500,
+            LHDC_QUALITY_FIXED_900,
+            LHDC_QUALITY_FIXED_1000,
+            LHDC_QUALITY_ABR
     };
 
     /** Returns the protocol-defined quality steps for {@code codecType} when the platform
@@ -153,7 +162,7 @@ public final class CodecLabelTable {
      * {@code 0x10..0x1F} window (TODO A4). Ids inside the core window are accepted outright.
      * For ids in the widened {@code 0x20..0x3F} tail we additionally require the
      * {@code codecSpecific1} word to look like an LHDC vendor word: the low byte must match a
-     * known LHDC quality code (CONNECTION / STANDARD / HIGH_LEGACY / HIGH / BALANCED), which is
+     * known LHDC quality code (CONNECTION / STANDARD / LOW / MID / FIXED / ABR), which is
      * how every shipping OPPO LHDC build encodes the playback quality. This keeps a brand-new
      * vendor id recognised while avoiding mis-labelling an unrelated future codec as LHDC.
      *
@@ -171,9 +180,11 @@ public final class CodecLabelTable {
         long lowByte = codecSpecific1 & 0xFFL;
         return lowByte == LHDC_QUALITY_CONNECTION
                 || lowByte == LHDC_QUALITY_STANDARD
-                || lowByte == LHDC_QUALITY_HIGH_LEGACY
-                || lowByte == LHDC_QUALITY_HIGH
-                || lowByte == LHDC_QUALITY_BALANCED;
+                || lowByte == LHDC_QUALITY_LOW_400
+                || lowByte == LHDC_QUALITY_MID_500
+                || lowByte == LHDC_QUALITY_FIXED_900
+                || lowByte == LHDC_QUALITY_FIXED_1000
+                || lowByte == LHDC_QUALITY_ABR;
     }
 
     /** Resolve the LDAC / LHDC quality label, or fall back to {@code "档位 (rawValue)"}. */
@@ -188,10 +199,12 @@ public final class CodecLabelTable {
             // future bit fields (e.g. lossless toggle) do not break label resolution.
             long versionByte = specific1 & 0xFFL;
             if (versionByte == LHDC_QUALITY_CONNECTION) return Strings.QUALITY_LHDC_CONNECTION;
-            if (versionByte == LHDC_QUALITY_STANDARD) return Strings.QUALITY_LHDC_BALANCED;
-            if (versionByte == LHDC_QUALITY_BALANCED) return Strings.QUALITY_LHDC_BALANCED;
-            if (versionByte == LHDC_QUALITY_HIGH_LEGACY) return Strings.QUALITY_LHDC_HIGH;
-            if (versionByte == LHDC_QUALITY_HIGH) return Strings.QUALITY_LHDC_HIGH;
+            if (versionByte == LHDC_QUALITY_STANDARD) return Strings.QUALITY_LHDC_STANDARD;
+            if (versionByte == LHDC_QUALITY_LOW_400) return Strings.QUALITY_LHDC_LOW_400;
+            if (versionByte == LHDC_QUALITY_MID_500) return Strings.QUALITY_LHDC_MID_500;
+            if (versionByte == LHDC_QUALITY_FIXED_900) return Strings.QUALITY_LHDC_FIXED_900;
+            if (versionByte == LHDC_QUALITY_FIXED_1000) return Strings.QUALITY_LHDC_FIXED_1000;
+            if (versionByte == LHDC_QUALITY_ABR) return Strings.QUALITY_LHDC_ABR;
         }
         return "档位 (" + specific1 + ")";
     }
