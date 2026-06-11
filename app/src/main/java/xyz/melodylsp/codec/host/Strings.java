@@ -25,6 +25,7 @@ public final class Strings {
     public static final String BANNER_VIA_SETTINGS = "已写入开发者选项";
     public static final String BANNER_VIA_ROOT = "已通过 root 写入开发者选项，蓝牙正在重连";
     public static final String TOAST_APPLY_FAILED = "切换未生效，请重试";
+    public static final String TOAST_LHDC_GOLD_RESTRICTION = "由于金标系统限制，切换失败";
     public static final String TOAST_CODEC_MODE_UNSUPPORTED = "当前耳机不支持高品质编解码器切换";
 
     public static final String FRESHNESS_LABEL_FORMAT = "上次同步：%s";
@@ -43,14 +44,14 @@ public final class Strings {
     public static final String QUALITY_LDAC_990 = "990 kbps（音质优先）";
     public static final String QUALITY_LDAC_660 = "660 kbps（标准）";
     public static final String QUALITY_LDAC_330 = "330 kbps（连接优先）";
-    public static final String QUALITY_LHDC_CONNECTION = "64 kbps（连接优先）";
+    public static final String QUALITY_LHDC_CONNECTION = "64 kbps";
     public static final String QUALITY_LHDC_STANDARD = "标准";
     public static final String QUALITY_LHDC_LOW_400 = "400 kbps";
-    public static final String QUALITY_LHDC_MID_500 = "500 kbps";
+    public static final String QUALITY_LHDC_MID_500 = "连接优先";
     public static final String QUALITY_LHDC_FIXED_900 = "900 kbps（固定）";
-    public static final String QUALITY_LHDC_FIXED_1000 = "1000 kbps（固定）";
-    public static final String QUALITY_LHDC_ABR = "自适应（ABR）";
-    public static final String QUALITY_LHDC_BALANCED = "均衡";
+    public static final String QUALITY_LHDC_FIXED_1000 = "音质优先";
+    public static final String QUALITY_LHDC_ABR = "自适应";
+    public static final String QUALITY_LHDC_BALANCED = "自适应";
     public static final String QUALITY_LHDC_HIGH = "音质优先";
     public static final String CODEC_MODE_HIGH_QUALITY = "高品质";
     public static final String CODEC_MODE_STANDARD = "标准";
