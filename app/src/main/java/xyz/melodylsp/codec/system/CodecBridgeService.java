@@ -15,6 +15,7 @@ import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.bridge.ICodecBridge;
 import xyz.melodylsp.codec.bridge.ICodecBridgeListener;
+import xyz.melodylsp.codec.bt.BluetoothCodecReflect;
 import xyz.melodylsp.codec.util.MLog;
 
 /**
@@ -56,6 +57,10 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
     CodecSnapshot getStatusUnchecked(String mac) {
         try {
             BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(mac);
+            if (!BluetoothCodecReflect.isAclConnectedOrUnknown(device)) {
+                MLog.event("codec.bridge.status.skip.acl_disconnected", "mac", mac);
+                return null;
+            }
             Method m = a2dpClass.getMethod("getCodecStatus", BluetoothDevice.class);
             Object status = m.invoke(a2dpService, device);
             if (status == null) return null;

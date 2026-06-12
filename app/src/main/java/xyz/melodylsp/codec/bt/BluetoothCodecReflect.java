@@ -75,6 +75,10 @@ public final class BluetoothCodecReflect {
     public CodecSnapshot readStatus(String mac) {
         BluetoothA2dp proxy = acquireProxyBlocking();
         BluetoothDevice device = ensureDevice(mac);
+        if (!isAclConnectedOrUnknown(device)) {
+            MLog.event("codec.status.skip.acl_disconnected", "mac", mac);
+            return null;
+        }
         if (!isConnected(proxy, device)) return null;
         Object status;
         try {
@@ -104,6 +108,21 @@ public final class BluetoothCodecReflect {
         } catch (Throwable t) {
             return true;
         }
+    }
+
+    /**
+     * Hidden framework ACL check. Some OPlus builds keep a stale A2DP codec status after the
+     * physical link is gone; in that state profile/capability APIs may still look connected.
+     */
+    public static boolean isAclConnectedOrUnknown(BluetoothDevice device) {
+        if (device == null) return true;
+        try {
+            Method m = device.getClass().getMethod("isConnected");
+            Object out = m.invoke(device);
+            if (out instanceof Boolean) return (Boolean) out;
+        } catch (Throwable ignored) {
+        }
+        return true;
     }
 
     /** Writes a {@link CodecRequest} via {@code setCodecConfigPreference}. */
