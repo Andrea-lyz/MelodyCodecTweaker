@@ -37,7 +37,9 @@ final class A2dpRouteReadiness {
     private final Context context;
     private final Object lock = new Object();
     private final Set<String> readyMacs = new HashSet<>();
+    private final Set<String> waitingMacs = new HashSet<>();
     private boolean loggedQueryFailure;
+    private boolean loggedPermissionDenied;
 
     A2dpRouteReadiness(Context context) {
         this.context = context != null ? context.getApplicationContext() : null;
@@ -47,7 +49,12 @@ final class A2dpRouteReadiness {
         String key = normalizeMac(mac);
         if (key == null) return;
         synchronized (lock) {
+            if (readyMacs.contains(key)) {
+                MLog.event("a2dp.ready.keep", "mac", redactMac(key), "reason", "connected");
+                return;
+            }
             readyMacs.remove(key);
+            waitingMacs.add(key);
         }
         MLog.event("a2dp.ready.reset", "mac", redactMac(key));
     }
@@ -57,6 +64,7 @@ final class A2dpRouteReadiness {
         if (key == null) return;
         synchronized (lock) {
             readyMacs.remove(key);
+            waitingMacs.remove(key);
         }
         MLog.event("a2dp.ready.clear", "mac", redactMac(key));
     }
@@ -67,6 +75,7 @@ final class A2dpRouteReadiness {
         boolean changed;
         synchronized (lock) {
             changed = readyMacs.add(key);
+            waitingMacs.remove(key);
         }
         if (changed) {
             MLog.event("a2dp.ready.latched",
@@ -80,12 +89,13 @@ final class A2dpRouteReadiness {
         String key = normalizeMac(mac);
         if (key == null) return true;
         if (isLatchedReady(key)) return true;
+        if (isWaitingForActive(key)) return false;
         Boolean activeMatch = queryActiveA2dpMatch(key);
         if (Boolean.TRUE.equals(activeMatch)) {
             markReady(key, "active_query");
             return true;
         }
-        return activeMatch == null;
+        return true;
     }
 
     boolean updateFromActiveDeviceIntent(Intent intent, String expectedMac) {
@@ -106,6 +116,12 @@ final class A2dpRouteReadiness {
         }
     }
 
+    private boolean isWaitingForActive(String key) {
+        synchronized (lock) {
+            return waitingMacs.contains(key);
+        }
+    }
+
     private Boolean queryActiveA2dpMatch(String expected) {
         BluetoothAdapter adapter = resolveAdapter();
         if (adapter == null) return null;
@@ -114,6 +130,10 @@ final class A2dpRouteReadiness {
             Object devices = getActiveDevices.invoke(adapter, BluetoothProfile.A2DP);
             return deviceCollectionContains(devices, expected);
         } catch (Throwable t) {
+            if (containsSecurityException(t)) {
+                logPermissionDenied();
+                return null;
+            }
             logQueryFailure(t);
             return null;
         }
@@ -185,6 +205,21 @@ final class A2dpRouteReadiness {
         if (loggedQueryFailure) return;
         loggedQueryFailure = true;
         MLog.w("A2DP active device query unavailable; route readiness will fail open", t);
+    }
+
+    private void logPermissionDenied() {
+        if (loggedPermissionDenied) return;
+        loggedPermissionDenied = true;
+        MLog.event("a2dp.active.query.denied", "mode", "broadcast_only");
+    }
+
+    private static boolean containsSecurityException(Throwable t) {
+        Throwable cur = t;
+        while (cur != null) {
+            if (cur instanceof SecurityException) return true;
+            cur = cur.getCause();
+        }
+        return false;
     }
 
     static String normalizeMac(String mac) {
