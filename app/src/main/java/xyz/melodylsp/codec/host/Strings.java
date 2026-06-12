@@ -25,7 +25,6 @@ public final class Strings {
     public static final String BANNER_VIA_SETTINGS = "已写入开发者选项";
     public static final String BANNER_VIA_ROOT = "已通过 root 写入开发者选项，蓝牙正在重连";
     public static final String TOAST_APPLY_FAILED = "切换未生效，请重试";
-    public static final String TOAST_LHDC_GOLD_RESTRICTION = "由于金标系统限制，切换失败";
     public static final String TOAST_CODEC_MODE_UNSUPPORTED = "当前耳机不支持高品质编解码器切换";
 
     public static final String FRESHNESS_LABEL_FORMAT = "上次同步：%s";

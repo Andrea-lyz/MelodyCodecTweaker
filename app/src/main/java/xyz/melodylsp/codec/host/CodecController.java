@@ -45,8 +45,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import dalvik.system.DexFile;
 
@@ -75,6 +73,8 @@ public final class CodecController {
             "android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED";
     private static final String ACTION_CONNECTION_STATE_CHANGED =
             "android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED";
+    private static final String ACTION_ACTIVE_DEVICE_CHANGED =
+            "android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED";
     private static final String EXTRA_CONNECTION_STATE = "android.bluetooth.profile.extra.STATE";
     private static final int SAMPLE_RATE_48000_BIT = 0x2;
     private static final int SAMPLE_RATE_96000_BIT = 0x8;
@@ -86,23 +86,10 @@ public final class CodecController {
     private static final long CLASSIC_RESTORE_WINDOW_MS = 30_000L;
     private static final long HIGH_QUALITY_RETRY_DELAY_MS = 900L;
     private static final long AAC_HIGH_QUALITY_WARMUP_DELAY_MS = 650L;
-    private static final int[] GOLD_RESTRICTION_MIN_ROM = {16, 0, 7};
-    private static final Pattern ROM_VERSION_PATTERN =
-            Pattern.compile("(?:^|[^0-9])(?:V|v)?(\\d{1,2})\\.(\\d{1,2})\\.(\\d{1,3})(?:\\.\\d+)?");
-    private static final String[] ROM_VERSION_PROPERTIES = {
-            "ro.build.version.oplusrom",
-            "ro.build.version.oplusrom.display",
-            "ro.build.version.ota",
-            "ro.oplus.version.release",
-            "ro.oplus.os.version",
-            "ro.build.display.id",
-            "ro.build.version.incremental",
-            "ro.system.build.version.incremental",
-            "ro.vendor.build.version.incremental"
-    };
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
-    private static volatile Boolean cachedGoldRestrictionRom;
+    private static final String STATE_A2DP_WAITING =
+            "\u7b49\u5f85\u8033\u673a\u5c31\u7eea";
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
@@ -1636,14 +1623,6 @@ public final class CodecController {
                     break;
                 case TIMEOUT_ROLLED_BACK:
                     if (failureHandler != null && failureHandler.onFailure(result, null)) return;
-                    if (showLhdcGoldRestrictionToastIfNeeded(request, result)) {
-                        if (result.rollbackSnapshot != null) {
-                            publish(result.rollbackSnapshot, sub);
-                        } else {
-                            refreshSnapshot(sub);
-                        }
-                        break;
-                    }
                     Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
                     if (result.rollbackSnapshot != null) {
                         publish(result.rollbackSnapshot, sub);
@@ -1667,147 +1646,6 @@ public final class CodecController {
 
     private interface WriteSuccessHandler {
         boolean onConfirmed(WriteResult result);
-    }
-
-    private boolean showLhdcGoldRestrictionToastIfNeeded(
-            CodecRequest request, WriteResult result) {
-        if (!isLhdcGoldRestrictionFailure(request, result)) return false;
-        Toast.makeText(context, Strings.TOAST_LHDC_GOLD_RESTRICTION, Toast.LENGTH_LONG).show();
-        MLog.event("write.lhdc.gold_restriction.toast",
-                "request", request,
-                "live", String.valueOf(result.rollbackSnapshot));
-        return true;
-    }
-
-    private static boolean isLhdcGoldRestrictionFailure(
-            CodecRequest request, WriteResult result) {
-        if (request == null || result == null) return false;
-        if (result.outcome != WriteResult.Outcome.TIMEOUT_ROLLED_BACK) return false;
-        if (!CodecLabelTable.isLhdc(request.codecType)) return false;
-        long requestedQuality = request.codecSpecific1 & 0xFFL;
-        if (requestedQuality != CodecLabelTable.LHDC_QUALITY_FIXED_1000) return false;
-        CodecSnapshot live = result.rollbackSnapshot;
-        if (live == null || !CodecLabelTable.isLhdc(live.activeCodecType)) return false;
-        if ((live.activeCodecSpecific1 & 0xFFL) == requestedQuality) return false;
-        return isGoldRestrictionRom();
-    }
-
-    private static boolean isGoldRestrictionRom() {
-        Boolean cached = cachedGoldRestrictionRom;
-        if (cached != null) return cached;
-        boolean enabled = false;
-        String source = null;
-        int[] best = null;
-        for (String property : ROM_VERSION_PROPERTIES) {
-            String value = readSystemProperty(property);
-            int[] parsed = parseRomVersion(value);
-            if (parsed != null && (best == null || compareVersion(parsed, best) > 0)) {
-                best = parsed;
-                source = property + "=" + value;
-            }
-        }
-        String[] publicValues = {
-                "Build.DISPLAY=" + Build.DISPLAY,
-                "Build.VERSION.INCREMENTAL=" + Build.VERSION.INCREMENTAL,
-                "Build.FINGERPRINT=" + Build.FINGERPRINT,
-                "Build.VERSION.RELEASE=" + Build.VERSION.RELEASE
-        };
-        for (String value : publicValues) {
-            int[] parsed = parseRomVersion(value);
-            if (parsed != null && (best == null || compareVersion(parsed, best) > 0)) {
-                best = parsed;
-                source = value;
-            }
-        }
-        if (best != null) {
-            enabled = compareVersion(best, GOLD_RESTRICTION_MIN_ROM) >= 0;
-        } else {
-            enabled = isOplusFamilyBuild() && parseMajorVersion(Build.VERSION.RELEASE) >= 16;
-            source = "fallback:android_release=" + Build.VERSION.RELEASE;
-        }
-        cachedGoldRestrictionRom = enabled;
-        MLog.event("rom.gold_restriction.gate",
-                "enabled", enabled,
-                "source", source != null ? source : "unknown");
-        return enabled;
-    }
-
-    private static String readSystemProperty(String key) {
-        if (TextUtils.isEmpty(key)) return "";
-        try {
-            Class<?> cls = Class.forName("android.os.SystemProperties");
-            Method get = cls.getDeclaredMethod("get", String.class, String.class);
-            get.setAccessible(true);
-            Object value = get.invoke(null, key, "");
-            return value != null ? String.valueOf(value) : "";
-        } catch (Throwable ignored) {
-            return "";
-        }
-    }
-
-    private static int[] parseRomVersion(String value) {
-        if (TextUtils.isEmpty(value)) return null;
-        Matcher matcher = ROM_VERSION_PATTERN.matcher(value);
-        int[] best = null;
-        while (matcher.find()) {
-            int[] parsed = {
-                    safeParseInt(matcher.group(1)),
-                    safeParseInt(matcher.group(2)),
-                    safeParseInt(matcher.group(3))
-            };
-            if (parsed[0] < 0 || parsed[1] < 0 || parsed[2] < 0) continue;
-            if (best == null || compareVersion(parsed, best) > 0) {
-                best = parsed;
-            }
-        }
-        return best;
-    }
-
-    private static int compareVersion(int[] left, int[] right) {
-        if (left == null && right == null) return 0;
-        if (left == null) return -1;
-        if (right == null) return 1;
-        int len = Math.max(left.length, right.length);
-        for (int i = 0; i < len; i++) {
-            int l = i < left.length ? left[i] : 0;
-            int r = i < right.length ? right[i] : 0;
-            if (l != r) return l < r ? -1 : 1;
-        }
-        return 0;
-    }
-
-    private static int safeParseInt(String value) {
-        if (TextUtils.isEmpty(value)) return -1;
-        try {
-            return Integer.parseInt(value);
-        } catch (Throwable ignored) {
-            return -1;
-        }
-    }
-
-    private static int parseMajorVersion(String value) {
-        if (TextUtils.isEmpty(value)) return -1;
-        for (int i = 0; i < value.length(); i++) {
-            char c = value.charAt(i);
-            if (c < '0' || c > '9') continue;
-            int end = i + 1;
-            while (end < value.length()) {
-                char next = value.charAt(end);
-                if (next < '0' || next > '9') break;
-                end++;
-            }
-            return safeParseInt(value.substring(i, end));
-        }
-        return -1;
-    }
-
-    private static boolean isOplusFamilyBuild() {
-        String family = (String.valueOf(Build.BRAND) + " "
-                + String.valueOf(Build.MANUFACTURER) + " "
-                + String.valueOf(Build.PRODUCT)).toLowerCase(Locale.ROOT);
-        return family.contains("oppo")
-                || family.contains("oplus")
-                || family.contains("oneplus");
     }
 
     private synchronized long nextCodecWriteGeneration(Subscription sub) {
@@ -2198,6 +2036,10 @@ public final class CodecController {
             renderLeAudioActive(sub);
             return;
         }
+        if (Boolean.FALSE.equals(sub.a2dpActive)) {
+            renderA2dpWaiting(sub);
+            return;
+        }
         sub.renderedLeAudioActive = false;
         clearClassicRestorePending(sub.mac);
         if (Boolean.FALSE.equals(sub.connected)) {
@@ -2226,6 +2068,26 @@ public final class CodecController {
         if (sub.prefs.rememberToggle != null) {
             PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
         }
+    }
+
+    private void renderA2dpWaiting(Subscription sub) {
+        if (sub == null || sub.prefs == null) return;
+        sub.connected = Boolean.TRUE;
+        sub.renderedLeAudioActive = false;
+        if (sub.prefs.codecDisplay != null) {
+            PrefRef.setTitle(sub.prefs.codecDisplay,
+                    Strings.CODEC_BLOCK_TITLE + " : " + STATE_A2DP_WAITING);
+        }
+        PrefRef.setSummary(sub.prefs.qualityOption, STATE_A2DP_WAITING);
+        PrefRef.setSummary(sub.prefs.sampleRateOption, STATE_A2DP_WAITING);
+        PrefRef.setVisible(sub.prefs.codecModeOption, false);
+        PrefRef.setVisible(sub.prefs.qualityOption, true);
+        PrefRef.setVisible(sub.prefs.sampleRateOption, true);
+        setBlockDisabled(sub, true);
+        if (sub.prefs.rememberToggle != null) {
+            PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
+        }
+        applyLeAudioToSwitch(sub);
     }
 
     private boolean shouldRenderLeAudioActive(Subscription sub) {
@@ -2642,6 +2504,7 @@ public final class CodecController {
         final Object fragment;
         BroadcastReceiver receiver;
         Boolean connected;
+        Boolean a2dpActive;
         boolean renderedLeAudioActive;
         java.lang.ref.WeakReference<Activity> hostActivity;
 
@@ -2669,6 +2532,7 @@ public final class CodecController {
                                     return;
                                 }
                                 connected = Boolean.FALSE;
+                                a2dpActive = Boolean.FALSE;
                                 lastSnapshot.set(null);
                                 renderUnknown(Subscription.this);
                             });
@@ -2676,6 +2540,7 @@ public final class CodecController {
                         }
                         if (state == BluetoothProfile.STATE_CONNECTED) {
                             connected = Boolean.TRUE;
+                            a2dpActive = null;
                         }
                         refreshSnapshot(Subscription.this);
                         if (state == BluetoothProfile.STATE_CONNECTED) {
@@ -2689,12 +2554,22 @@ public final class CodecController {
                             return;
                         }
                         refreshSnapshot(Subscription.this);
+                    } else if (ACTION_ACTIVE_DEVICE_CHANGED.equals(action)) {
+                        boolean active = activeDeviceMatchesSubscription(intent);
+                        a2dpActive = active;
+                        if (active) {
+                            refreshSnapshot(Subscription.this);
+                            refreshSnapshotDelayed(Subscription.this, 1200L);
+                        } else {
+                            renderA2dpWaiting(Subscription.this);
+                        }
                     }
                 }
             };
             IntentFilter filter = new IntentFilter();
             filter.addAction(ACTION_CODEC_CONFIG_CHANGED);
             filter.addAction(ACTION_CONNECTION_STATE_CHANGED);
+            filter.addAction(ACTION_ACTIVE_DEVICE_CHANGED);
             try {
                 context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
             } catch (Throwable t) {
@@ -2711,6 +2586,18 @@ public final class CodecController {
                 return address == null || address.equalsIgnoreCase(mac);
             } catch (Throwable t) {
                 return true;
+            }
+        }
+
+        @SuppressWarnings("deprecation")
+        private boolean activeDeviceMatchesSubscription(Intent intent) {
+            try {
+                BluetoothDevice device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                if (device == null) return false;
+                String address = device.getAddress();
+                return address != null && address.equalsIgnoreCase(mac);
+            } catch (Throwable t) {
+                return false;
             }
         }
 
