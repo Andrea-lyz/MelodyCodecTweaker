@@ -78,6 +78,10 @@ public final class FeedbackCollector {
             "write.timeout",
             "ignore target bitrate"
     };
+    private static final String[] MODULE_LOG_PATTERNS = {
+            "MelodyCodecLsp",
+            "LSPosedFramework"
+    };
     private static final String[] SU_CANDIDATES = {
             "su",
             "/system/bin/su",
@@ -88,6 +92,14 @@ public final class FeedbackCollector {
             "/data/adb/ksu/bin/su",
             "/data/adb/magisk/su"
     };
+    private static final String MODULE_LOGCAT_COMMAND =
+            "/system/bin/logcat -d -b all -t 20000 "
+                    + "MelodyCodecLsp:V '*:S'";
+    private static final String BLUETOOTH_LOGCAT_COMMAND =
+            "/system/bin/logcat -d -b all -t 50000 "
+                    + "MelodyCodecLsp:V "
+                    + "bluetooth-a2dp:V soc_bta_av:V "
+                    + "a2dp_vendor_lhdcv5:V a2dp_vendor_lhdcv5_encoder:V '*:S'";
     private static final int MAX_COMMAND_OUTPUT_CHARS = 4_000_000;
 
     private FeedbackCollector() {
@@ -278,29 +290,51 @@ public final class FeedbackCollector {
                 "-s", "MelodyCodecLsp:V", "LSPosedFramework:I"
         });
         if (direct.trim().length() > 80) return direct;
-        String rooted = runRootCommand(
-                "/system/bin/logcat -d -b all -t 4000 -s MelodyCodecLsp:V LSPosedFramework:I");
-        if (!rooted.trim().isEmpty()) {
-            return "direct logcat was empty; su fallback used\n\n" + rooted;
+        String rooted = runRootCommand(MODULE_LOGCAT_COMMAND);
+        String rootFailure = rooted.startsWith("root command failed:") ? rooted : "";
+        String filteredRooted = rootFailure.isEmpty() ? filterLog(rooted, MODULE_LOG_PATTERNS) : "";
+        if (!filteredRooted.trim().isEmpty()) {
+            return "direct logcat was empty; tagged su fallback used\n\n"
+                    + filteredRooted;
+        }
+        String allRooted = runRootCommand("/system/bin/logcat -d -b all -t 12000");
+        if (!allRooted.startsWith("root command failed:")) {
+            String filtered = filterLog(allRooted, MODULE_LOG_PATTERNS);
+            if (!filtered.trim().isEmpty()) {
+                return "direct and tag-filtered root logcat were empty; "
+                        + "filtered full root logcat used\n\n" + filtered;
+            }
         }
         return "logcat unavailable from module app. Please also attach LSPosed module logs.\n\n"
-                + direct;
+                + direct
+                + (rootFailure.isEmpty() ? "" : "\n--- root fallback ---\n" + rootFailure);
     }
 
     private static String collectBluetoothLogcatRoot() {
-        String all = runRootCommand("/system/bin/logcat -d -b all -t 12000");
-        if (all.startsWith("root command failed:")) {
-            return "root logcat unavailable\n\n" + all;
+        String tagged = runRootCommand(BLUETOOTH_LOGCAT_COMMAND);
+        if (!tagged.startsWith("root command failed:") && !tagged.trim().isEmpty()) {
+            String filtered = filterLog(tagged, BLUETOOTH_LOG_PATTERNS);
+            if (!filtered.trim().isEmpty()) {
+                return filtered;
+            }
         }
-        return filterBluetoothLog(all);
+
+        String all = runRootCommand("/system/bin/logcat -d -b all -t 30000");
+        if (all.startsWith("root command failed:")) {
+            return "root logcat unavailable\n\n"
+                    + (tagged.startsWith("root command failed:")
+                    ? tagged + "\n\n--- full fallback ---\n" : "")
+                    + all;
+        }
+        return filterLog(all, BLUETOOTH_LOG_PATTERNS);
     }
 
-    private static String filterBluetoothLog(String all) {
+    private static String filterLog(String all, String[] patterns) {
         StringBuilder out = new StringBuilder();
         String[] lines = all.split("\\n");
         for (String line : lines) {
-            for (String pattern : BLUETOOTH_LOG_PATTERNS) {
-                if (line.contains(pattern)) {
+            for (String pattern : patterns) {
+                if (line.contains(pattern) && keepMatchedLine(line, pattern)) {
                     out.append(line).append('\n');
                     break;
                 }
@@ -310,6 +344,11 @@ public final class FeedbackCollector {
             return "root logcat succeeded, but no relevant bluetooth/module lines matched.\n";
         }
         return out.toString();
+    }
+
+    private static boolean keepMatchedLine(String line, String pattern) {
+        if (!"LSPosedFramework".equals(pattern)) return true;
+        return line.contains("MelodyCodecLsp") || line.contains(BuildConfig.APPLICATION_ID);
     }
 
     private static String runRootCommand(String command) {
@@ -338,6 +377,7 @@ public final class FeedbackCollector {
 
     private static boolean looksLikeRootCommandFailure(String result) {
         if (result == null) return true;
+        if (looksLikeLogcatOutput(result)) return false;
         String lower = result.toLowerCase(Locale.ROOT);
         return lower.startsWith("command failed:")
                 || lower.contains("cannot run program")
@@ -347,6 +387,11 @@ public final class FeedbackCollector {
                 || lower.contains("su: not found")
                 || lower.contains("unknown option")
                 || lower.contains("command timed out");
+    }
+
+    private static boolean looksLikeLogcatOutput(String result) {
+        return result.contains("--------- beginning of ")
+                || result.matches("(?s).*\\b\\d\\d-\\d\\d \\d\\d:\\d\\d:\\d\\d\\.\\d\\d\\d\\b.*");
     }
 
     private static String shellEscape(String value) {
