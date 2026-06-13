@@ -78,11 +78,20 @@ OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip
 /storage/emulated/0/Download/
 ```
 
-建议反馈前按这个流程操作：
+建议反馈前按这个流程操作，普通用户按顺序做即可：
 
-1. 打开诊断页，点击「开始记录问题」。
-2. 回到「无线耳机」页面复现一次问题，例如切换 LHDC 质量 / 采样率、断开重连、打开 LE Audio。
-3. 再回到诊断页，点击「生成反馈包」。
+1. 确认 LSPosed 里已经启用模块，并勾选 `com.oplus.melody`、`com.android.bluetooth`、`com.oplus.wirelesssettings`、`com.android.settings` 四个作用域。
+2. 在 KernelSU / Magisk / APatch 等 root 管理器里给「欧加耳机音质助手」授权 root；没有 root 授权时也能生成反馈包，但会缺少最关键的蓝牙栈日志。
+3. 打开「欧加耳机音质助手」诊断页，点击「开始记录问题」。如果弹出 root 授权请求，请选择允许。
+4. 回到「无线耳机」页面复现一次问题，例如切换 LHDC 质量 / 采样率、切换 AAC / SBC / LHDC、断开重连耳机、开关 LE Audio，或等待出现「未适配，请联系开发者反馈」。
+5. 再回到诊断页，点击「生成反馈包」。
+6. 把生成的 `OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip` 发给开发者即可。
+
+如果是为了适配 LHDC V5 native 内存补丁，请同时提供手机型号、系统版本，以及当前系统的 `/system/lib64/libbluetooth_jni.so`。这个文件可以通过 root 文件管理器复制，也可以在电脑上用 adb 尝试导出：
+
+```bash
+adb pull /system/lib64/libbluetooth_jni.so
+```
 
 反馈包包含设备信息、模块版本、相关包版本、诊断状态、最近模块事件时间线、结构化事件 JSONL、状态快照、模块偏好、`scope.list`、`module.prop` 和模块 logcat。若设备已授权 root，还会额外尝试抓取并过滤蓝牙栈相关 logcat，便于确认 `quality_mode`、`target bit rate`、`codec_specific_1`、native patch 和记忆重放情况。它不会主动打包用户文件，但 logcat 里可能包含系统日志，请反馈前自行确认是否介意。
 
@@ -162,6 +171,11 @@ LHDC 的实时切换更依赖厂商蓝牙栈。模块会直接写入目标播放
 ## LHDC V5 运行时内存补丁
 
 当前版本已内置 LSPosed 进程内 native helper 和多 pattern 运行时补丁表，用来处理部分 OPlus / ColorOS 蓝牙栈忽略 LHDC V5 固定 900 / 1000 kbps 目标码率的问题。只要启用 `com.android.bluetooth` 作用域，模块会在蓝牙进程启动后自动尝试运行时内存补丁。
+
+已适配机型：
+
+- 一加 13：ColorOS 16 `C16.0.8.301`
+- 一加 15：ColorOS 16 `C16.0.7.207`
 
 补丁流程：
 
