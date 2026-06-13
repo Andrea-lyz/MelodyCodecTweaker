@@ -48,6 +48,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import dalvik.system.DexFile;
 
+import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.bt.BluetoothCodecReflect;
@@ -102,6 +103,7 @@ public final class CodecController {
     private final Map<String, Long> classicRestoreDeadlines = new HashMap<>();
     private final Map<String, CodecSnapshot> lastHighQualitySnapshots = new HashMap<>();
     private final Map<String, Long> codecWriteGenerations = new HashMap<>();
+    private volatile boolean nativePatchUnsupported;
 
     public interface SurfaceRescanRequester {
         void request(String reason);
@@ -126,6 +128,8 @@ public final class CodecController {
         this.leAudioManager = new xyz.melodylsp.codec.leaudio.LeAudioManager(
                 this.context, this::onLeAudioStateChanged);
         registerActivityCleanup();
+        registerNativePatchStateReceiver();
+        queryNativePatchStateSoon();
     }
 
     private void markClassicRestorePending(String mac) {
@@ -161,6 +165,62 @@ public final class CodecController {
 
     private void requestSurfaceRescanDelayed(String reason, long delayMs) {
         mainHandler.postDelayed(() -> requestSurfaceRescan(reason), delayMs);
+    }
+
+    private void registerNativePatchStateReceiver() {
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                handleNativePatchState(intent);
+            }
+        };
+        IntentFilter filter = new IntentFilter(CodecIpc.ACTION_NATIVE_PATCH_STATE);
+        try {
+            context.registerReceiver(receiver, filter, null, mainHandler,
+                    Context.RECEIVER_EXPORTED);
+        } catch (Throwable t) {
+            try {
+                context.registerReceiver(receiver, filter, null, mainHandler);
+            } catch (Throwable inner) {
+                MLog.w("native patch state receiver registration failed", inner);
+            }
+        }
+    }
+
+    private void queryNativePatchStateSoon() {
+        mainHandler.postDelayed(this::queryNativePatchState, 300L);
+        mainHandler.postDelayed(this::queryNativePatchState, 1_500L);
+        mainHandler.postDelayed(this::queryNativePatchState, 5_000L);
+    }
+
+    private void queryNativePatchState() {
+        try {
+            Intent intent = new Intent(CodecIpc.ACTION_QUERY_NATIVE_PATCH);
+            intent.setPackage(CodecIpc.BLUETOOTH_PKG);
+            intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+            context.sendBroadcast(intent);
+        } catch (Throwable t) {
+            MLog.w("native patch state query failed", t);
+        }
+    }
+
+    private void handleNativePatchState(Intent intent) {
+        if (intent == null
+                || !CodecIpc.ACTION_NATIVE_PATCH_STATE.equals(intent.getAction())
+                || !CodecIpc.TOKEN.equals(intent.getStringExtra(CodecIpc.EXTRA_TOKEN))) {
+            return;
+        }
+        String status = intent.getStringExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS);
+        int patched = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, -1);
+        int original = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, -1);
+        nativePatchUnsupported = "unsupported".equals(status)
+                && patched == 0
+                && original == 0;
+        MLog.event("native.patch.state.recv",
+                "status", status,
+                "patched", patched,
+                "original", original,
+                "unsupported", nativePatchUnsupported);
     }
 
     /**
@@ -1643,7 +1703,7 @@ public final class CodecController {
             if (ex != null) {
                 MLog.e("setCodec future failed", ex);
                 if (failureHandler != null && failureHandler.onFailure(null, ex)) return;
-                Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                showWriteFailedToast(request);
                 refreshSnapshot(sub);
                 return;
             }
@@ -1664,7 +1724,7 @@ public final class CodecController {
                     break;
                 case TIMEOUT_ROLLED_BACK:
                     if (failureHandler != null && failureHandler.onFailure(result, null)) return;
-                    Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                    showWriteFailedToast(request);
                     if (result.rollbackSnapshot != null) {
                         publish(result.rollbackSnapshot, sub);
                     } else {
@@ -1674,11 +1734,35 @@ public final class CodecController {
                 case FAILED:
                 default:
                     if (failureHandler != null && failureHandler.onFailure(result, null)) return;
-                    Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                    showWriteFailedToast(request);
                     refreshSnapshot(sub);
                     break;
             }
         }));
+    }
+
+    private void showWriteFailedToast(CodecRequest request) {
+        Toast.makeText(context,
+                shouldShowNativePatchUnsupportedToast(request)
+                        ? Strings.TOAST_NATIVE_PATCH_UNSUPPORTED
+                        : Strings.TOAST_APPLY_FAILED,
+                Toast.LENGTH_SHORT).show();
+    }
+
+    private boolean shouldShowNativePatchUnsupportedToast(CodecRequest request) {
+        return nativePatchUnsupported
+                && request != null
+                && CodecLabelTable.isLhdc(request.codecType);
+    }
+
+    private void showWriteFailedToastForSnapshot(CodecSnapshot snapshot) {
+        Toast.makeText(context,
+                nativePatchUnsupported
+                        && snapshot != null
+                        && CodecLabelTable.isLhdc(snapshot.activeCodecType)
+                        ? Strings.TOAST_NATIVE_PATCH_UNSUPPORTED
+                        : Strings.TOAST_APPLY_FAILED,
+                Toast.LENGTH_SHORT).show();
     }
 
     private interface WriteFailureHandler {
@@ -1722,7 +1806,7 @@ public final class CodecController {
             setBlockDisabled(sub, false);
             if (ex != null) {
                 MLog.e("setOptionalCodecs future failed", ex);
-                Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                showWriteFailedToastForSnapshot(lastSnapshot.get());
                 refreshSnapshot(sub);
                 return;
             }
@@ -1737,7 +1821,7 @@ public final class CodecController {
                     if (enable && applyHighQualityCodecFallback(sub, result.rollbackSnapshot)) {
                         return;
                     }
-                    Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                    showWriteFailedToastForSnapshot(result.rollbackSnapshot);
                     if (result.rollbackSnapshot != null) {
                         publish(result.rollbackSnapshot, sub);
                     } else {
@@ -1749,7 +1833,7 @@ public final class CodecController {
                     if (enable && applyHighQualityCodecFallback(sub, lastSnapshot.get())) {
                         return;
                     }
-                    Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+                    showWriteFailedToastForSnapshot(lastSnapshot.get());
                     refreshSnapshot(sub);
                     break;
             }

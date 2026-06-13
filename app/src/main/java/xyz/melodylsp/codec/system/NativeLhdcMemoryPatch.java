@@ -54,6 +54,7 @@ final class NativeLhdcMemoryPatch {
     private static volatile String nativeLoadError;
     private static volatile boolean nativeLoadAttempted;
     private static volatile boolean nativeLoaded;
+    private static volatile PatchResult lastResult;
 
     private NativeLhdcMemoryPatch() {
     }
@@ -75,12 +76,19 @@ final class NativeLhdcMemoryPatch {
     }
 
     static PatchResult apply() {
+        PatchResult result;
         try {
-            return applyUnchecked();
+            result = applyUnchecked();
         } catch (Throwable t) {
-            return PatchResult.failed("exception:" + t.getClass().getSimpleName()
+            result = PatchResult.failed("exception:" + t.getClass().getSimpleName()
                     + ":" + t.getMessage());
         }
+        lastResult = result;
+        return result;
+    }
+
+    static PatchResult lastResult() {
+        return lastResult;
     }
 
     private static PatchResult applyUnchecked() throws Exception {

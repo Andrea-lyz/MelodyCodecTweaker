@@ -18,6 +18,10 @@ public final class CodecIpc {
     public static final String ACTION_SET_OPTIONAL_CODECS =
             "xyz.melodylsp.codec.action.SET_OPTIONAL_CODECS";
     public static final String ACTION_CODEC_STATE = "xyz.melodylsp.codec.action.CODEC_STATE";
+    public static final String ACTION_QUERY_NATIVE_PATCH =
+            "xyz.melodylsp.codec.action.QUERY_NATIVE_PATCH";
+    public static final String ACTION_NATIVE_PATCH_STATE =
+            "xyz.melodylsp.codec.action.NATIVE_PATCH_STATE";
 
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_REQUEST_ID = "request_id";
@@ -48,6 +52,11 @@ public final class CodecIpc {
     public static final String EXTRA_OPTIONAL_CODECS_ENABLED = "optional_codecs_enabled";
     public static final String EXTRA_OPTIONAL_CODECS_ENABLE = "optional_codecs_enable";
     public static final String EXTRA_READ_TIMESTAMP_MS = "read_timestamp_ms";
+    public static final String EXTRA_NATIVE_PATCH_STATUS = "native_patch_status";
+    public static final String EXTRA_NATIVE_PATCH_DETAIL = "native_patch_detail";
+    public static final String EXTRA_NATIVE_PATCH_PATCHED = "native_patch_patched";
+    public static final String EXTRA_NATIVE_PATCH_ORIGINAL = "native_patch_original";
+    public static final String EXTRA_NATIVE_PATCH_SUCCESS = "native_patch_success";
 
     public static final String TOKEN = "mlcdc-codec-v1";
 

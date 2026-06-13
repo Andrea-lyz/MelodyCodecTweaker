@@ -138,6 +138,12 @@ public final class FeedbackCollector {
         }
     }
 
+    public static boolean hasRootAccess() {
+        String result = runRootCommand("/system/bin/id", 3_000L);
+        return !result.startsWith("root command failed:")
+                && result.toLowerCase(Locale.ROOT).contains("uid=0");
+    }
+
     private static OutputTarget openTarget(Context context, String name) throws Exception {
         File root = Environment.getExternalStorageDirectory();
         File file = new File(root, name);
@@ -352,9 +358,13 @@ public final class FeedbackCollector {
     }
 
     private static String runRootCommand(String command) {
+        return runRootCommand(command, 10_000L);
+    }
+
+    private static String runRootCommand(String command, long timeoutMs) {
         StringBuilder failures = new StringBuilder();
         for (String su : SU_CANDIDATES) {
-            String result = runCommand(new String[]{su, "-c", command});
+            String result = runCommand(new String[]{su, "-c", command}, timeoutMs);
             if (!looksLikeRootCommandFailure(result)) {
                 return result;
             }
@@ -366,7 +376,7 @@ public final class FeedbackCollector {
                 "-c",
                 "PATH=/data/adb/ksu/bin:/data/adb/magisk:/system/bin:/system/xbin:/vendor/bin:/sbin:$PATH su -c \""
                         + shellEscape(command) + "\""
-        });
+        }, timeoutMs);
         if (!looksLikeRootCommandFailure(shellResult)) {
             return shellResult;
         }
@@ -399,6 +409,10 @@ public final class FeedbackCollector {
     }
 
     private static String runCommand(String[] command) {
+        return runCommand(command, 10_000L);
+    }
+
+    private static String runCommand(String[] command, long timeoutMs) {
         Process process = null;
         StreamCollector out = null;
         StreamCollector err = null;
@@ -408,7 +422,7 @@ public final class FeedbackCollector {
             err = new StreamCollector(process.getErrorStream());
             out.start();
             err.start();
-            boolean finished = process.waitFor(10, TimeUnit.SECONDS);
+            boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
             if (!finished) {
                 process.destroy();
             }

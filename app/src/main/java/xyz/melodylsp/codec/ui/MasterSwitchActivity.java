@@ -335,10 +335,26 @@ public final class MasterSwitchActivity extends Activity {
     }
 
     private void startRecordSession() {
-        String id = DiagnosticEvents.startSession(this);
-        diagPrefs = getSharedPreferences(DiagnosticEvents.PREFS, Context.MODE_PRIVATE);
-        Toast.makeText(this, "已开始记录：" + id, Toast.LENGTH_SHORT).show();
-        refresh();
+        Toast.makeText(this, "正在检测 root 权限...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            boolean rootGranted;
+            try {
+                rootGranted = FeedbackCollector.hasRootAccess();
+            } catch (Throwable t) {
+                rootGranted = false;
+            }
+            boolean finalRootGranted = rootGranted;
+            runOnUiThread(() -> {
+                String id = DiagnosticEvents.startSession(this);
+                diagPrefs = getSharedPreferences(DiagnosticEvents.PREFS, Context.MODE_PRIVATE);
+                Toast.makeText(this,
+                        finalRootGranted
+                                ? "已开始记录：" + id
+                                : "没有 root 权限，反馈包将缺少蓝牙日志",
+                        Toast.LENGTH_SHORT).show();
+                refresh();
+            });
+        }, "OPlusHeadsetAudioHelper-root-check").start();
     }
 
     private static void clearDynamicRows(LinearLayout parent) {

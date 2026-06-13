@@ -3,6 +3,7 @@ package xyz.melodylsp.codec.system;
 import android.app.Application;
 import android.bluetooth.BluetoothDevice;
 import android.content.Context;
+import android.content.Intent;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.Looper;
@@ -17,6 +18,7 @@ import java.util.List;
 import dalvik.system.DexFile;
 
 import xyz.melodylsp.codec.MelodyCodecLspEntry;
+import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.leaudio.BluetoothLeAudioBridge;
 import xyz.melodylsp.codec.util.MLog;
 
@@ -49,6 +51,7 @@ public final class SystemHookInstaller {
     private CodecBridgeService bridgeService;
     private CodecBroadcastBridge codecBroadcastBridge;
     private BluetoothLeAudioBridge leAudioBridge;
+    private Context appContext;
     private boolean serviceManagerAttempted;
     private boolean nativePatchTerminal;
     private boolean nativePatchRunning;
@@ -172,11 +175,12 @@ public final class SystemHookInstaller {
                 Object result = chain.proceed();
                 Object app = chain.getThisObject();
                 if (app instanceof Context) {
-                    NativeLhdcMemoryPatch.configureModuleContext((Context) app);
-                    MLog.setDiagnosticContext((Context) app, "bluetooth");
+                    appContext = ((Context) app).getApplicationContext();
+                    NativeLhdcMemoryPatch.configureModuleContext(appContext);
+                    MLog.setDiagnosticContext(appContext, "bluetooth");
                     MLog.event("scope.system.context.ready");
-                    ensureLeAudioBridge((Context) app);
-                    ensureCodecBroadcastBridge((Context) app, bridgeService);
+                    ensureLeAudioBridge(appContext);
+                    ensureCodecBroadcastBridge(appContext, bridgeService);
                     scheduleNativeLhdcMemoryPatch("application.onCreate");
                 }
                 return result;
@@ -437,6 +441,7 @@ public final class SystemHookInstaller {
                 "patched", result.patchedCount,
                 "original", result.originalCount,
                 "success", result.success);
+        sendNativePatchState(result);
 
         synchronized (this) {
             nativePatchRunning = false;
@@ -446,6 +451,24 @@ public final class SystemHookInstaller {
         }
         if (!result.terminal && allowRetry) {
             scheduleNativeLhdcMemoryPatch(reason);
+        }
+    }
+
+    private void sendNativePatchState(NativeLhdcMemoryPatch.PatchResult result) {
+        Context context = appContext;
+        if (context == null || result == null) return;
+        Intent intent = new Intent(CodecIpc.ACTION_NATIVE_PATCH_STATE);
+        intent.setPackage(CodecIpc.MELODY_PKG);
+        intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS, result.status);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_DETAIL, result.reason);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, result.patchedCount);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, result.originalCount);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_SUCCESS, result.success);
+        try {
+            context.sendBroadcast(intent);
+        } catch (Throwable t) {
+            MLog.w("native patch state broadcast failed", t);
         }
     }
 

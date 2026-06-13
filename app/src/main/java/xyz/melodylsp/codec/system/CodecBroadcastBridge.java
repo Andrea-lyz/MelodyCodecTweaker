@@ -34,6 +34,7 @@ public final class CodecBroadcastBridge {
         filter.addAction(CodecIpc.ACTION_QUERY_CODEC);
         filter.addAction(CodecIpc.ACTION_SET_CODEC);
         filter.addAction(CodecIpc.ACTION_SET_OPTIONAL_CODECS);
+        filter.addAction(CodecIpc.ACTION_QUERY_NATIVE_PATCH);
         try {
             context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
         } catch (Throwable t) {
@@ -55,10 +56,13 @@ public final class CodecBroadcastBridge {
         }
         String requestId = intent.getStringExtra(CodecIpc.EXTRA_REQUEST_ID);
         String mac = intent.getStringExtra(CodecIpc.EXTRA_MAC);
-        if (mac == null || mac.isEmpty()) return;
         try {
             String action = intent.getAction();
-            if (CodecIpc.ACTION_QUERY_CODEC.equals(action)) {
+            if (CodecIpc.ACTION_QUERY_NATIVE_PATCH.equals(action)) {
+                replyNativePatchState();
+            } else if (mac == null || mac.isEmpty()) {
+                return;
+            } else if (CodecIpc.ACTION_QUERY_CODEC.equals(action)) {
                 CodecSnapshot snapshot = service.getStatusUnchecked(mac);
                 reply(requestId, mac, snapshot, snapshot != null, CodecRequest.RESULT_OK);
                 MLog.event("codec.bt.reply", "ok", snapshot != null, "mac", mac);
@@ -116,10 +120,23 @@ public final class CodecBroadcastBridge {
         if (snapshot != null) {
             writeSnapshot(reply, snapshot);
         }
+        writeNativePatchState(reply);
         try {
             context.sendBroadcast(reply);
         } catch (Throwable t) {
             MLog.w("codec.bt.reply send failed", t);
+        }
+    }
+
+    void replyNativePatchState() {
+        Intent reply = new Intent(CodecIpc.ACTION_NATIVE_PATCH_STATE);
+        reply.setPackage(CodecIpc.MELODY_PKG);
+        reply.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+        writeNativePatchState(reply);
+        try {
+            context.sendBroadcast(reply);
+        } catch (Throwable t) {
+            MLog.w("codec.bt.native_patch.reply send failed", t);
         }
     }
 
@@ -149,5 +166,15 @@ public final class CodecBroadcastBridge {
         intent.putExtra(CodecIpc.EXTRA_OPTIONAL_CODECS_ENABLED,
                 snapshot.optionalCodecsEnabled);
         intent.putExtra(CodecIpc.EXTRA_READ_TIMESTAMP_MS, snapshot.readTimestampMs);
+    }
+
+    private static void writeNativePatchState(Intent intent) {
+        NativeLhdcMemoryPatch.PatchResult result = NativeLhdcMemoryPatch.lastResult();
+        if (result == null) return;
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS, result.status);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_DETAIL, result.reason);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, result.patchedCount);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, result.originalCount);
+        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_SUCCESS, result.success);
     }
 }
