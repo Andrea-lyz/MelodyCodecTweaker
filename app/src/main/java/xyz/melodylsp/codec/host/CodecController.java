@@ -2621,6 +2621,9 @@ public final class CodecController {
         if (CodecLabelTable.isLhdc(codecType)) {
             long optionByte = option & 0xFFL;
             long activeByte = active & 0xFFL;
+            if (isLhdcHighQuality(optionByte) && isLhdcHighQuality(activeByte)) {
+                return true;
+            }
             return optionByte == activeByte;
         }
         return option == active;

@@ -122,13 +122,12 @@ public final class CodecLabelTable {
     };
 
     /**
-     * User-facing LHDC choices keep OPPO's adaptive / connection-priority modes, while exposing
-     * 900 and 1000 kbps separately because some LHDC V5 earbuds cap fixed quality at 900 kbps.
+     * User-facing LHDC choices stay aligned with the original OPPO wording. Internally both
+     * fixed 900 and 1000 kbps map to "quality priority"; the picker keeps the simpler concept.
      */
     public static final long[] LHDC_QUALITY_STEPS = {
             LHDC_QUALITY_ABR,
             LHDC_QUALITY_MID_500,
-            LHDC_QUALITY_FIXED_900,
             LHDC_QUALITY_FIXED_1000
     };
 

@@ -50,8 +50,8 @@ public final class Strings {
     public static final String QUALITY_LHDC_STANDARD = "标准";
     public static final String QUALITY_LHDC_LOW_400 = "400 kbps";
     public static final String QUALITY_LHDC_MID_500 = "连接优先";
-    public static final String QUALITY_LHDC_FIXED_900 = "900 kbps";
-    public static final String QUALITY_LHDC_FIXED_1000 = "1000 kbps";
+    public static final String QUALITY_LHDC_FIXED_900 = "音质优先";
+    public static final String QUALITY_LHDC_FIXED_1000 = "音质优先";
     public static final String QUALITY_LHDC_ABR = "自适应";
     public static final String QUALITY_LHDC_BALANCED = "自适应";
     public static final String QUALITY_LHDC_HIGH = "音质优先";
