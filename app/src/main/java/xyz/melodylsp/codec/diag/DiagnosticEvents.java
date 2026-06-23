@@ -239,6 +239,8 @@ public final class DiagnosticEvents {
     private static String stateFromMessage(String message) {
         if (message.contains("success=true")
                 || message.contains("outcome=CONFIRMED")
+                || message.contains("evt=replay.stable")
+                || message.contains("evt=remember.write.delayed_confirmed")
                 || message.contains("status=patched")
                 || message.contains("status=already_patched")) {
             return "ok";
@@ -251,6 +253,7 @@ public final class DiagnosticEvents {
         if (message.contains("failed")
                 || message.contains("FAILED")
                 || message.contains("TIMEOUT")
+                || message.contains("evt=replay.unstable")
                 || message.contains("unsupported")
                 || message.contains("success=false")) {
             return "attention";

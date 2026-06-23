@@ -32,6 +32,8 @@ public final class ConnectionStateReplayer {
     private static final int STATE_CONNECTED = 2;
 
     private static final long REPLAY_DELAY_MS = 1_500L;
+    private static final long REPLAY_VERIFY_DELAY_MS = 2_000L;
+    private static final int MAX_REPLAY_WRITE_ATTEMPTS = 2;
 
     private final Context context;
     private final CodecBridgeClient bridge;
@@ -217,16 +219,29 @@ public final class ConnectionStateReplayer {
             String mac,
             PreferenceStore.RememberedValue stored,
             long generation) {
+        runReplayWorker(mac, stored, generation, 0);
+    }
+
+    private void runReplayWorker(
+            String mac,
+            PreferenceStore.RememberedValue stored,
+            long generation,
+            int attempt) {
         Thread worker = new Thread(() -> {
             if (!isCurrentReplay(mac, generation)) return;
-            replay(mac, stored);
+            replay(mac, stored, generation, attempt);
         }, "MelodyCodecLsp-replay");
         worker.setDaemon(true);
         worker.start();
     }
 
-    private void replay(String mac, PreferenceStore.RememberedValue stored) {
+    private void replay(
+            String mac,
+            PreferenceStore.RememberedValue stored,
+            long generation,
+            int attempt) {
         if (!replayEnabled) return;
+        if (!isReplayStillCurrent(mac, stored, generation)) return;
         if (!routeReadiness.isReadyOrUnknown(mac)) {
             synchronized (this) {
                 pendingReplays.put(mac, stored);
@@ -239,6 +254,15 @@ public final class ConnectionStateReplayer {
         if (live == null) {
             MLog.w("replay skipped, getStatus returned null mac="
                     + A2dpRouteReadiness.redactMac(mac));
+            scheduleReplayRetry(mac, stored, generation, attempt);
+            return;
+        }
+
+        if (matchesStoredValue(live, stored)) {
+            MLog.event("replay.already_applied",
+                    "mac", A2dpRouteReadiness.redactMac(mac),
+                    "attempt", attempt,
+                    "live", live);
             return;
         }
 
@@ -253,7 +277,7 @@ public final class ConnectionStateReplayer {
                     .bitsPerSample(0)
                     .channelMode(0)
                     .build();
-            dispatchReplay(req);
+            dispatchReplay(mac, stored, req, generation, attempt);
             return;
         }
 
@@ -266,6 +290,7 @@ public final class ConnectionStateReplayer {
                     "stored_codec", stored.codecType,
                     "stored_specific1", stored.codecSpecific1,
                     "stored_rate", stored.sampleRate);
+            scheduleReplayRetry(mac, stored, generation, attempt);
             return;
         }
 
@@ -274,25 +299,140 @@ public final class ConnectionStateReplayer {
         if (sampleRateSelectable) builder.withSampleRate(stored.sampleRate);
 
         CodecRequest req = builder.build();
-        dispatchReplay(req);
+        dispatchReplay(mac, stored, req, generation, attempt);
     }
 
-    private void dispatchReplay(CodecRequest req) {
-        MLog.event("replay.dispatch", "request", req);
-        bridge.setCodec(req).whenComplete((result, throwable) -> {
+    private void dispatchReplay(
+            String mac,
+            PreferenceStore.RememberedValue stored,
+            CodecRequest req,
+            long generation,
+            int attempt) {
+        MLog.event("replay.dispatch",
+                "attempt", attempt,
+                "request", req);
+        bridge.setCodec(req, () -> isReplayStillCurrent(mac, stored, generation))
+                .whenComplete((result, throwable) -> {
             if (throwable != null) {
                 MLog.e("replay future failed", throwable);
+            } else {
+                MLog.event("replay.outcome",
+                        "attempt", attempt,
+                        "path", result != null ? result.path : "unknown",
+                        "outcome", result != null ? result.outcome : "null");
+            }
+            if (throwable != null
+                    || result == null
+                    || result.outcome != WriteResult.Outcome.CONFIRMED) {
+                scheduleReplayRetry(mac, stored, generation, attempt);
+            }
+        });
+    }
+
+    private void scheduleReplayRetry(
+            String mac,
+            PreferenceStore.RememberedValue stored,
+            long generation,
+            int attempt) {
+        mainHandler.postDelayed(() -> {
+            if (!isReplayStillCurrent(mac, stored, generation)) return;
+            if (!routeReadiness.isReadyOrUnknown(mac)) {
+                MLog.event("replay.verify.skip_not_ready",
+                        "mac", A2dpRouteReadiness.redactMac(mac),
+                        "attempt", attempt);
                 return;
             }
-            MLog.event("replay.outcome",
-                    "path", result != null ? result.path : "unknown",
-                    "outcome", result != null ? result.outcome : "null");
-        });
+            Thread worker = new Thread(() -> {
+                if (!isReplayStillCurrent(mac, stored, generation)) return;
+                CodecSnapshot live = bridge.getStatus(mac);
+                if (live != null && matchesStoredValue(live, stored)) {
+                    MLog.event("replay.stable",
+                            "mac", A2dpRouteReadiness.redactMac(mac),
+                            "attempt", attempt,
+                            "live", live);
+                    return;
+                }
+                int nextAttempt = attempt + 1;
+                if (nextAttempt >= MAX_REPLAY_WRITE_ATTEMPTS) {
+                    MLog.event("replay.unstable",
+                            "mac", A2dpRouteReadiness.redactMac(mac),
+                            "attempts", MAX_REPLAY_WRITE_ATTEMPTS,
+                            "live", String.valueOf(live));
+                    return;
+                }
+                MLog.event("replay.retry",
+                        "mac", A2dpRouteReadiness.redactMac(mac),
+                        "attempt", nextAttempt,
+                        "live", String.valueOf(live));
+                replay(mac, stored, generation, nextAttempt);
+            }, "MelodyCodecLsp-replayVerify");
+            worker.setDaemon(true);
+            worker.start();
+        }, REPLAY_VERIFY_DELAY_MS);
+    }
+
+    private boolean isReplayStillCurrent(
+            String mac,
+            PreferenceStore.RememberedValue stored,
+            long generation) {
+        if (!isCurrentReplay(mac, generation)) return false;
+        PreferenceStore.RememberedValue current = prefs.readSnapshot(mac);
+        if (!sameRememberedValue(stored, current)) {
+            MLog.event("replay.stale.preference",
+                    "mac", A2dpRouteReadiness.redactMac(mac),
+                    "generation", generation);
+            return false;
+        }
+        return true;
     }
 
     private static boolean isStandardCodec(int codecType) {
         return codecType == CodecLabelTable.CODEC_SBC
                 || codecType == CodecLabelTable.CODEC_AAC;
+    }
+
+    private static boolean sameRememberedValue(
+            PreferenceStore.RememberedValue first,
+            PreferenceStore.RememberedValue second) {
+        if (first == second) return true;
+        if (first == null || second == null) return false;
+        return first.codecType == second.codecType
+                && first.codecSpecific1 == second.codecSpecific1
+                && first.sampleRate == second.sampleRate;
+    }
+
+    private static boolean matchesStoredValue(
+            CodecSnapshot live,
+            PreferenceStore.RememberedValue stored) {
+        if (live == null || stored == null) return false;
+        if (stored.codecType >= 0 && !sameCodecFamily(live.activeCodecType, stored.codecType)) {
+            return false;
+        }
+        if (isStandardCodec(stored.codecType)) return true;
+        if (stored.sampleRate > 0 && live.activeSampleRate != stored.sampleRate) {
+            return false;
+        }
+        if (stored.codecSpecific1 < 0L) return true;
+        if (CodecLabelTable.isLhdc(live.activeCodecType)
+                || CodecLabelTable.isLhdc(stored.codecType)) {
+            long active = live.activeCodecSpecific1 & 0xFFL;
+            long remembered = stored.codecSpecific1 & 0xFFL;
+            return active == remembered || isLhdcFixedCeilingPair(active, remembered);
+        }
+        return live.activeCodecSpecific1 == stored.codecSpecific1;
+    }
+
+    private static boolean sameCodecFamily(int activeCodecType, int storedCodecType) {
+        if (activeCodecType == storedCodecType) return true;
+        return CodecLabelTable.isLhdc(activeCodecType)
+                && CodecLabelTable.isLhdc(storedCodecType);
+    }
+
+    private static boolean isLhdcFixedCeilingPair(long first, long second) {
+        return (first == CodecLabelTable.LHDC_QUALITY_FIXED_900
+                && second == CodecLabelTable.LHDC_QUALITY_FIXED_1000)
+                || (first == CodecLabelTable.LHDC_QUALITY_FIXED_1000
+                && second == CodecLabelTable.LHDC_QUALITY_FIXED_900);
     }
 
     private static boolean arrayContains(long[] arr, long value) {

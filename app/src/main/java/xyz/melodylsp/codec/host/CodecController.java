@@ -85,6 +85,7 @@ public final class CodecController {
     private static final long CLASSIC_RESTORE_WINDOW_MS = 30_000L;
     private static final long HIGH_QUALITY_RETRY_DELAY_MS = 900L;
     private static final long AAC_HIGH_QUALITY_WARMUP_DELAY_MS = 650L;
+    private static final long REMEMBER_CONFIRM_RECHECK_DELAY_MS = 2_000L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
 
@@ -1721,6 +1722,11 @@ public final class CodecController {
                     refreshSnapshot(sub);
                     break;
                 case TIMEOUT_ROLLED_BACK:
+                    if (rememberOnConfirmed
+                            && failureHandler == null
+                            && prefs.isRemembered(sub.mac)) {
+                        recheckRememberedWriteAfterTimeout(sub, request, generation);
+                    }
                     if (failureHandler != null && failureHandler.onFailure(result, null)) return;
                     showWriteFailedToast(request);
                     if (result.rollbackSnapshot != null) {
@@ -1764,6 +1770,68 @@ public final class CodecController {
         }
         prefs.writeSnapshot(
                 sub.mac, request.codecType, request.codecSpecific1, request.sampleRate);
+    }
+
+    /**
+     * Vendor Bluetooth stacks can apply a requested LHDC sample rate after the regular
+     * confirmation window closes. Preserve the user's per-device memory only once that delayed
+     * state can be read back; a failed request is never persisted optimistically.
+     */
+    private void recheckRememberedWriteAfterTimeout(
+            Subscription sub,
+            CodecRequest request,
+            long generation) {
+        if (sub == null || sub.mac == null || request == null) return;
+        mainHandler.postDelayed(() -> {
+            if (!isCurrentCodecWrite(sub, generation) || !prefs.isRemembered(sub.mac)) return;
+            Thread worker = new Thread(() -> {
+                CodecSnapshot snapshot = bridge.getStatus(sub.mac);
+                if (!isCurrentCodecWrite(sub, generation) || !prefs.isRemembered(sub.mac)) {
+                    return;
+                }
+                if (!matchesRememberedRequest(snapshot, request)) {
+                    MLog.event("remember.write.delayed_skip",
+                            "request", request,
+                            "live", String.valueOf(snapshot));
+                    return;
+                }
+                writeRememberedConfirmedSnapshot(sub, request, snapshot);
+                MLog.event("remember.write.delayed_confirmed",
+                        "request", request,
+                        "live", snapshot);
+                mainHandler.post(() -> {
+                    if (isCurrentCodecWrite(sub, generation)) {
+                        publish(snapshot, sub);
+                    }
+                });
+            }, "MelodyCodecLsp-rememberConfirm");
+            worker.setDaemon(true);
+            worker.start();
+        }, REMEMBER_CONFIRM_RECHECK_DELAY_MS);
+    }
+
+    private static boolean matchesRememberedRequest(
+            CodecSnapshot snapshot,
+            CodecRequest request) {
+        if (snapshot == null || request == null) return false;
+        if (snapshot.activeCodecType != request.codecType) return false;
+        if (request.sampleRate != 0 && snapshot.activeSampleRate != request.sampleRate) {
+            return false;
+        }
+        if (request.codecType == CodecLabelTable.CODEC_AAC) return true;
+        if (CodecLabelTable.isLhdc(request.codecType)) {
+            long active = snapshot.activeCodecSpecific1 & 0xFFL;
+            long requested = request.codecSpecific1 & 0xFFL;
+            return active == requested || isLhdcFixedCeilingPair(active, requested);
+        }
+        return snapshot.activeCodecSpecific1 == request.codecSpecific1;
+    }
+
+    private static boolean isLhdcFixedCeilingPair(long first, long second) {
+        return (first == CodecLabelTable.LHDC_QUALITY_FIXED_900
+                && second == CodecLabelTable.LHDC_QUALITY_FIXED_1000)
+                || (first == CodecLabelTable.LHDC_QUALITY_FIXED_1000
+                && second == CodecLabelTable.LHDC_QUALITY_FIXED_900);
     }
 
     private boolean shouldShowNativePatchUnsupportedToast(CodecRequest request) {
