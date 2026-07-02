@@ -2207,6 +2207,7 @@ public final class CodecController {
         CodecSnapshot remembered = lastHighQualitySnapshots.get(sub.mac);
         PreferenceStore.RememberedValue rememberedValue = prefs.readSnapshot(sub.mac);
         int rememberedCodec = resolveSelectableCodecType(live, remembered);
+        boolean rememberedValueMatchesTarget = false;
         if (rememberedCodec >= 0) {
             codecType = rememberedCodec;
             specific1 = remembered.activeCodecSpecific1;
@@ -2216,7 +2217,9 @@ public final class CodecController {
         } else {
             codecType = bestSelectableHighQualityCodec(live.selectableCodecTypes);
             if (codecType < 0) return null;
-            specific1 = rememberedValue != null
+            rememberedValueMatchesTarget = rememberedValue != null
+                    && sameCodecFamily(rememberedValue.codecType, codecType);
+            specific1 = rememberedValueMatchesTarget
                     ? rememberedValue.codecSpecific1
                     : defaultHighQualitySpecific1(codecType);
         }
@@ -2227,7 +2230,7 @@ public final class CodecController {
         }
         int rememberedRate = remembered != null
                 ? remembered.activeSampleRate
-                : rememberedValue != null ? rememberedValue.sampleRate : 0;
+                : rememberedValueMatchesTarget ? rememberedValue.sampleRate : 0;
         sampleRate = chooseSampleRate(
                 selectableIntValue(live.selectableCodecSampleRates, capIndex),
                 rememberedRate,
@@ -2678,6 +2681,12 @@ public final class CodecController {
             }
         }
         return -1;
+    }
+
+    private static boolean sameCodecFamily(int firstCodecType, int secondCodecType) {
+        if (firstCodecType == secondCodecType) return true;
+        return CodecLabelTable.isLhdc(firstCodecType)
+                && CodecLabelTable.isLhdc(secondCodecType);
     }
 
     private static int selectableIntValue(int[] values, int index) {
