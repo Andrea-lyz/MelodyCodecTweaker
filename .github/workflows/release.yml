@@ -154,6 +154,9 @@ jobs:
             echo "- 版本：${VERSION_NAME} (${VERSION_CODE})"
             echo "- 分支：${GITHUB_REF_NAME}"
             echo "- 源提交：${GITHUB_SHA}"
+            echo
+            echo "## 支持作者"
+            echo "<img src=\"https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${TAG_NAME}/docs/PY_QR.png\" alt=\"微信 / 支付宝捐赠二维码\" width=\"600\" height=\"400\">"
           } > RELEASE_NOTES.md
 
       - name: Generate Gradle Wrapper
