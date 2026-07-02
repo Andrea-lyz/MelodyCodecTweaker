@@ -371,7 +371,23 @@ public final class HostHookInstaller {
             if (attempt < 14) {
                 scheduleSurfaceDispatch(fragment, attempt + 1);
             } else {
-                MLog.w("surface anchor not found after retries; class=" + fragment.getClass().getName());
+                boolean knownCodecSurface = false;
+                boolean hasScreen = false;
+                try {
+                    Object screen = PrefRef.getPreferenceScreen(fragment);
+                    hasScreen = screen != null;
+                    knownCodecSurface = hasScreen && isKnownCodecSurface(screen);
+                } catch (Throwable ignored) {
+                }
+                if (!knownCodecSurface) {
+                    MLog.event("surface.scan.skip_non_codec",
+                            "class", fragment.getClass().getName(),
+                            "screen", hasScreen,
+                            "attempts", attempt + 1);
+                } else {
+                    MLog.w("surface anchor not found after retries; class="
+                            + fragment.getClass().getName());
+                }
             }
         }, attempt == 0 ? 200L : 1000L);
     }

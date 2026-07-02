@@ -368,13 +368,16 @@ public final class ConnectionStateReplayer {
             CodecSnapshot live = bridge.getStatus(key);
             if (live == null) continue;
             matched++;
-            MLog.event("replay.bootstrap.remembered_status",
+            MLog.event("replay.bootstrap.live_vs_stored",
                     "mac", A2dpRouteReadiness.redactMac(key),
                     "pass", pass,
-                    "codec", live.activeCodecType,
-                    "rate", live.activeSampleRate,
-                    "specific1", live.activeCodecSpecific1);
-            maybeReplayConnected(key, REPLAY_DELAY_MS, "startup_remembered_status");
+                    "stored_codec", stored.codecType,
+                    "stored_rate", stored.sampleRate,
+                    "stored_specific1", stored.codecSpecific1,
+                    "live_codec", live.activeCodecType,
+                    "live_rate", live.activeSampleRate,
+                    "live_specific1", live.activeCodecSpecific1);
+            maybeReplayConnected(key, REPLAY_DELAY_MS, "startup_stored_snapshot");
         }
         if (candidates > 0 || alreadySeen.isEmpty()) {
             MLog.event("replay.bootstrap.remembered_probe",
