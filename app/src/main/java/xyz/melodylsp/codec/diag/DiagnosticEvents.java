@@ -69,7 +69,7 @@ public final class DiagnosticEvents {
         try {
             Intent intent = new Intent(ACTION_MEMORY_SNAPSHOT_REQUEST);
             intent.setPackage("com.oplus.melody");
-            context.sendBroadcast(intent);
+            context.sendOrderedBroadcast(intent, null);
         } catch (Throwable ignored) {
         }
     }
@@ -275,6 +275,9 @@ public final class DiagnosticEvents {
         if (message.contains("evt=lhdc.memory_patch")
                 || message.contains("evt=native.patch.state.recv")) {
             mark(editor, "native.patch", stateFromMessage(message), message, time);
+        }
+        if (message.contains("evt=dexkit.")) {
+            mark(editor, "dexkit", stateFromMessage(message), message, time);
         }
         if (message.contains("evt=write.")
                 || message.contains("evt=a2dp.setCodecConfigPreference")
@@ -540,6 +543,10 @@ public final class DiagnosticEvents {
         if (message.contains("success=true")
                 || message.contains("outcome=CONFIRMED")
                 || message.contains("evt=replay.stable")
+                || message.contains("evt=replay.already_applied")
+                || message.contains("evt=dexkit.bridge.created")
+                || message.contains("evt=dexkit.bridge.closed")
+                || message.contains("evt=dexkit.find.classes")
                 || message.contains("evt=remember.write.delayed_confirmed")
                 || message.contains("status=patched")
                 || message.contains("status=already_patched")) {
@@ -547,6 +554,7 @@ public final class DiagnosticEvents {
         }
         if (message.contains("skip")
                 || message.contains("pending")
+                || message.contains("evt=dexkit.find.empty")
                 || message.contains("waiting")) {
             return "pending";
         }
@@ -554,6 +562,7 @@ public final class DiagnosticEvents {
                 || message.contains("FAILED")
                 || message.contains("TIMEOUT")
                 || message.contains("evt=replay.unstable")
+                || message.contains("evt=dexkit.unavailable")
                 || message.contains("unsupported")
                 || message.contains("success=false")) {
             return "attention";

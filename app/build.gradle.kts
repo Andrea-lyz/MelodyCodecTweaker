@@ -64,6 +64,8 @@ android {
 dependencies {
     // Modern Xposed API. Provided by LSPosed at runtime.
     compileOnly("io.github.libxposed:api:101.0.1")
+    // Runtime dex scanner used to locate R8-renamed Melody host classes by stable strings.
+    implementation("org.luckypray:dexkit:2.2.0")
     // androidx.annotation is used inline (@NonNull etc.); we don't compile against
     // androidx.preference / lifecycle since the host APK ships R8-minified copies and we
     // route all access through reflection (see PrefRef).

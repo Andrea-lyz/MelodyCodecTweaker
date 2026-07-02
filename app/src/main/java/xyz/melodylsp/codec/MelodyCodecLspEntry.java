@@ -72,7 +72,8 @@ public final class MelodyCodecLspEntry extends XposedModule {
             return;
         }
         MLog.event("scope.host.start", "process", param.getApplicationInfo().processName);
-        new HostHookInstaller(this, param.getDefaultClassLoader()).install();
+        new HostHookInstaller(this, param.getDefaultClassLoader(),
+                param.getApplicationInfo().sourceDir).install();
     }
 
     private void installSystemScope(PackageLoadedParam param) {

@@ -104,6 +104,7 @@ public final class HostHookInstaller {
 
     private final MelodyCodecLspEntry module;
     private final ClassLoader classLoader;
+    private final DexKitHostResolver dexKit;
     private final Set<Object> attachedScreens =
             java.util.Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<Activity> knownActivities =
@@ -112,18 +113,26 @@ public final class HostHookInstaller {
     private CodecController controller;
     private boolean activityScanRegistered;
 
-    public HostHookInstaller(MelodyCodecLspEntry module, ClassLoader classLoader) {
+    public HostHookInstaller(
+            MelodyCodecLspEntry module,
+            ClassLoader classLoader,
+            String hostApkPath) {
         this.module = module;
         this.classLoader = classLoader;
+        this.dexKit = new DexKitHostResolver(hostApkPath);
     }
 
     public void install() {
-        hookApplicationOnCreate();
-        hookHighAudio();
-        hookBasePreferenceFragment();
-        hookOneSpace();
-        hookDetailMainActivity();
-        hookOneSpaceActivity();
+        try {
+            hookApplicationOnCreate();
+            hookHighAudio();
+            hookBasePreferenceFragment();
+            hookOneSpace();
+            hookDetailMainActivity();
+            hookOneSpaceActivity();
+        } finally {
+            dexKit.close();
+        }
     }
 
     private void hookApplicationOnCreate() {
@@ -643,16 +652,36 @@ public final class HostHookInstaller {
         // OneSpaceListFragment (com.oplus.melody.onespace.d) extends
         // com.coui.appcompat.preference.h directly — NOT com.oplus.melody.ui.base.c — so the
         // base-class hook does not cover it. Hook OneSpace explicitly.
-        Class<?> fragCls = loadHostClass(CLASS_ONE_SPACE_FRAGMENT);
-        if (fragCls == null) return;
-        Method onViewCreated = findOnViewCreated(fragCls);
-        if (onViewCreated == null) return;
-        module.hook(onViewCreated).intercept(chain -> {
-            Object result = chain.proceed();
-            Object fragment = chain.getThisObject();
-            scheduleSurfaceDispatch(fragment, /* attempt= */ 0);
-            return result;
-        });
+        java.util.List<String> names = new java.util.ArrayList<>();
+        names.add(CLASS_ONE_SPACE_FRAGMENT);
+        names.addAll(dexKit.findClassesUsingStrings(
+                "onespace.list.fragment",
+                "com.oplus.melody.onespace",
+                "pref_more_setting",
+                "pref_more_setting_category",
+                "pref_noise_switch",
+                "pref_noise_switch_category"));
+        java.util.Set<Method> hooked = new java.util.HashSet<>();
+        int count = 0;
+        for (String name : names) {
+            Class<?> fragCls = loadHostClass(name);
+            if (fragCls == null) continue;
+            Method onViewCreated = findOnViewCreated(fragCls);
+            if (onViewCreated == null || !hooked.add(onViewCreated)) continue;
+            module.hook(onViewCreated).intercept(chain -> {
+                Object result = chain.proceed();
+                Object fragment = chain.getThisObject();
+                scheduleSurfaceDispatch(fragment, /* attempt= */ 0);
+                return result;
+            });
+            count++;
+            MLog.event("onespace.fragment.hooked",
+                    "class", name,
+                    "methodOwner", onViewCreated.getDeclaringClass().getName());
+        }
+        if (count == 0) {
+            MLog.w("OneSpace direct fragment hook unavailable; activity scan fallback remains");
+        }
     }
 
     /**

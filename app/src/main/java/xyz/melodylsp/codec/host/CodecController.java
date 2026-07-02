@@ -2,6 +2,7 @@ package xyz.melodylsp.codec.host;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.Application;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
@@ -174,28 +175,96 @@ public final class CodecController {
 
     private void registerMemorySnapshotRequestReceiver() {
         if (memorySnapshotReceiver != null) return;
+        String processName = resolveProcessName(context);
+        if (!shouldRegisterMemorySnapshotReceiver(context, processName)) {
+            MLog.event("remember.snapshot.receiver",
+                    "registered", false,
+                    "process", safeProcessName(processName),
+                    "reason", "non_owner_process");
+            return;
+        }
+        int priority = memorySnapshotReceiverPriority(context, processName);
         memorySnapshotReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent intent) {
                 if (intent == null) return;
                 if (!DiagnosticEvents.ACTION_MEMORY_SNAPSHOT_REQUEST.equals(intent.getAction())) return;
                 prefs.emitDiagnosticSnapshot("request");
+                if (isOrderedBroadcast()) {
+                    abortBroadcast();
+                }
             }
         };
         IntentFilter filter = new IntentFilter(DiagnosticEvents.ACTION_MEMORY_SNAPSHOT_REQUEST);
+        filter.setPriority(priority);
         try {
             context.registerReceiver(memorySnapshotReceiver, filter, null, mainHandler,
                     Context.RECEIVER_EXPORTED);
-            MLog.event("remember.snapshot.receiver", "registered", true);
+            MLog.event("remember.snapshot.receiver",
+                    "registered", true,
+                    "process", safeProcessName(processName),
+                    "priority", priority);
         } catch (Throwable t) {
             try {
                 context.registerReceiver(memorySnapshotReceiver, filter, null, mainHandler);
-                MLog.event("remember.snapshot.receiver", "registered", true, "mode", "legacy");
+                MLog.event("remember.snapshot.receiver",
+                        "registered", true,
+                        "mode", "legacy",
+                        "process", safeProcessName(processName),
+                        "priority", priority);
             } catch (Throwable inner) {
                 memorySnapshotReceiver = null;
                 MLog.w("remember snapshot receiver registration failed", inner);
             }
         }
+    }
+
+    private static String resolveProcessName(Context context) {
+        try {
+            String name = Application.getProcessName();
+            if (name != null && !name.isEmpty()) return name;
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class<?> cls = Class.forName("android.app.ActivityThread");
+            Object value = cls.getMethod("currentProcessName").invoke(null);
+            if (value instanceof String && !((String) value).isEmpty()) return (String) value;
+        } catch (Throwable ignored) {
+        }
+        try {
+            return context != null ? context.getPackageName() : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean shouldRegisterMemorySnapshotReceiver(Context context, String processName) {
+        String packageName = packageName(context);
+        if (packageName == null || packageName.isEmpty()) return true;
+        if (processName == null || processName.isEmpty()) return true;
+        if (packageName.equals(processName)) return true;
+        return (packageName + ":fg").equals(processName);
+    }
+
+    private static int memorySnapshotReceiverPriority(Context context, String processName) {
+        String packageName = packageName(context);
+        if (packageName != null && !packageName.isEmpty()
+                && (packageName + ":fg").equals(processName)) {
+            return 1000;
+        }
+        return 0;
+    }
+
+    private static String packageName(Context context) {
+        try {
+            return context != null ? context.getPackageName() : null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String safeProcessName(String processName) {
+        return processName != null && !processName.isEmpty() ? processName : "unknown";
     }
 
     private void registerNativePatchStateReceiver() {
