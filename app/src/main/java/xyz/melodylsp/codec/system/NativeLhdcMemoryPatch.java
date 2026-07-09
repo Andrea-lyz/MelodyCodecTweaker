@@ -43,6 +43,12 @@ final class NativeLhdcMemoryPatch {
                     hex("1f0900f117000014283d805299008052"),
                     4,
                     hex("17000014")),
+            new PatternSpec(
+                    "branch_plus_73_plc110",
+                    hex("1f0900f122090054680f80529a008052"),
+                    hex("1f0900f149000014680f80529a008052"),
+                    4,
+                    hex("49000014")),
     };
     private static final int MAX_RANGE_BYTES = 64 * 1024 * 1024;
     private static volatile Method cachedStaticMprotect;

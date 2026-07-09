@@ -182,14 +182,14 @@ LHDC 的实时切换更依赖厂商蓝牙栈。模块会直接写入目标播放
 
 - 补丁按 `/system/lib64/libbluetooth_jni.so` 内目标函数附近的机器码 pattern 命中，不按手机型号写死白名单。
 - 同一 pattern 可能覆盖多个机型和多个系统小版本；只要蓝牙库目标函数机器码布局没有变化，通常不需要为每次小版本 OTA 单独适配。
-- 已实测一加 13、一加 15、一加 Ace 6 Pro、一加 Ace 6T、一加 12 在 ColorOS 金标版本上可命中现有 pattern，并解除系统侧对 LHDC V5 固定 1 Mbps 目标码率的限制。
+- 已实测一加 13、一加 15、一加 Ace 6 Pro、一加 Ace 6T、一加 12，以及用户反馈的 PLC110 `C16.0.8.300` 在 ColorOS 金标版本上可命中现有 pattern，并解除系统侧对 LHDC V5 固定 1 Mbps 目标码率的限制。
 - 最终是否稳定显示 1000 kbps 还取决于耳机、耳机固件、当前采样率和蓝牙栈协商结果；部分 LHDC V5 设备组合可能会把「音质优先」确认到实际可用最高挡位，例如 900 kbps。
 
 补丁流程：
 
 - 在 `com.android.bluetooth` 进程内加载 APK 自带的 `libmelody_lhdc_patch.so`。
 - 扫描当前已映射的 `/system/lib64/libbluetooth_jni.so`。
-- 按已知蓝牙库族的机器码字节特征匹配目标函数；当前已覆盖实测的 `branch_plus_69`、`branch_plus_23_op15` 等变体。
+- 按已知蓝牙库族的机器码字节特征匹配目标函数；当前已覆盖实测的 `branch_plus_69`、`branch_plus_23_op15`、`branch_plus_73_plc110` 等变体。
 - 只有在某个已知特征唯一命中时，才临时修改目标内存页权限并写入对应 4 字节补丁。
 - 写入后立即回读验证，并恢复原内存页权限。
 - 不替换系统文件，不复制系统库，不创建 KernelSU / Magisk mount。
