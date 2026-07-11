@@ -33,6 +33,8 @@ public final class LeAudioIpc {
     public static final String EXTRA_MAC = "mac";
     /** boolean, the requested enable state for {@link #ACTION_SET_LE_AUDIO}. */
     public static final String EXTRA_ENABLE = "enable";
+    /** boolean, query-side hint that a fresh OEM/profile event warrants reconnect repair. */
+    public static final String EXTRA_REPAIR_CONNECTION = "repair_connection";
     /** boolean, whether the device supports LE Audio (in {@link #ACTION_LE_AUDIO_STATE}). */
     public static final String EXTRA_SUPPORTED = "supported";
     /** boolean, whether LE Audio is currently enabled (in {@link #ACTION_LE_AUDIO_STATE}). */

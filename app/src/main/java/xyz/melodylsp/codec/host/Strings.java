@@ -24,7 +24,7 @@ public final class Strings {
     public static final String STATE_SWITCHING_CODEC = "正在切换…";
 
     public static final String BANNER_VIA_SETTINGS = "已写入开发者选项";
-    public static final String BANNER_VIA_ROOT = "已通过 root 写入开发者选项，蓝牙正在重连";
+    public static final String BANNER_VIA_ROOT = "已通过 root 写入开发者选项并确认生效";
     public static final String TOAST_APPLY_FAILED = "切换未生效，请重试";
     public static final String TOAST_NATIVE_PATCH_UNSUPPORTED = "未适配，请联系开发者反馈";
     public static final String TOAST_A2DP_WAITING = "等待耳机就绪";
@@ -62,8 +62,10 @@ public final class Strings {
     // leaudio.LeAudioStrings because the dialog is shown from the wirelesssettings process.
     public static final String LE_AUDIO_TITLE = "LE Audio";
     public static final String LE_AUDIO_SUMMARY_ON = "已开启（LC3 低功耗音频）";
+    public static final String LE_AUDIO_SUMMARY_CONNECTING = "已开启，正在连接 LE Audio…";
     public static final String LE_AUDIO_SUMMARY_OFF = "已关闭（经典蓝牙音频）";
     public static final String LE_AUDIO_SUMMARY_UNKNOWN = "正在获取状态…";
+    public static final String STATE_LE_AUDIO_CONNECTING = "LE Audio 正在连接…";
 
     private Strings() {
     }

@@ -5,6 +5,7 @@ import android.util.Log;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Pattern;
 
 import io.github.libxposed.api.XposedInterface;
 import xyz.melodylsp.codec.BuildConfig;
@@ -26,6 +27,8 @@ public final class MLog {
     private static final Object PENDING_LOCK = new Object();
     private static final List<PendingDiagnostic> pendingDiagnostics = new ArrayList<>();
     private static final int MAX_PENDING_DIAGNOSTICS = 128;
+    private static final Pattern BLUETOOTH_ADDRESS = Pattern.compile(
+            "(?i)([0-9a-f]{2}):(?:[0-9a-f]{2}:){4}([0-9a-f]{2})");
 
     private MLog() {
     }
@@ -106,22 +109,25 @@ public final class MLog {
 
     private static void emit(int priority, String message, Throwable t) {
         long time = System.currentTimeMillis();
-        String prefixed = prefix() + message;
+        String prefixed = prefix() + redactBluetoothAddresses(message);
+        String safeStack = t != null
+                ? redactBluetoothAddresses(Log.getStackTraceString(t))
+                : null;
         if (t == null) {
             Log.println(priority, TAG, prefixed);
         } else {
-            Log.println(priority, TAG, prefixed + '\n' + Log.getStackTraceString(t));
+            Log.println(priority, TAG, prefixed + '\n' + safeStack);
         }
         XposedInterface api = xposed;
         if (api != null) {
             try {
                 if (t == null) api.log(priority, TAG, prefixed);
-                else api.log(priority, TAG, prefixed, t);
+                else api.log(priority, TAG, prefixed + '\n' + safeStack);
             } catch (Throwable swallow) {
                 // Logging never crashes the app.
             }
         }
-        String diagnosticMessage = t == null ? prefixed : prefixed + '\n' + Log.getStackTraceString(t);
+        String diagnosticMessage = t == null ? prefixed : prefixed + '\n' + safeStack;
         Context context = diagnosticContext;
         if (context != null) {
             DiagnosticEvents.send(context, diagnosticScope, priority, diagnosticMessage, time);
@@ -132,6 +138,11 @@ public final class MLog {
 
     private static String prefix() {
         return "[mod=" + BuildConfig.VERSION_NAME + " host=" + hostVersion + "] ";
+    }
+
+    static String redactBluetoothAddresses(String value) {
+        if (value == null || value.isEmpty()) return value;
+        return BLUETOOTH_ADDRESS.matcher(value).replaceAll("$1:**:**:**:**:$2");
     }
 
     private static void enqueuePendingDiagnostic(int priority, String message, long time) {

@@ -27,6 +27,7 @@ import xyz.melodylsp.codec.bridge.ICodecBridgeListener;
 import xyz.melodylsp.codec.bt.BluetoothCodecReflect;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.util.MLog;
+import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /**
  * Encapsulates the three-tier write strategy described in design.md §Component 6:
@@ -406,7 +407,7 @@ public final class CodecBridgeClient {
         boolean wrote = settingsFallback.apply(request);
         if (wrote) {
             MLog.event("write.path", "path", "SETTINGS_GLOBAL");
-            return CompletableFuture.completedFuture(WriteResult.confirmed(WriteResult.Path.SETTINGS_GLOBAL));
+            return awaitConfirmation(request, WriteResult.Path.SETTINGS_GLOBAL);
         }
 
         // Path D — root shell. Run on a worker thread because exec'ing su can block for ~1 s
@@ -414,16 +415,38 @@ public final class CodecBridgeClient {
         CompletableFuture<WriteResult> rootFuture = new CompletableFuture<>();
         Thread worker = new Thread(() -> {
             try {
-                boolean ok = rootFallback.apply(request);
-                if (ok) {
+                if (!shouldContinue(shouldContinue)) {
+                    rootFuture.complete(staleWriteResult(
+                            request, WriteResult.Path.ROOT_SHELL).join());
+                    return;
+                }
+                RootShellFallback.ApplyResult applyResult =
+                        rootFallback.stageSettings(request, shouldContinue);
+                if (applyResult == RootShellFallback.ApplyResult.SETTINGS_STAGED) {
                     MLog.event("write.path", "path", "ROOT_SHELL");
-                    // Wait for the bluetooth-toggle in the root script to bring A2DP back, then
-                    // poll once to see whether the spec1/sample-rate stuck. We resolve as
-                    // CONFIRMED even if we cannot read it back, because the kernel does not
-                    // emit a CODEC_CONFIG_CHANGED broadcast for global-settings-driven changes
-                    // until the next track plays — pretending it failed would falsely toast.
-                    rootFuture.complete(WriteResult.confirmed(WriteResult.Path.ROOT_SHELL));
+                    // Root only staged developer-option values. Confirm against the live codec;
+                    // no successful shell exit is treated as proof that A2DP renegotiated.
+                    if (!shouldContinue(shouldContinue)) {
+                        rootFuture.complete(staleWriteResult(
+                                request, WriteResult.Path.ROOT_SHELL).join());
+                    } else {
+                        awaitConfirmation(request, WriteResult.Path.ROOT_SHELL)
+                                .whenComplete((confirmed, confirmError) -> {
+                                    if (confirmError != null) {
+                                        rootFuture.complete(WriteResult.failed(
+                                                WriteResult.Path.ROOT_SHELL,
+                                                unwrap(confirmError)));
+                                    } else {
+                                        rootFuture.complete(confirmed);
+                                    }
+                                });
+                    }
                 } else {
+                    if (!shouldContinue(shouldContinue)) {
+                        rootFuture.complete(staleWriteResult(
+                                request, WriteResult.Path.ROOT_SHELL).join());
+                        return;
+                    }
                     MLog.e("All write paths failed; nothing was applied");
                     rootFuture.complete(WriteResult.failed(WriteResult.Path.ROOT_SHELL,
                             new IllegalStateException("no usable write path (root denied or absent)")));
@@ -500,14 +523,16 @@ public final class CodecBridgeClient {
             }
             latch.countDown();
         });
-        registerCodecReplyReceiver(receiver);
+        if (!registerCodecReplyReceiver(receiver)) return null;
         try {
             Intent intent = new Intent(CodecIpc.ACTION_QUERY_CODEC);
             intent.setPackage(CodecIpc.BLUETOOTH_PKG);
             intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
             intent.putExtra(CodecIpc.EXTRA_REQUEST_ID, requestId);
             intent.putExtra(CodecIpc.EXTRA_MAC, mac);
-            context.sendBroadcast(intent);
+            if (!TrustedBroadcasts.send(context, intent)) {
+                return null;
+            }
             boolean delivered = latch.await(timeoutMs, TimeUnit.MILLISECONDS);
             if (!delivered) {
                 MLog.w("codec broadcast query timed out");
@@ -540,12 +565,14 @@ public final class CodecBridgeClient {
             }
             latch.countDown();
         });
-        registerCodecReplyReceiver(receiver);
+        if (!registerCodecReplyReceiver(receiver)) return CodecRequest.RESULT_DENIED;
         try {
             Intent intent = new Intent(CodecIpc.ACTION_SET_CODEC);
             intent.setPackage(CodecIpc.BLUETOOTH_PKG);
             writeRequest(intent, requestId, request);
-            context.sendBroadcast(intent);
+            if (!TrustedBroadcasts.send(context, intent)) {
+                return CodecRequest.RESULT_ERROR;
+            }
             boolean delivered = latch.await(timeoutMs, TimeUnit.MILLISECONDS);
             if (!delivered) {
                 MLog.w("codec broadcast set timed out");
@@ -575,7 +602,7 @@ public final class CodecBridgeClient {
             }
             latch.countDown();
         });
-        registerCodecReplyReceiver(receiver);
+        if (!registerCodecReplyReceiver(receiver)) return CodecRequest.RESULT_DENIED;
         try {
             Intent intent = new Intent(CodecIpc.ACTION_SET_OPTIONAL_CODECS);
             intent.setPackage(CodecIpc.BLUETOOTH_PKG);
@@ -583,7 +610,9 @@ public final class CodecBridgeClient {
             intent.putExtra(CodecIpc.EXTRA_REQUEST_ID, requestId);
             intent.putExtra(CodecIpc.EXTRA_MAC, mac);
             intent.putExtra(CodecIpc.EXTRA_OPTIONAL_CODECS_ENABLE, enable);
-            context.sendBroadcast(intent);
+            if (!TrustedBroadcasts.send(context, intent)) {
+                return CodecRequest.RESULT_ERROR;
+            }
             boolean delivered = latch.await(timeoutMs, TimeUnit.MILLISECONDS);
             if (!delivered) {
                 MLog.w("optional codec broadcast set timed out");
@@ -612,6 +641,14 @@ public final class CodecBridgeClient {
                 if (!CodecIpc.TOKEN.equals(intent.getStringExtra(CodecIpc.EXTRA_TOKEN))) {
                     return;
                 }
+                if (TrustedBroadcasts.supportsSenderIdentity()
+                        && !TrustedBroadcasts.isTrustedSender(
+                        context,
+                        TrustedBroadcasts.captureSender(this),
+                        CodecIpc.BLUETOOTH_PKG)) {
+                    MLog.w("codec broadcast reply rejected: untrusted sender");
+                    return;
+                }
                 String incomingId = intent.getStringExtra(CodecIpc.EXTRA_REQUEST_ID);
                 if (requestId != null && !requestId.equals(incomingId)) {
                     return;
@@ -621,13 +658,14 @@ public final class CodecBridgeClient {
         };
     }
 
-    private void registerCodecReplyReceiver(BroadcastReceiver receiver) {
+    private boolean registerCodecReplyReceiver(BroadcastReceiver receiver) {
         IntentFilter filter = new IntentFilter(CodecIpc.ACTION_CODEC_STATE);
-        try {
-            context.registerReceiver(receiver, filter, null, ipcHandler, Context.RECEIVER_EXPORTED);
-        } catch (Throwable t) {
-            context.registerReceiver(receiver, filter, null, ipcHandler);
-        }
+        return TrustedBroadcasts.registerExportedReceiver(
+                context,
+                receiver,
+                filter,
+                TrustedBroadcasts.PERMISSION_BLUETOOTH_PRIVILEGED,
+                ipcHandler);
     }
 
     private void unregisterQuietly(BroadcastReceiver receiver) {
@@ -709,16 +747,29 @@ public final class CodecBridgeClient {
             CodecRequest request, WriteResult.Path path) {
         CompletableFuture<WriteResult> future = new CompletableFuture<>();
         AtomicReference<BroadcastReceiver> receiverRef = new AtomicReference<>();
+        AtomicBoolean readInFlight = new AtomicBoolean(false);
+        AtomicBoolean timeoutExpired = new AtomicBoolean(false);
+
+        Runnable probe = () -> {
+            if (future.isDone() || !readInFlight.compareAndSet(false, true)) return;
+            readStatusAsync(request.mac, s -> {
+                readInFlight.set(false);
+                if (future.isDone()) return;
+                if (s != null && matches(s, request)) {
+                    completeWith(future, WriteResult.confirmed(path, s), receiverRef);
+                } else if (timeoutExpired.get()) {
+                    MLog.event("write.timeout", "request", request, "live", String.valueOf(s));
+                    completeWith(future, WriteResult.rolledBack(path, s), receiverRef);
+                }
+            });
+        };
 
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent intent) {
                 if (!ACTION_CODEC_CONFIG_CHANGED.equals(intent.getAction())) return;
                 if (future.isDone()) return;
-                CodecSnapshot s = safeReadStatus(request.mac);
-                if (s != null && matches(s, request)) {
-                    completeWith(future, WriteResult.confirmed(path, s), receiverRef);
-                }
+                mainHandler.post(probe);
             }
         };
         receiverRef.set(receiver);
@@ -732,13 +783,8 @@ public final class CodecBridgeClient {
 
         mainHandler.postDelayed(() -> {
             if (future.isDone()) return;
-            CodecSnapshot s = safeReadStatus(request.mac);
-            if (s != null && matches(s, request)) {
-                completeWith(future, WriteResult.confirmed(path, s), receiverRef);
-            } else {
-                MLog.event("write.timeout", "request", request, "live", String.valueOf(s));
-                completeWith(future, WriteResult.rolledBack(path, s), receiverRef);
-            }
+            timeoutExpired.set(true);
+            probe.run();
         }, confirmTimeoutMs(request));
 
         return future;
@@ -755,16 +801,30 @@ public final class CodecBridgeClient {
             String mac, boolean enable, WriteResult.Path path) {
         CompletableFuture<WriteResult> future = new CompletableFuture<>();
         AtomicReference<BroadcastReceiver> receiverRef = new AtomicReference<>();
+        AtomicBoolean readInFlight = new AtomicBoolean(false);
+        AtomicBoolean timeoutExpired = new AtomicBoolean(false);
+
+        Runnable probe = () -> {
+            if (future.isDone() || !readInFlight.compareAndSet(false, true)) return;
+            readStatusAsync(mac, s -> {
+                readInFlight.set(false);
+                if (future.isDone()) return;
+                if (s != null && optionalMatches(s, enable)) {
+                    completeWith(future, WriteResult.confirmed(path), receiverRef);
+                } else if (timeoutExpired.get()) {
+                    MLog.event("write.optional.timeout",
+                            "mac", mac, "enable", enable, "live", String.valueOf(s));
+                    completeWith(future, WriteResult.rolledBack(path, s), receiverRef);
+                }
+            });
+        };
 
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent intent) {
                 if (!ACTION_CODEC_CONFIG_CHANGED.equals(intent.getAction())) return;
                 if (future.isDone()) return;
-                CodecSnapshot s = safeReadStatus(mac);
-                if (s != null && optionalMatches(s, enable)) {
-                    completeWith(future, WriteResult.confirmed(path), receiverRef);
-                }
+                mainHandler.post(probe);
             }
         };
         receiverRef.set(receiver);
@@ -777,14 +837,8 @@ public final class CodecBridgeClient {
 
         mainHandler.postDelayed(() -> {
             if (future.isDone()) return;
-            CodecSnapshot s = safeReadStatus(mac);
-            if (s != null && optionalMatches(s, enable)) {
-                completeWith(future, WriteResult.confirmed(path), receiverRef);
-            } else {
-                MLog.event("write.optional.timeout",
-                        "mac", mac, "enable", enable, "live", String.valueOf(s));
-                completeWith(future, WriteResult.rolledBack(path, s), receiverRef);
-            }
+            timeoutExpired.set(true);
+            probe.run();
         }, OPTIONAL_CONFIRM_TIMEOUT_MS);
 
         return future;
@@ -797,6 +851,17 @@ public final class CodecBridgeClient {
             MLog.w("safeReadStatus failed", t);
             return null;
         }
+    }
+
+    private void readStatusAsync(String mac, StatusReadCallback callback) {
+        statusHandler.post(() -> {
+            CodecSnapshot snapshot = safeReadStatus(mac);
+            mainHandler.post(() -> callback.onStatusRead(snapshot));
+        });
+    }
+
+    private interface StatusReadCallback {
+        void onStatusRead(CodecSnapshot snapshot);
     }
 
     private static boolean matches(CodecSnapshot snapshot, CodecRequest request) {

@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 
 import java.util.Map;
+import java.util.Locale;
 import java.util.TreeSet;
 
 import xyz.melodylsp.codec.util.MLog;
@@ -39,38 +40,43 @@ public final class PreferenceStore {
     }
 
     public boolean isRemembered(String mac) {
-        if (mac == null) return false;
-        return prefs().getBoolean(mac + KEY_REMEMBER_SUFFIX, false);
+        String key = normalizeMac(mac);
+        if (key == null) return false;
+        return prefs().getBoolean(key + KEY_REMEMBER_SUFFIX, false);
     }
 
     public void setRemembered(String mac, boolean remembered) {
-        if (mac == null) return;
+        String key = normalizeMac(mac);
+        if (key == null) return;
         SharedPreferences.Editor editor = prefs().edit();
-        editor.putBoolean(mac + KEY_REMEMBER_SUFFIX, remembered);
-        if (!remembered) {
+        if (remembered) {
+            editor.putBoolean(key + KEY_REMEMBER_SUFFIX, true);
+        } else {
             // Snapshot keys must vanish atomically with the toggle (Property 9).
-            editor.remove(mac + KEY_CODEC_TYPE_SUFFIX);
-            editor.remove(mac + KEY_SPECIFIC1_SUFFIX);
-            editor.remove(mac + KEY_SAMPLERATE_SUFFIX);
+            editor.remove(key + KEY_REMEMBER_SUFFIX);
+            editor.remove(key + KEY_CODEC_TYPE_SUFFIX);
+            editor.remove(key + KEY_SPECIFIC1_SUFFIX);
+            editor.remove(key + KEY_SAMPLERATE_SUFFIX);
         }
         if (!editor.commit()) {
-            MLog.w("remember.set commit failed mac=" + redact(mac));
+            MLog.w("remember.set commit failed mac=" + redact(key));
         }
-        MLog.event("remember.set", "mac", redact(mac), "remembered", remembered);
+        MLog.event("remember.set", "mac", redact(key), "remembered", remembered);
         emitDiagnosticSnapshot("remember_set");
     }
 
     public RememberedValue readSnapshot(String mac) {
-        if (mac == null) return null;
+        String key = normalizeMac(mac);
+        if (key == null) return null;
         SharedPreferences sp = prefs();
-        if (!sp.getBoolean(mac + KEY_REMEMBER_SUFFIX, false)) return null;
-        if (!sp.contains(mac + KEY_SPECIFIC1_SUFFIX)
-                || !sp.contains(mac + KEY_SAMPLERATE_SUFFIX)) {
+        if (!sp.getBoolean(key + KEY_REMEMBER_SUFFIX, false)) return null;
+        if (!sp.contains(key + KEY_SPECIFIC1_SUFFIX)
+                || !sp.contains(key + KEY_SAMPLERATE_SUFFIX)) {
             return null;
         }
-        int codecType = sp.getInt(mac + KEY_CODEC_TYPE_SUFFIX, CODEC_TYPE_UNKNOWN);
-        long specific1 = sp.getLong(mac + KEY_SPECIFIC1_SUFFIX, -1L);
-        int sampleRate = sp.getInt(mac + KEY_SAMPLERATE_SUFFIX, -1);
+        int codecType = sp.getInt(key + KEY_CODEC_TYPE_SUFFIX, CODEC_TYPE_UNKNOWN);
+        long specific1 = sp.getLong(key + KEY_SPECIFIC1_SUFFIX, -1L);
+        int sampleRate = sp.getInt(key + KEY_SAMPLERATE_SUFFIX, -1);
         return new RememberedValue(codecType, specific1, sampleRate);
     }
 
@@ -81,22 +87,23 @@ public final class PreferenceStore {
     }
 
     public void writeSnapshot(String mac, int codecType, long codecSpecific1, int sampleRate) {
-        if (mac == null) return;
+        String key = normalizeMac(mac);
+        if (key == null) return;
         SharedPreferences sp = prefs();
-        if (!sp.getBoolean(mac + KEY_REMEMBER_SUFFIX, false)) {
-            MLog.w("writeSnapshot ignored, remember=false mac=" + redact(mac));
+        if (!sp.getBoolean(key + KEY_REMEMBER_SUFFIX, false)) {
+            MLog.w("writeSnapshot ignored, remember=false mac=" + redact(key));
             return;
         }
         boolean committed = sp.edit()
-                .putInt(mac + KEY_CODEC_TYPE_SUFFIX, codecType)
-                .putLong(mac + KEY_SPECIFIC1_SUFFIX, codecSpecific1)
-                .putInt(mac + KEY_SAMPLERATE_SUFFIX, sampleRate)
+                .putInt(key + KEY_CODEC_TYPE_SUFFIX, codecType)
+                .putLong(key + KEY_SPECIFIC1_SUFFIX, codecSpecific1)
+                .putInt(key + KEY_SAMPLERATE_SUFFIX, sampleRate)
                 .commit();
         if (!committed) {
-            MLog.w("remember.write commit failed mac=" + redact(mac));
+            MLog.w("remember.write commit failed mac=" + redact(key));
         }
         MLog.event("remember.write",
-                "mac", redact(mac),
+                "mac", redact(key),
                 "codec", codecType,
                 "specific1", codecSpecific1,
                 "rate", sampleRate);
@@ -135,10 +142,11 @@ public final class PreferenceStore {
     private static TreeSet<String> rememberedMacs(Map<String, ?> all) {
         TreeSet<String> macs = new TreeSet<>();
         for (String key : all.keySet()) {
-            if (key.endsWith(KEY_REMEMBER_SUFFIX)) {
-                String mac = key.substring(0, key.length() - KEY_REMEMBER_SUFFIX.length());
-                if (mac != null && !mac.isEmpty()) macs.add(mac);
-            }
+            if (!key.endsWith(KEY_REMEMBER_SUFFIX)
+                    || !Boolean.TRUE.equals(all.get(key))) continue;
+            String mac = normalizeMac(
+                    key.substring(0, key.length() - KEY_REMEMBER_SUFFIX.length()));
+            if (mac != null) macs.add(mac);
         }
         return macs;
     }
@@ -155,6 +163,12 @@ public final class PreferenceStore {
     private static String redact(String mac) {
         if (mac == null || mac.length() < 5) return "??";
         return mac.substring(0, 2) + "**" + mac.substring(mac.length() - 2);
+    }
+
+    private static String normalizeMac(String mac) {
+        if (mac == null) return null;
+        String key = mac.trim().toUpperCase(Locale.ROOT);
+        return key.isEmpty() ? null : key;
     }
 
     /** Snapshot returned to ConnectionStateReplayer / UI on a remember=true MAC. */

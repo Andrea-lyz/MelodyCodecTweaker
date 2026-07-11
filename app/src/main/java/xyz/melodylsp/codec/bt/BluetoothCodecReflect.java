@@ -92,6 +92,7 @@ public final class BluetoothCodecReflect {
         return readSnapshotFromCodecStatus(mac, status, proxy, device);
     }
 
+    @android.annotation.SuppressLint("MissingPermission")
     private static boolean isConnected(BluetoothA2dp proxy, BluetoothDevice device) {
         try {
             String target = device.getAddress();

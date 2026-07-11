@@ -20,8 +20,10 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
@@ -88,7 +90,12 @@ public final class FeedbackCollector {
             "replay.stable",
             "replay.unstable",
             "write.timeout",
-            "ignore target bitrate"
+            "ignore target bitrate",
+            "LeAudio",
+            "le_audio",
+            "OplusLeAudio",
+            "CHANGE_LEA_CONN_STATE",
+            "ACL_CONNECTED"
     };
     private static final String[] MODULE_LOG_PATTERNS = {
             "MelodyCodecLsp",
@@ -348,21 +355,40 @@ public final class FeedbackCollector {
 
     private static String collectBluetoothLogcatRoot() {
         String tagged = runRootCommand(BLUETOOTH_LOGCAT_COMMAND);
-        if (!tagged.startsWith("root command failed:") && !tagged.trim().isEmpty()) {
-            String filtered = filterLog(tagged, BLUETOOTH_LOG_PATTERNS);
-            if (!filtered.trim().isEmpty()) {
-                return filtered;
-            }
-        }
-
         String all = runRootCommand("/system/bin/logcat -d -b all -t 30000");
         if (all.startsWith("root command failed:")) {
-            return "root logcat unavailable\n\n"
-                    + (tagged.startsWith("root command failed:")
-                    ? tagged + "\n\n--- full fallback ---\n" : "")
-                    + all;
+            if (!tagged.startsWith("root command failed:") && !tagged.trim().isEmpty()) {
+                return filterLog(tagged, BLUETOOTH_LOG_PATTERNS);
+            }
+            return "root logcat unavailable\n\n" + tagged
+                    + "\n\n--- full fallback ---\n" + all;
         }
-        return filterLog(all, BLUETOOTH_LOG_PATTERNS);
+        String taggedFiltered = tagged.startsWith("root command failed:")
+                ? ""
+                : filterLog(tagged, BLUETOOTH_LOG_PATTERNS);
+        String allFiltered = filterLog(all, BLUETOOTH_LOG_PATTERNS);
+        return mergeUniqueLogLines(taggedFiltered, allFiltered);
+    }
+
+    private static String mergeUniqueLogLines(String first, String second) {
+        Set<String> lines = new LinkedHashSet<>();
+        addLogLines(lines, first);
+        addLogLines(lines, second);
+        StringBuilder out = new StringBuilder();
+        for (String line : lines) {
+            out.append(line).append('\n');
+        }
+        return out.length() == 0
+                ? "root logcat succeeded, but no relevant bluetooth/module lines matched.\n"
+                : out.toString();
+    }
+
+    private static void addLogLines(Set<String> output, String text) {
+        if (text == null || text.isEmpty()
+                || text.startsWith("root logcat succeeded, but no relevant")) return;
+        for (String line : text.split("\\n")) {
+            if (!line.isEmpty()) output.add(line);
+        }
     }
 
     private static String filterLog(String all, String[] patterns) {

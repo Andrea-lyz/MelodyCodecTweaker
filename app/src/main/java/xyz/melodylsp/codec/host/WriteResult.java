@@ -10,7 +10,7 @@ public final class WriteResult {
         SYSTEM_BRIDGE,
         SYSTEM_BROADCAST,
         SETTINGS_GLOBAL,
-        /** {@code su} → {@code cmd settings put global …} + bluetooth toggle. */
+        /** {@code su} → stage {@code cmd settings put global …}; live state still needs readback. */
         ROOT_SHELL
     }
 

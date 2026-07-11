@@ -9,6 +9,7 @@ import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.util.MLog;
+import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /** A2DP codec endpoint running inside {@code com.android.bluetooth}. */
 public final class CodecBroadcastBridge {
@@ -27,7 +28,9 @@ public final class CodecBroadcastBridge {
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent intent) {
-                handleAsync(intent);
+                TrustedBroadcasts.SenderIdentity sender =
+                        TrustedBroadcasts.captureSender(this);
+                handleAsync(intent, sender);
             }
         };
         IntentFilter filter = new IntentFilter();
@@ -35,29 +38,35 @@ public final class CodecBroadcastBridge {
         filter.addAction(CodecIpc.ACTION_SET_CODEC);
         filter.addAction(CodecIpc.ACTION_SET_OPTIONAL_CODECS);
         filter.addAction(CodecIpc.ACTION_QUERY_NATIVE_PATCH);
-        try {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
-        } catch (Throwable t) {
-            context.registerReceiver(receiver, filter);
+        if (!TrustedBroadcasts.registerExportedReceiver(
+                context,
+                receiver,
+                filter,
+                TrustedBroadcasts.PERMISSION_OPLUS_COMPONENT_SAFE,
+                null)) {
+            MLog.w("codec.bt.receiver registration rejected: signature permission unavailable");
+            return;
         }
         registered = true;
         MLog.event("codec.bt.receiver.registered");
     }
 
-    private void handleAsync(Intent intent) {
-        new Thread(() -> handle(intent), "MelodyCodecLsp-codec").start();
+    private void handleAsync(
+            Intent intent, TrustedBroadcasts.SenderIdentity sender) {
+        new Thread(() -> handle(intent, sender), "MelodyCodecLsp-codec").start();
     }
 
-    private void handle(Intent intent) {
+    private void handle(Intent intent, TrustedBroadcasts.SenderIdentity sender) {
         if (intent == null) return;
         if (!CodecIpc.TOKEN.equals(intent.getStringExtra(CodecIpc.EXTRA_TOKEN))) {
-            MLog.w("codec bluetooth request rejected: bad token");
+            MLog.w("codec bluetooth request rejected: protocol mismatch");
             return;
         }
+        String action = intent.getAction();
+        if (!isAuthorizedRequest(action, sender)) return;
         String requestId = intent.getStringExtra(CodecIpc.EXTRA_REQUEST_ID);
         String mac = intent.getStringExtra(CodecIpc.EXTRA_MAC);
         try {
-            String action = intent.getAction();
             if (CodecIpc.ACTION_QUERY_NATIVE_PATCH.equals(action)) {
                 replyNativePatchState();
             } else if (mac == null || mac.isEmpty()) {
@@ -91,6 +100,29 @@ public final class CodecBroadcastBridge {
         }
     }
 
+    private boolean isAuthorizedRequest(
+            String action, TrustedBroadcasts.SenderIdentity sender) {
+        if (!TrustedBroadcasts.supportsSenderIdentity()) {
+            // Android 12/13 rely on the OPlus signature permission required at registration time.
+            return CodecIpc.ACTION_SET_CODEC.equals(action)
+                    || CodecIpc.ACTION_SET_OPTIONAL_CODECS.equals(action)
+                    || CodecIpc.ACTION_QUERY_CODEC.equals(action)
+                    || CodecIpc.ACTION_QUERY_NATIVE_PATCH.equals(action);
+        }
+        boolean trusted = TrustedBroadcasts.isTrustedSender(
+                context, sender, CodecIpc.MELODY_PKG);
+        if (trusted) return true;
+
+        boolean write = CodecIpc.ACTION_SET_CODEC.equals(action)
+                || CodecIpc.ACTION_SET_OPTIONAL_CODECS.equals(action);
+        if (write) {
+            MLog.w("codec bluetooth write rejected: sender identity unavailable or untrusted");
+            return false;
+        }
+        MLog.w("codec bluetooth query rejected: untrusted sender");
+        return false;
+    }
+
     private static CodecRequest readRequest(Intent intent) {
         return new CodecRequest(
                 intent.getStringExtra(CodecIpc.EXTRA_MAC),
@@ -122,7 +154,9 @@ public final class CodecBroadcastBridge {
         }
         writeNativePatchState(reply);
         try {
-            context.sendBroadcast(reply);
+            if (!TrustedBroadcasts.send(context, reply)) {
+                MLog.w("codec.bt.reply identity send failed");
+            }
         } catch (Throwable t) {
             MLog.w("codec.bt.reply send failed", t);
         }
@@ -134,7 +168,9 @@ public final class CodecBroadcastBridge {
         reply.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
         writeNativePatchState(reply);
         try {
-            context.sendBroadcast(reply);
+            if (!TrustedBroadcasts.send(context, reply)) {
+                MLog.w("codec.bt.native_patch.reply identity send failed");
+            }
         } catch (Throwable t) {
             MLog.w("codec.bt.native_patch.reply send failed", t);
         }

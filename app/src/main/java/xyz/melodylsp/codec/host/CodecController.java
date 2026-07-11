@@ -45,7 +45,6 @@ import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicReference;
 
 import dalvik.system.DexFile;
 
@@ -57,6 +56,7 @@ import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.storage.PreferenceStore;
 import xyz.melodylsp.codec.util.MLog;
+import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /**
  * Single host-side state owner. Each Surface attaches its {@link CodecPreferences} bag, the
@@ -100,7 +100,8 @@ public final class CodecController {
     private final ConnectionStateReplayer replayer;
     private final SurfaceRescanRequester surfaceRescanRequester;
     private final Map<Object, Subscription> subscriptions = new HashMap<>();
-    private final AtomicReference<CodecSnapshot> lastSnapshot = new AtomicReference<>();
+    /** Latest A2DP state is device-scoped; a single global value can write earphone A to B. */
+    private final Map<String, CodecSnapshot> lastSnapshotsByMac = new HashMap<>();
     private final xyz.melodylsp.codec.leaudio.LeAudioManager leAudioManager;
     private final Set<String> classicRestorePending = new LinkedHashSet<>();
     private final Map<String, Long> classicRestoreDeadlines = new HashMap<>();
@@ -162,7 +163,9 @@ public final class CodecController {
         intent.putExtra(CodecIpc.EXTRA_GAME_MODE_SOURCE,
                 source != null && !source.isEmpty() ? source : "host.game_sound");
         try {
-            context.sendBroadcast(intent);
+            if (!TrustedBroadcasts.send(context, intent)) {
+                MLog.w("game mode state broadcast was not delivered");
+            }
         } catch (Throwable t) {
             MLog.w("game mode state broadcast failed", t);
         }
@@ -227,25 +230,19 @@ public final class CodecController {
         };
         IntentFilter filter = new IntentFilter(DiagnosticEvents.ACTION_MEMORY_SNAPSHOT_REQUEST);
         filter.setPriority(priority);
-        try {
-            context.registerReceiver(memorySnapshotReceiver, filter, null, mainHandler,
-                    Context.RECEIVER_EXPORTED);
+        if (TrustedBroadcasts.registerExportedReceiver(
+                context,
+                memorySnapshotReceiver,
+                filter,
+                DiagnosticEvents.PERMISSION_MEMORY_SNAPSHOT_REQUEST,
+                mainHandler)) {
             MLog.event("remember.snapshot.receiver",
                     "registered", true,
                     "process", safeProcessName(processName),
                     "priority", priority);
-        } catch (Throwable t) {
-            try {
-                context.registerReceiver(memorySnapshotReceiver, filter, null, mainHandler);
-                MLog.event("remember.snapshot.receiver",
-                        "registered", true,
-                        "mode", "legacy",
-                        "process", safeProcessName(processName),
-                        "priority", priority);
-            } catch (Throwable inner) {
-                memorySnapshotReceiver = null;
-                MLog.w("remember snapshot receiver registration failed", inner);
-            }
+        } else {
+            memorySnapshotReceiver = null;
+            MLog.w("remember snapshot receiver registration failed");
         }
     }
 
@@ -297,23 +294,67 @@ public final class CodecController {
         return processName != null && !processName.isEmpty() ? processName : "unknown";
     }
 
+    private static String deviceKey(String mac) {
+        if (mac == null) return null;
+        String value = mac.trim();
+        return value.isEmpty() ? null : value.toUpperCase(Locale.ROOT);
+    }
+
+    static boolean sameDevice(String first, String second) {
+        String firstKey = deviceKey(first);
+        String secondKey = deviceKey(second);
+        return firstKey != null && firstKey.equals(secondKey);
+    }
+
+    private CodecSnapshot snapshotFor(Subscription sub) {
+        return sub != null ? snapshotForMac(sub.mac) : null;
+    }
+
+    private CodecSnapshot snapshotForMac(String mac) {
+        String key = deviceKey(mac);
+        if (key == null) return null;
+        CodecSnapshot snapshot = lastSnapshotsByMac.get(key);
+        return snapshot != null && sameDevice(mac, snapshot.mac) ? snapshot : null;
+    }
+
+    private void cacheSnapshot(CodecSnapshot snapshot) {
+        if (snapshot == null) return;
+        String key = deviceKey(snapshot.mac);
+        if (key != null) lastSnapshotsByMac.put(key, snapshot);
+    }
+
+    private void clearSnapshot(String mac) {
+        String key = deviceKey(mac);
+        if (key != null) lastSnapshotsByMac.remove(key);
+    }
+
+    private static boolean isSubscriptionActive(Subscription sub) {
+        return sub != null && sub.active;
+    }
+
     private void registerNativePatchStateReceiver() {
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent intent) {
+                if (TrustedBroadcasts.supportsSenderIdentity()
+                        && !TrustedBroadcasts.isTrustedSender(
+                        ctx,
+                        TrustedBroadcasts.captureSender(this),
+                        CodecIpc.BLUETOOTH_PKG)) {
+                    MLog.w("native patch state rejected: untrusted sender");
+                    return;
+                }
                 handleNativePatchState(intent);
             }
         };
         IntentFilter filter = new IntentFilter(CodecIpc.ACTION_NATIVE_PATCH_STATE);
-        try {
-            context.registerReceiver(receiver, filter, null, mainHandler,
-                    Context.RECEIVER_EXPORTED);
-        } catch (Throwable t) {
-            try {
-                context.registerReceiver(receiver, filter, null, mainHandler);
-            } catch (Throwable inner) {
-                MLog.w("native patch state receiver registration failed", inner);
-            }
+        if (!TrustedBroadcasts.registerExportedReceiver(
+                context,
+                receiver,
+                filter,
+                TrustedBroadcasts.PERMISSION_BLUETOOTH_PRIVILEGED,
+                mainHandler)) {
+            MLog.w("native patch state receiver registration failed");
         }
     }
 
@@ -328,7 +369,9 @@ public final class CodecController {
             Intent intent = new Intent(CodecIpc.ACTION_QUERY_NATIVE_PATCH);
             intent.setPackage(CodecIpc.BLUETOOTH_PKG);
             intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
-            context.sendBroadcast(intent);
+            if (!TrustedBroadcasts.send(context, intent)) {
+                MLog.w("native patch state query was not delivered");
+            }
         } catch (Throwable t) {
             MLog.w("native patch state query failed", t);
         }
@@ -361,8 +404,9 @@ public final class CodecController {
      */
     private void onLeAudioStateChanged(String mac) {
         boolean leOn = leAudioManager.isEnabled(mac);
+        boolean leConnected = leAudioManager.isConnected(mac);
         for (Subscription sub : subscriptions.values()) {
-            if (sub.mac == null || !sub.mac.equals(mac)) continue;
+            if (!isSubscriptionActive(sub) || !sameDevice(sub.mac, mac)) continue;
             applyLeAudioToSwitch(sub);
             if (leOn) {
                 if (isClassicRestorePending(mac)) {
@@ -372,11 +416,15 @@ public final class CodecController {
                     scheduleClassicAudioRefresh(sub);
                     continue;
                 }
+                if (!leConnected) {
+                    renderLeAudioConnecting(sub);
+                    continue;
+                }
                 // LC3 takes over the LE transport and A2DP reports DISCONNECTED. Keep the
                 // injected block interactive instead of treating that as "no earphone".
                 sub.connected = Boolean.TRUE;
-                CodecSnapshot snap = lastSnapshot.get();
-                if (snap != null && mac.equals(snap.mac) && !Boolean.FALSE.equals(sub.connected)) {
+                CodecSnapshot snap = snapshotFor(sub);
+                if (snap != null && !Boolean.FALSE.equals(sub.connected)) {
                     renderSnapshot(snap, sub, /* fromCache= */ false);
                 } else {
                     // LE Audio took over the transport; renderUnknown shows the LC3 state.
@@ -449,7 +497,7 @@ public final class CodecController {
             }
             Activity host = sub.hostActivity != null ? sub.hostActivity.get() : null;
             if (host == null || host == activity) {
-                sub.unregisterReceiver();
+                sub.dispose();
                 it.remove();
                 removed++;
             }
@@ -488,11 +536,10 @@ public final class CodecController {
 
         @Override
         public void onActivityDestroyed(Activity activity) {
-            // Guard against the host re-using a config-change-driven destroy: only clean up when
-            // the Activity is really finishing.
-            if (activity != null && !activity.isChangingConfigurations()) {
-                CodecController.this.onActivityDestroyed(activity);
-            }
+            // A configuration change creates a new Fragment/PreferenceScreen. Keeping the old
+            // receiver alive until a later attach leaks the destroyed Activity and can render
+            // asynchronous results into its dead view tree.
+            CodecController.this.onActivityDestroyed(activity);
         }
     }
 
@@ -502,7 +549,7 @@ public final class CodecController {
         // previous subscription first so its BroadcastReceiver is not orphaned (TODO A5).
         Subscription previous = subscriptions.remove(fragment);
         if (previous != null) {
-            previous.unregisterReceiver();
+            previous.dispose();
         }
         Subscription sub = new Subscription(mac, pref, fragment);
         sub.hostActivity = new java.lang.ref.WeakReference<>(activityFromFragment(fragment));
@@ -512,7 +559,9 @@ public final class CodecController {
         wireRememberToggle(sub);
         wireLeAudio(sub);
         sub.registerReceiver();
-        mainHandler.post(() -> refreshSnapshot(sub));
+        mainHandler.post(() -> {
+            if (isSubscriptionActive(sub)) refreshSnapshot(sub);
+        });
     }
 
     /** Bring the optional LE Audio switch to life (TODO B1 / B2). No-op when absent. */
@@ -549,6 +598,7 @@ public final class CodecController {
      * framework dialog as a final fallback.
      */
     private void showLeAudioConfirmDialog(Subscription sub, boolean enable) {
+        if (!isSubscriptionActive(sub)) return;
         Activity activity = resolveLiveActivity(sub);
         if (activity == null || activity.isFinishing()) {
             MLog.w("showLeAudioConfirmDialog: no live activity; skip");
@@ -594,25 +644,27 @@ public final class CodecController {
     }
 
     private void requestLeAudioToggle(Subscription sub, boolean enable) {
+        if (!isSubscriptionActive(sub)) return;
+        String mac = sub.mac;
         if (!enable) {
-            markClassicRestorePending(sub.mac);
-            restoreClassicAudioRowsForMac(sub.mac);
+            markClassicRestorePending(mac);
+            restoreClassicAudioRowsForMac(mac);
             requestSurfaceRescan("le.disable.request");
         } else {
-            clearClassicRestorePending(sub.mac);
+            clearClassicRestorePending(mac);
         }
-        leAudioManager.requestToggle(sub.mac, enable);
+        leAudioManager.requestToggle(mac, enable);
         if (!enable) {
-            scheduleClassicAudioRefreshForMac(sub.mac);
+            scheduleClassicAudioRefreshForMac(mac);
             requestSurfaceRescanDelayed("le.disable.sent", 1200L);
             requestSurfaceRescanDelayed("le.disable.sent", 3500L);
             requestSurfaceRescanDelayed("le.disable.sent", 7000L);
             mainHandler.postDelayed(() -> {
-                if (!isClassicRestorePending(sub.mac)) return;
-                if (leAudioManager.isEnabled(sub.mac)) {
-                    onLeAudioStateChanged(sub.mac);
+                if (!isClassicRestorePending(mac)) return;
+                if (leAudioManager.isEnabled(mac)) {
+                    onLeAudioStateChanged(mac);
                 } else {
-                    scheduleClassicAudioRefreshForMac(sub.mac);
+                    scheduleClassicAudioRefreshForMac(mac);
                     requestSurfaceRescan("le.disable.waiting_classic");
                 }
             }, 12_000L);
@@ -939,21 +991,28 @@ public final class CodecController {
 
     /** Reflect the tracked LE Audio state onto the switch widget (visibility + checked + summary). */
     private void applyLeAudioToSwitch(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
         Object sw = sub.prefs.leAudioSwitch;
         if (sw == null) return;
         boolean supported = leAudioManager.isSupported(sub.mac);
         PrefRef.setVisible(sw, supported);
         if (!supported) return;
         boolean enabled = leAudioManager.isEnabled(sub.mac);
+        boolean connected = leAudioManager.isConnected(sub.mac);
         PrefRef.setChecked(sw, enabled);
-        PrefRef.setSummary(sw, enabled ? Strings.LE_AUDIO_SUMMARY_ON : Strings.LE_AUDIO_SUMMARY_OFF);
+        PrefRef.setSummary(sw,
+                !enabled
+                        ? Strings.LE_AUDIO_SUMMARY_OFF
+                        : connected
+                        ? Strings.LE_AUDIO_SUMMARY_ON
+                        : Strings.LE_AUDIO_SUMMARY_CONNECTING);
     }
 
     private void restoreClassicAudioRowsForMac(String mac) {
         if (mac == null) return;
         markClassicRestorePending(mac);
         for (Subscription sub : subscriptions.values()) {
-            if (mac.equals(sub.mac)) {
+            if (isSubscriptionActive(sub) && sameDevice(mac, sub.mac)) {
                 restoreClassicAudioRows(sub);
             }
         }
@@ -962,13 +1021,14 @@ public final class CodecController {
     private void scheduleClassicAudioRefreshForMac(String mac) {
         if (mac == null) return;
         for (Subscription sub : subscriptions.values()) {
-            if (mac.equals(sub.mac)) {
+            if (isSubscriptionActive(sub) && sameDevice(mac, sub.mac)) {
                 scheduleClassicAudioRefresh(sub);
             }
         }
     }
 
     private void restoreClassicAudioRows(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
         sub.connected = Boolean.TRUE;
         sub.renderedLeAudioActive = false;
         if (sub.prefs.codecDisplay != null) {
@@ -994,6 +1054,7 @@ public final class CodecController {
     }
 
     private void scheduleClassicAudioRefresh(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
         refreshSnapshot(sub);
         refreshSnapshotDelayed(sub, 600L);
         refreshSnapshotDelayed(sub, 1200L);
@@ -1081,7 +1142,7 @@ public final class CodecController {
      */
     private void showCodecModePicker(Subscription sub, Object sourcePref) {
         if (!ensureA2dpReadyForUser(sub)) return;
-        CodecSnapshot snapshot = lastSnapshot.get();
+        CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
             Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
             return;
@@ -1159,7 +1220,7 @@ public final class CodecController {
      */
     private void showQualityPicker(Subscription sub, Object sourcePref) {
         if (!ensureA2dpReadyForUser(sub)) return;
-        CodecSnapshot snapshot = lastSnapshot.get();
+        CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
             Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
             return;
@@ -1219,7 +1280,7 @@ public final class CodecController {
 
     private void showSampleRatePicker(Subscription sub, Object sourcePref) {
         if (!ensureA2dpReadyForUser(sub)) return;
-        CodecSnapshot snapshot = lastSnapshot.get();
+        CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
             Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
             return;
@@ -1555,6 +1616,7 @@ public final class CodecController {
     }
 
     private static Activity resolveLiveActivity(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return null;
         Context ui = sub != null && sub.prefs != null ? sub.prefs.uiContext : null;
         Activity activity = findActivity(ui);
         if (activity == null && sub != null) {
@@ -1750,25 +1812,54 @@ public final class CodecController {
     }
 
     private boolean handleRememberChange(Subscription sub, Object value) {
-        if (!(value instanceof Boolean)) return false;
+        if (!isSubscriptionActive(sub) || !(value instanceof Boolean)) return false;
         boolean enabled = (Boolean) value;
         prefs.setRemembered(sub.mac, enabled);
         if (enabled) {
-            CodecSnapshot s = lastSnapshot.get();
             boolean a2dpReady = isA2dpReadyOrUnknown(sub);
-            if (a2dpReady && s != null && s.mac != null && s.mac.equals(sub.mac)) {
-                prefs.writeSnapshot(
-                        sub.mac, s.activeCodecType, s.activeCodecSpecific1, s.activeSampleRate);
-            } else if (!a2dpReady) {
+            if (a2dpReady) {
+                captureInitialRememberedSnapshotAsync(sub.mac, "toggle_enabled");
+            } else {
                 MLog.event("remember.write.skip",
-                        "reason", "a2dp_waiting",
+                        "reason", "a2dp_waiting_pending_capture",
                         "mac", A2dpRouteReadiness.redactMac(sub.mac));
             }
         }
         return true;
     }
 
+    private void captureInitialRememberedSnapshotAsync(String mac, String reason) {
+        if (mac == null || !prefs.isRemembered(mac) || prefs.readSnapshot(mac) != null) return;
+        Thread worker = new Thread(() -> {
+            CodecSnapshot snapshot = bridge.getStatus(mac);
+            mainHandler.post(() -> {
+                if (snapshot != null && sameDevice(mac, snapshot.mac)) {
+                    maybeInitializeRememberedSnapshot(snapshot, reason);
+                }
+            });
+        }, "MelodyCodecLsp-rememberCapture");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private void maybeInitializeRememberedSnapshot(CodecSnapshot snapshot, String reason) {
+        if (snapshot == null || snapshot.mac == null) return;
+        if (!prefs.isRemembered(snapshot.mac) || prefs.readSnapshot(snapshot.mac) != null) return;
+        prefs.writeSnapshot(
+                snapshot.mac,
+                snapshot.activeCodecType,
+                snapshot.activeCodecSpecific1,
+                snapshot.activeSampleRate);
+        MLog.event("remember.write.initialized",
+                "mac", A2dpRouteReadiness.redactMac(snapshot.mac),
+                "reason", reason,
+                "codec", snapshot.activeCodecType,
+                "specific1", snapshot.activeCodecSpecific1,
+                "rate", snapshot.activeSampleRate);
+    }
+
     private boolean ensureA2dpReadyForUser(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return false;
         if (isA2dpReadyOrUnknown(sub)) return true;
         renderA2dpWaiting(sub);
         Toast.makeText(context, Strings.TOAST_A2DP_WAITING, Toast.LENGTH_SHORT).show();
@@ -1778,7 +1869,7 @@ public final class CodecController {
     }
 
     private boolean isA2dpReadyOrUnknown(Subscription sub) {
-        return sub == null || routeReadiness.isReadyOrUnknown(sub.mac);
+        return isSubscriptionActive(sub) && routeReadiness.isReadyOrUnknown(sub.mac);
     }
 
     private void applyWrite(Subscription sub, CodecRequest request) {
@@ -1813,6 +1904,15 @@ public final class CodecController {
             long generation,
             WriteSuccessHandler successHandler,
             boolean rememberOnConfirmed) {
+        if (!isSubscriptionActive(sub)
+                || request == null
+                || !sameDevice(sub.mac, request.mac)) {
+            MLog.event("write.skip.device_mismatch",
+                    "subMac", redactedMac(sub),
+                    "requestMac", A2dpRouteReadiness.redactMac(
+                            request != null ? request.mac : null));
+            return;
+        }
         if (!isA2dpReadyOrUnknown(sub)) {
             renderA2dpWaiting(sub);
             Toast.makeText(context, Strings.TOAST_A2DP_WAITING, Toast.LENGTH_SHORT).show();
@@ -1889,7 +1989,7 @@ public final class CodecController {
             CodecSnapshot confirmedSnapshot) {
         if (sub == null || sub.mac == null || request == null) return;
         if (confirmedSnapshot != null
-                && sub.mac.equals(confirmedSnapshot.mac)
+                && sameDevice(sub.mac, confirmedSnapshot.mac)
                 && confirmedSnapshot.activeCodecType == request.codecType) {
             prefs.writeSnapshot(
                     sub.mac,
@@ -1913,10 +2013,14 @@ public final class CodecController {
             long generation) {
         if (sub == null || sub.mac == null || request == null) return;
         mainHandler.postDelayed(() -> {
-            if (!isCurrentCodecWrite(sub, generation) || !prefs.isRemembered(sub.mac)) return;
+            if (!isSubscriptionActive(sub)
+                    || !isCurrentCodecWrite(sub, generation)
+                    || !prefs.isRemembered(sub.mac)) return;
             Thread worker = new Thread(() -> {
                 CodecSnapshot snapshot = bridge.getStatus(sub.mac);
-                if (!isCurrentCodecWrite(sub, generation) || !prefs.isRemembered(sub.mac)) {
+                if (!isSubscriptionActive(sub)
+                        || !isCurrentCodecWrite(sub, generation)
+                        || !prefs.isRemembered(sub.mac)) {
                     return;
                 }
                 if (!matchesRememberedRequest(snapshot, request)) {
@@ -1930,7 +2034,7 @@ public final class CodecController {
                         "request", request,
                         "live", snapshot);
                 mainHandler.post(() -> {
-                    if (isCurrentCodecWrite(sub, generation)) {
+                    if (isSubscriptionActive(sub) && isCurrentCodecWrite(sub, generation)) {
                         publish(snapshot, sub);
                     }
                 });
@@ -1944,6 +2048,7 @@ public final class CodecController {
             CodecSnapshot snapshot,
             CodecRequest request) {
         if (snapshot == null || request == null) return false;
+        if (!sameDevice(snapshot.mac, request.mac)) return false;
         if (snapshot.activeCodecType != request.codecType) return false;
         if (request.sampleRate != 0 && snapshot.activeSampleRate != request.sampleRate) {
             return false;
@@ -1989,7 +2094,7 @@ public final class CodecController {
     }
 
     private synchronized long nextCodecWriteGeneration(Subscription sub) {
-        if (sub == null || sub.mac == null) return 0L;
+        if (!isSubscriptionActive(sub) || sub.mac == null) return 0L;
         long next = codecWriteGenerations.containsKey(sub.mac)
                 ? codecWriteGenerations.get(sub.mac) + 1L
                 : 1L;
@@ -1998,12 +2103,13 @@ public final class CodecController {
     }
 
     private synchronized boolean isCurrentCodecWrite(Subscription sub, long generation) {
-        if (generation == 0L || sub == null || sub.mac == null) return true;
+        if (!isSubscriptionActive(sub) || sub.mac == null || generation == 0L) return false;
         Long current = codecWriteGenerations.get(sub.mac);
         return current != null && current == generation;
     }
 
     private void applyOptionalCodecWrite(Subscription sub, boolean enable) {
+        if (!isSubscriptionActive(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         setCodecModeStatus(sub, Strings.STATE_SWITCHING_CODEC);
         setBlockDisabled(sub, true);
@@ -2025,7 +2131,7 @@ public final class CodecController {
             setBlockDisabled(sub, false);
             if (ex != null) {
                 MLog.e("setOptionalCodecs future failed", ex);
-                showWriteFailedToastForSnapshot(lastSnapshot.get());
+                showWriteFailedToastForSnapshot(snapshotFor(sub));
                 refreshSnapshot(sub);
                 return;
             }
@@ -2049,10 +2155,10 @@ public final class CodecController {
                     break;
                 case FAILED:
                 default:
-                    if (enable && applyHighQualityCodecFallback(sub, lastSnapshot.get())) {
+                    if (enable && applyHighQualityCodecFallback(sub, snapshotFor(sub))) {
                         return;
                     }
-                    showWriteFailedToastForSnapshot(lastSnapshot.get());
+                    showWriteFailedToastForSnapshot(snapshotFor(sub));
                     refreshSnapshot(sub);
                     break;
             }
@@ -2104,7 +2210,7 @@ public final class CodecController {
                         "path", result != null ? result.path : "unknown",
                         "attempt", attempt);
             }
-            CodecSnapshot live = result != null ? result.rollbackSnapshot : lastSnapshot.get();
+            CodecSnapshot live = result != null ? result.rollbackSnapshot : snapshotFor(sub);
             if (isHighQualityMode(live)) {
                 MLog.event("write.high_quality.partial_confirmed",
                         "attempt", attempt,
@@ -2144,7 +2250,7 @@ public final class CodecController {
             CodecSnapshot live,
             long generation) {
         if (!isCurrentCodecWrite(sub, generation)) return;
-        if (live == null || live.mac == null || !live.mac.equals(highQualityRequest.mac)) {
+        if (live == null || !sameDevice(live.mac, highQualityRequest.mac)) {
             MLog.event("write.high_quality.aac_warmup.skip",
                     "reason", "no_live_snapshot",
                     "request", highQualityRequest);
@@ -2194,7 +2300,9 @@ public final class CodecController {
     }
 
     private CodecRequest buildHighQualityCodecRequest(Subscription sub, CodecSnapshot live) {
-        if (sub == null || live == null || live.mac == null) return null;
+        if (!isSubscriptionActive(sub)
+                || live == null
+                || !sameDevice(sub.mac, live.mac)) return null;
         int codecType = -1;
         long specific1 = 0L;
         long specific2 = 0L;
@@ -2301,7 +2409,11 @@ public final class CodecController {
     }
 
     private void refreshSnapshot(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
+        long refreshGeneration = sub.beginRefresh();
+        if (refreshGeneration < 0L) return;
         Thread worker = new Thread(() -> {
+            if (!isSubscriptionActive(sub)) return;
             CodecSnapshot snapshot;
             try {
                 snapshot = bridge.getStatus(sub.mac);
@@ -2311,6 +2423,13 @@ public final class CodecController {
             }
             CodecSnapshot finalSnapshot = snapshot;
             mainHandler.post(() -> {
+                if (!isSubscriptionActive(sub)
+                        || !sub.isCurrentRefresh(refreshGeneration)) {
+                    MLog.event("snapshot.refresh.stale.ignore",
+                            "generation", refreshGeneration,
+                            "mac", redactedMac(sub));
+                    return;
+                }
                 if (Boolean.FALSE.equals(sub.connected)) {
                     publish(null, sub);
                 } else {
@@ -2323,16 +2442,29 @@ public final class CodecController {
     }
 
     private void refreshSnapshotDelayed(Subscription sub, long delayMs) {
-        mainHandler.postDelayed(() -> refreshSnapshot(sub), delayMs);
+        if (!isSubscriptionActive(sub)) return;
+        mainHandler.postDelayed(() -> {
+            if (isSubscriptionActive(sub)) refreshSnapshot(sub);
+        }, delayMs);
     }
 
     private void publish(CodecSnapshot snapshot, Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
+        // A pushed/rollback snapshot or the winning refresh supersedes every older query.
+        sub.invalidateRefreshes();
         if (snapshot != null) {
-            lastSnapshot.set(snapshot);
+            if (!sameDevice(sub.mac, snapshot.mac)) {
+                MLog.event("snapshot.publish.device_mismatch",
+                        "subMac", redactedMac(sub),
+                        "snapshotMac", A2dpRouteReadiness.redactMac(snapshot.mac));
+                return;
+            }
+            cacheSnapshot(snapshot);
+            maybeInitializeRememberedSnapshot(snapshot, "status_publish");
             rememberHighQualitySnapshot(snapshot);
         }
         if (snapshot == null) {
-            lastSnapshot.set(null);
+            clearSnapshot(sub.mac);
             renderUnknown(sub);
             return;
         }
@@ -2342,10 +2474,12 @@ public final class CodecController {
     private void onPushedSnapshot(CodecSnapshot snapshot) {
         if (snapshot == null || snapshot.mac == null) return;
         mainHandler.post(() -> {
-            lastSnapshot.set(snapshot);
+            cacheSnapshot(snapshot);
+            maybeInitializeRememberedSnapshot(snapshot, "bridge_push");
             rememberHighQualitySnapshot(snapshot);
             for (Subscription sub : subscriptions.values()) {
-                if (snapshot.mac.equals(sub.mac)) {
+                if (isSubscriptionActive(sub) && sameDevice(snapshot.mac, sub.mac)) {
+                    sub.invalidateRefreshes();
                     sub.connected = Boolean.TRUE;
                     renderSnapshot(snapshot, sub, /* fromCache= */ false);
                 }
@@ -2354,8 +2488,13 @@ public final class CodecController {
     }
 
     private void renderUnknown(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
         if (isClassicRestorePending(sub.mac)) {
             restoreClassicAudioRows(sub);
+            return;
+        }
+        if (leAudioManager.isEnabled(sub.mac) && !leAudioManager.isConnected(sub.mac)) {
+            renderLeAudioConnecting(sub);
             return;
         }
         sub.renderedLeAudioActive = false;
@@ -2388,7 +2527,7 @@ public final class CodecController {
     }
 
     private void renderA2dpWaiting(Subscription sub) {
-        if (sub == null || sub.prefs == null) return;
+        if (!isSubscriptionActive(sub) || sub.prefs == null) return;
         sub.connected = Boolean.TRUE;
         sub.renderedLeAudioActive = false;
         if (sub.prefs.codecDisplay != null) {
@@ -2408,6 +2547,9 @@ public final class CodecController {
     }
 
     private void renderSnapshot(CodecSnapshot snapshot, Subscription sub, boolean fromCache) {
+        if (!isSubscriptionActive(sub)
+                || snapshot == null
+                || !sameDevice(sub.mac, snapshot.mac)) return;
         // LE Audio override (TODO B): when LE Audio is on, the device runs LC3 over the LE
         // transport, so the A2DP codec / quality / sample-rate controls do not apply. Show
         // "蓝牙音质 : LC3" and hide the quality + sample-rate rows on BOTH surfaces.
@@ -2450,10 +2592,30 @@ public final class CodecController {
     }
 
     private boolean shouldRenderLeAudioActive(Subscription sub) {
-        return leAudioManager.isEnabled(sub.mac) && !isClassicRestorePending(sub.mac);
+        return leAudioManager.isEnabled(sub.mac)
+                && leAudioManager.isConnected(sub.mac)
+                && !isClassicRestorePending(sub.mac);
+    }
+
+    private void renderLeAudioConnecting(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
+        sub.renderedLeAudioActive = false;
+        if (sub.prefs.codecDisplay != null) {
+            PrefRef.setTitle(sub.prefs.codecDisplay,
+                    Strings.CODEC_BLOCK_TITLE + " : " + Strings.STATE_LE_AUDIO_CONNECTING);
+        }
+        PrefRef.setVisible(sub.prefs.codecModeOption, false);
+        PrefRef.setVisible(sub.prefs.qualityOption, false);
+        PrefRef.setVisible(sub.prefs.sampleRateOption, false);
+        setBlockDisabled(sub, true);
+        // A failed reconnect must not trap the user in LE Audio. Keep the toggle available so
+        // classic audio can be restored without opening system Settings.
+        PrefRef.setDisabled(sub.prefs.leAudioSwitch, false);
+        applyLeAudioToSwitch(sub);
     }
 
     private void renderLeAudioActive(Subscription sub) {
+        if (!isSubscriptionActive(sub)) return;
         sub.renderedLeAudioActive = true;
         if (sub.prefs.codecDisplay != null) {
             PrefRef.setTitle(sub.prefs.codecDisplay,
@@ -2470,7 +2632,7 @@ public final class CodecController {
     }
 
     private static void setBlockDisabled(Subscription sub, boolean disabled) {
-        if (sub == null || sub.prefs == null) return;
+        if (!isSubscriptionActive(sub) || sub.prefs == null) return;
         PrefRef.setDisabled(sub.prefs.category, disabled);
         PrefRef.setDisabled(sub.prefs.codecDisplay, disabled);
         PrefRef.setDisabled(sub.prefs.codecModeOption, disabled);
@@ -2558,7 +2720,7 @@ public final class CodecController {
     }
 
     private void setCodecModeStatus(Subscription sub, CharSequence summary) {
-        if (sub == null || sub.prefs == null) return;
+        if (!isSubscriptionActive(sub) || sub.prefs == null) return;
         Object mode = sub.prefs.codecModeOption;
         if (mode != null && PrefRef.isVisible(mode)) {
             PrefRef.setSummary(mode, summary);
@@ -2879,6 +3041,8 @@ public final class CodecController {
         Boolean connected;
         boolean renderedLeAudioActive;
         java.lang.ref.WeakReference<Activity> hostActivity;
+        volatile boolean active = true;
+        private long refreshGeneration;
 
         Subscription(String mac, CodecPreferences prefs, Object fragment) {
             this.mac = mac;
@@ -2887,24 +3051,32 @@ public final class CodecController {
         }
 
         void registerReceiver() {
-            if (receiver != null) return;
+            if (!active || receiver != null) return;
             receiver = new BroadcastReceiver() {
                 @Override
                 public void onReceive(Context ctx, Intent intent) {
+                    if (!active || intent == null) return;
                     String action = intent.getAction();
                     if (ACTION_CONNECTION_STATE_CHANGED.equals(action)) {
                         if (!matchesSubscriptionDevice(intent)) return;
                         int state = intent.getIntExtra(EXTRA_CONNECTION_STATE, -1);
                         if (state != -1 && state != BluetoothProfile.STATE_CONNECTED) {
                             mainHandler.post(() -> {
+                                if (!active) return;
+                                invalidateRefreshes();
                                 if (leAudioManager.isEnabled(mac)
                                         && !isClassicRestorePending(mac)) {
-                                    connected = Boolean.TRUE;
-                                    renderLeAudioActive(Subscription.this);
+                                    if (leAudioManager.isConnected(mac)) {
+                                        connected = Boolean.TRUE;
+                                        renderLeAudioActive(Subscription.this);
+                                    } else {
+                                        connected = Boolean.FALSE;
+                                        renderLeAudioConnecting(Subscription.this);
+                                    }
                                     return;
                                 }
                                 connected = Boolean.FALSE;
-                                lastSnapshot.set(null);
+                                clearSnapshot(mac);
                                 renderUnknown(Subscription.this);
                             });
                             return;
@@ -2920,7 +3092,11 @@ public final class CodecController {
                     } else if (ACTION_CODEC_CONFIG_CHANGED.equals(action)) {
                         if (leAudioManager.isEnabled(mac)
                                 && !isClassicRestorePending(mac)) {
-                            renderLeAudioActive(Subscription.this);
+                            if (leAudioManager.isConnected(mac)) {
+                                renderLeAudioActive(Subscription.this);
+                            } else {
+                                renderLeAudioConnecting(Subscription.this);
+                            }
                             return;
                         }
                         refreshSnapshot(Subscription.this);
@@ -2932,7 +3108,7 @@ public final class CodecController {
                             refreshSnapshotDelayed(Subscription.this, 1600L);
                         } else {
                             mainHandler.post(() -> {
-                                if (Boolean.TRUE.equals(connected)) {
+                                if (active && Boolean.TRUE.equals(connected)) {
                                     renderA2dpWaiting(Subscription.this);
                                 }
                             });
@@ -2970,6 +3146,25 @@ public final class CodecController {
             } catch (IllegalArgumentException ignored) {
             }
             receiver = null;
+        }
+
+        synchronized long beginRefresh() {
+            if (!active) return -1L;
+            return ++refreshGeneration;
+        }
+
+        synchronized boolean isCurrentRefresh(long generation) {
+            return active && generation == refreshGeneration;
+        }
+
+        synchronized void invalidateRefreshes() {
+            refreshGeneration++;
+        }
+
+        void dispose() {
+            active = false;
+            invalidateRefreshes();
+            unregisterReceiver();
         }
     }
 }

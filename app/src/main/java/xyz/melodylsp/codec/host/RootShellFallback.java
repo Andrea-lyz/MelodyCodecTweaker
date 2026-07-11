@@ -4,10 +4,10 @@ import java.io.BufferedReader;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
 
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.label.CodecLabelTable;
@@ -23,11 +23,11 @@ import xyz.melodylsp.codec.util.MLog;
  * AIDL hop. The user explicitly authorises {@code xyz.melodylsp.codec} in their root manager,
  * so we can just shell out.</p>
  *
- * <p>Strategy: write the developer-options keys via {@code cmd settings put global …}
- * (which the root shell can do unconditionally, no {@code WRITE_SECURE_SETTINGS} needed),
- * then nudge the A2DP stack to renegotiate the codec by toggling A2DP off/on through the
- * profile manager. This mirrors what the developer-options menu does internally when the user
- * picks a different codec spec1 / sample rate.</p>
+ * <p>Strategy: stage the developer-options keys via {@code cmd settings put global …}
+ * (which the root shell can do unconditionally, no {@code WRITE_SECURE_SETTINGS} needed).
+ * This fallback deliberately does not toggle the Bluetooth adapter: doing so would disconnect
+ * every watch, car kit, keyboard and headset, and a failed re-enable could leave Bluetooth off.
+ * The staged values take effect on the next natural A2DP negotiation.</p>
  *
  * <p>Each invocation lazily probes for {@code su}; absence is cached so subsequent attempts
  * skip straight to "no usable root" rather than spawning processes that cannot resolve the
@@ -40,32 +40,83 @@ public final class RootShellFallback {
     private final AtomicBoolean rootProbed = new AtomicBoolean(false);
     private volatile boolean rootAvailable;
 
+    /** Explicit outcome: a successful shell write is staged, not confirmed on the live link. */
+    public enum ApplyResult {
+        NOT_APPLIED(false),
+        SETTINGS_STAGED(true);
+
+        private final boolean settingsWritten;
+
+        ApplyResult(boolean settingsWritten) {
+            this.settingsWritten = settingsWritten;
+        }
+
+        public boolean settingsWritten() {
+            return settingsWritten;
+        }
+    }
+
     /**
-     * Best-effort apply via {@code su}. Returns true when the shell exited 0 and at least one
-     * of the developer-options writes was issued. False on any failure (no {@code su},
-     * non-zero exit, timeout).
+     * Compatibility wrapper for callers that only understand a boolean. A true result means
+     * settings were staged successfully; it does not mean the active codec was renegotiated or
+     * confirmed. New callers should use {@link #stageSettings(CodecRequest)}.
      */
     public boolean apply(CodecRequest req) {
+        return stageSettings(req).settingsWritten();
+    }
+
+    /**
+     * Best-effort settings staging via {@code su}. The result distinguishes a successful global
+     * settings write from a confirmed live A2DP change.
+     */
+    public ApplyResult stageSettings(CodecRequest req) {
+        return stageSettings(req, () -> true);
+    }
+
+    /**
+     * Stage settings only while the originating UI write is still current. The second guard
+     * check is deliberately after the root probe because a root-manager prompt may block long
+     * enough for the user to start a newer write while this request is waiting.
+     */
+    public ApplyResult stageSettings(CodecRequest req, BooleanSupplier shouldContinue) {
+        if (!canContinue(shouldContinue)) {
+            return ApplyResult.NOT_APPLIED;
+        }
         if (!ensureRoot()) {
-            return false;
+            return ApplyResult.NOT_APPLIED;
+        }
+        if (!canContinue(shouldContinue)) {
+            MLog.event("root.shell.settings_skip", "reason", "stale_after_root_probe");
+            return ApplyResult.NOT_APPLIED;
         }
         List<String> commands = buildCommands(req);
         if (commands.isEmpty()) {
             MLog.w("RootShellFallback: nothing to write for request " + req);
-            return false;
+            return ApplyResult.NOT_APPLIED;
         }
         boolean ok = runAsRoot(commands);
         if (ok) {
-            MLog.event("root.shell.write",
+            MLog.event("root.shell.settings_staged",
                     "codec", req.codecType,
                     "specific1", req.codecSpecific1,
-                    "rate", req.sampleRate);
+                    "rate", req.sampleRate,
+                    "liveState", "unconfirmed_until_natural_renegotiation");
         }
-        return ok;
+        return ok ? ApplyResult.SETTINGS_STAGED : ApplyResult.NOT_APPLIED;
     }
 
-    private List<String> buildCommands(CodecRequest req) {
-        java.util.ArrayList<String> cmds = new java.util.ArrayList<>(4);
+    private static boolean canContinue(BooleanSupplier shouldContinue) {
+        if (shouldContinue == null) return true;
+        try {
+            return shouldContinue.getAsBoolean();
+        } catch (Throwable t) {
+            MLog.w("root write continuation guard failed", t);
+            return false;
+        }
+    }
+
+    static List<String> buildCommands(CodecRequest req) {
+        java.util.ArrayList<String> cmds = new java.util.ArrayList<>(2);
 
         // LDAC playback quality maps {1000,1001,1002} → {0,1,2}.
         if (req.codecType == CodecLabelTable.CODEC_LDAC) {
@@ -76,7 +127,7 @@ public final class RootShellFallback {
             }
         }
         // LHDC variants do not have a global quality key in AOSP; codec selection is owned by
-        // the OPPO vendor stack. We still write the sample-rate global so renegotiation happens.
+        // the OPPO vendor stack. A sample-rate value is only staged for a later negotiation.
 
         int rateIdx = mapSampleRateToIndex(req.sampleRate);
         if (rateIdx >= 0) {
@@ -84,13 +135,6 @@ public final class RootShellFallback {
                     + SettingsGlobalFallback.KEY_SAMPLE_RATE + " " + rateIdx);
         }
 
-        // Force the A2DP stack to renegotiate by toggling the profile off and back on. This
-        // is what the dev-options menu does internally when the user picks a value.
-        if (!cmds.isEmpty()) {
-            cmds.add("cmd bluetooth_manager disable");
-            cmds.add("sleep 1");
-            cmds.add("cmd bluetooth_manager enable");
-        }
         return cmds;
     }
 
@@ -104,7 +148,8 @@ public final class RootShellFallback {
 
     /** Run {@code id -u} via su; root is "available" iff that returns 0. */
     private static boolean probeRoot() {
-        return runAsRoot(java.util.Collections.singletonList("id -u"));
+        return runAsRoot(java.util.Collections.singletonList(
+                "if [ \"$(id -u)\" != \"0\" ]; then exit 126; fi"));
     }
 
     /** Pipe each command (newline-terminated) into {@code su}, then {@code exit}. */
@@ -117,6 +162,8 @@ public final class RootShellFallback {
             return false;
         }
         try (DataOutputStream out = new DataOutputStream(process.getOutputStream())) {
+            // A failed settings write must not be hidden by a later successful command.
+            out.writeBytes("set -e\n");
             for (String c : commands) {
                 out.writeBytes(c + "\n");
             }

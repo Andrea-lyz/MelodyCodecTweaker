@@ -326,7 +326,7 @@ public final class CodecSnapshot implements Parcelable {
     public String toString() {
         return String.format(Locale.ROOT,
                 "CodecSnapshot{mac=%s codec=0x%x rate=0x%x specific1=%d selSpec1=%s selCodec=%s selRateMask=0x%x selRate=%s selBits=%s selChannel=%s selRawSpec1=%s optional=%d/%d ts=%d}",
-                mac, activeCodecType, activeSampleRate, activeCodecSpecific1,
+                redactedMac(mac), activeCodecType, activeSampleRate, activeCodecSpecific1,
                 Arrays.toString(selectableCodecSpecific1), Arrays.toString(selectableCodecTypes),
                 selectableSampleRateMask,
                 Arrays.toString(selectableCodecSampleRates),
@@ -335,5 +335,10 @@ public final class CodecSnapshot implements Parcelable {
                 Arrays.toString(selectableCodecSpecific1Values),
                 optionalCodecsSupported, optionalCodecsEnabled,
                 readTimestampMs);
+    }
+
+    private static String redactedMac(String value) {
+        if (value == null || value.length() < 5) return "??";
+        return value.substring(0, 2) + "**" + value.substring(value.length() - 2);
     }
 }

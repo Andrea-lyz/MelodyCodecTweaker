@@ -4,7 +4,6 @@ import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.os.Binder;
 import android.os.IBinder;
-import android.os.Process;
 import android.os.RemoteCallbackList;
 import android.os.RemoteException;
 
@@ -88,7 +87,7 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
     }
 
     int setCodecUnchecked(CodecRequest request) {
-        if (request == null || request.mac == null) return CodecRequest.RESULT_INVALID;
+        if (!isValidCodecRequest(request)) return CodecRequest.RESULT_INVALID;
         try {
             BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(request.mac);
             Class<?> cfgCls = Class.forName("android.bluetooth.BluetoothCodecConfig");
@@ -103,7 +102,7 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
     }
 
     int setOptionalCodecsUnchecked(String mac, boolean enable) {
-        if (mac == null || mac.isEmpty()) return CodecRequest.RESULT_INVALID;
+        if (!isValidConnectedMac(mac)) return CodecRequest.RESULT_INVALID;
         try {
             BluetoothDevice device = BluetoothAdapter.getDefaultAdapter().getRemoteDevice(mac);
             boolean wrotePreference = invokeOptionalCodecPreference(device, enable);
@@ -386,15 +385,91 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
         throw new NoSuchMethodException("BluetoothCodecConfig ctor");
     }
 
+    /**
+     * Treat the privileged bridge as a trust boundary even after caller authentication. A stale
+     * UI snapshot or malformed fallback broadcast must never make A2dpService consume a codec
+     * configuration that the live device did not advertise.
+     */
+    private boolean isValidCodecRequest(CodecRequest request) {
+        if (request == null || !isBluetoothAddress(request.mac)) return false;
+        if (request.codecType < 0 || request.codecType > 0x3f
+                || !isSingleBitOrZero(request.sampleRate)
+                || !isSingleBitOrZero(request.bitsPerSample)
+                || !isSingleBitOrZero(request.channelMode)) {
+            MLog.event("bridge.set.reject", "reason", "invalid_bit_field", "request", request);
+            return false;
+        }
+        CodecSnapshot live = getStatusUnchecked(request.mac);
+        if (live == null) {
+            MLog.event("bridge.set.reject", "reason", "device_not_active", "request", request);
+            return false;
+        }
+        int capabilityIndex = indexOf(live.selectableCodecTypes, request.codecType);
+        if (live.activeCodecType != request.codecType
+                && live.selectableCodecTypes != null
+                && live.selectableCodecTypes.length > 0
+                && capabilityIndex < 0) {
+            MLog.event("bridge.set.reject", "reason", "codec_not_selectable", "request", request);
+            return false;
+        }
+        if (capabilityIndex >= 0) {
+            if (!fieldFitsCapability(request.sampleRate,
+                    valueAt(live.selectableCodecSampleRates, capabilityIndex))
+                    || !fieldFitsCapability(request.bitsPerSample,
+                    valueAt(live.selectableCodecBitsPerSample, capabilityIndex))
+                    || !fieldFitsCapability(request.channelMode,
+                    valueAt(live.selectableCodecChannelModes, capabilityIndex))) {
+                MLog.event("bridge.set.reject", "reason", "field_not_selectable", "request", request);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean isValidConnectedMac(String mac) {
+        return isBluetoothAddress(mac) && getStatusUnchecked(mac) != null;
+    }
+
+    private static boolean isBluetoothAddress(String mac) {
+        try {
+            return mac != null && BluetoothAdapter.checkBluetoothAddress(mac);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static boolean isSingleBitOrZero(int value) {
+        return value == 0 || (value > 0 && (value & (value - 1)) == 0);
+    }
+
+    private static boolean fieldFitsCapability(int requested, int capabilityMask) {
+        return requested == 0 || capabilityMask == 0 || (capabilityMask & requested) != 0;
+    }
+
+    private static int indexOf(int[] values, int target) {
+        if (values == null) return -1;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] == target) return i;
+        }
+        return -1;
+    }
+
+    private static int valueAt(int[] values, int index) {
+        return values != null && index >= 0 && index < values.length ? values[index] : 0;
+    }
+
     private boolean isMelodyCaller() {
         int callingUid = Binder.getCallingUid();
-        if (callingUid == Process.SYSTEM_UID) return true;
         try {
             Class<?> amCls = Class.forName("android.app.ActivityThread");
             Method currentApp = amCls.getMethod("currentApplication");
             android.app.Application app = (android.app.Application) currentApp.invoke(null);
-            int melodyUid = app.getPackageManager().getPackageUid(MELODY_PKG, 0);
-            return melodyUid == callingUid;
+            String[] packages = app.getPackageManager().getPackagesForUid(callingUid);
+            if (packages == null) return false;
+            for (String pkg : packages) {
+                if (MELODY_PKG.equals(pkg)) return true;
+            }
+            return false;
         } catch (Throwable t) {
             MLog.w("isMelodyCaller resolution failed", t);
             return false;

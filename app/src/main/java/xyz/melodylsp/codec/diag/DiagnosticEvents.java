@@ -12,12 +12,15 @@ import java.util.Locale;
 import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.label.CodecLabelTable;
+import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 public final class DiagnosticEvents {
 
     public static final String ACTION = BuildConfig.APPLICATION_ID + ".action.DIAGNOSTIC_EVENT";
     public static final String ACTION_MEMORY_SNAPSHOT_REQUEST =
             BuildConfig.APPLICATION_ID + ".action.REQUEST_MEMORY_SNAPSHOT";
+    public static final String PERMISSION_MEMORY_SNAPSHOT_REQUEST =
+            BuildConfig.APPLICATION_ID + ".permission.DIAGNOSTIC_REQUEST";
     public static final String PREFS = "diagnostics";
     public static final String KEY_EVENTS = "events";
     public static final String KEY_EVENTS_JSON = "events_jsonl";
@@ -31,6 +34,9 @@ public final class DiagnosticEvents {
     private static final int MAX_EVENTS_CHARS = 256_000;
     private static final int MAX_EVENTS_JSON_CHARS = 256_000;
     private static final int MAX_MEMORY_REPLAY_CHARS = 32_000;
+    static final int MAX_MESSAGE_CHARS = 4_096;
+    private static final int MAX_SCOPE_CHARS = 48;
+    private static final long MAX_EVENT_TIME_SKEW_MS = 5 * 60_000L;
     private static final String KEY_MEMORY_DEVICE_LIST = "memory.devices";
     private static final String KEY_MEMORY_SNAPSHOT_TIME = "memory.snapshot.time";
     private static final String KEY_MEMORY_SNAPSHOT_REASON = "memory.snapshot.reason";
@@ -57,9 +63,9 @@ public final class DiagnosticEvents {
             intent.setPackage(BuildConfig.APPLICATION_ID);
             intent.putExtra(EXTRA_SCOPE, scope != null ? scope : "unknown");
             intent.putExtra(EXTRA_PRIORITY, priority);
-            intent.putExtra(EXTRA_MESSAGE, message);
+            intent.putExtra(EXTRA_MESSAGE, limit(message, MAX_MESSAGE_CHARS));
             intent.putExtra(EXTRA_TIME, time > 0L ? time : System.currentTimeMillis());
-            context.sendBroadcast(intent);
+            TrustedBroadcasts.send(context, intent);
         } catch (Throwable ignored) {
         }
     }
@@ -98,12 +104,27 @@ public final class DiagnosticEvents {
     }
 
     public static void record(Context context, Intent intent) {
+        record(context, intent, null);
+    }
+
+    static void record(Context context, Intent intent, String verifiedScope) {
         if (context == null || intent == null) return;
         String message = intent.getStringExtra(EXTRA_MESSAGE);
         if (message == null || message.isEmpty()) return;
-        String scope = intent.getStringExtra(EXTRA_SCOPE);
+        message = limit(message, MAX_MESSAGE_CHARS);
+        String scope = verifiedScope != null
+                ? verifiedScope
+                : limit(intent.getStringExtra(EXTRA_SCOPE), MAX_SCOPE_CHARS);
         int priority = intent.getIntExtra(EXTRA_PRIORITY, Log.INFO);
+        if (priority < Log.INFO) priority = Log.INFO;
+        if (priority > Log.ASSERT) priority = Log.ASSERT;
+        long now = System.currentTimeMillis();
         long time = intent.getLongExtra(EXTRA_TIME, System.currentTimeMillis());
+        if (time <= 0L
+                || time < now - MAX_EVENT_TIME_SKEW_MS
+                || time > now + MAX_EVENT_TIME_SKEW_MS) {
+            time = now;
+        }
         record(context, scope, priority, message, time);
     }
 
@@ -431,6 +452,11 @@ public final class DiagnosticEvents {
 
     private static String safe(String value) {
         return value != null && !value.isEmpty() ? value : "unknown";
+    }
+
+    private static String limit(String value, int maxChars) {
+        if (value == null || value.length() <= maxChars) return value;
+        return value.substring(0, maxChars);
     }
 
     private static String valueOf(String message, String key) {

@@ -111,8 +111,9 @@ public final class HostHookInstaller {
     private final MelodyCodecLspEntry module;
     private final ClassLoader classLoader;
     private final DexKitHostResolver dexKit;
+    /** Weak keys prevent an injected PreferenceScreen from retaining its destroyed Activity. */
     private final Set<Object> attachedScreens =
-            java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+            java.util.Collections.newSetFromMap(new WeakHashMap<>());
     private final Set<Activity> knownActivities =
             Collections.newSetFromMap(new WeakHashMap<>());
     private final Map<String, Set<Integer>> pendingGameModeTypes = new HashMap<>();
@@ -263,7 +264,7 @@ public final class HostHookInstaller {
         mainHandler.post(() -> {
             int scheduled = 0;
             for (Activity activity : new ArrayList<>(knownActivities)) {
-                if (activity == null || activity.isFinishing()) continue;
+                if (!isActivityAlive(activity)) continue;
                 String name = activity.getClass().getName();
                 if (!isSupportedHostActivityName(name)) continue;
                 scheduleKnownFragmentScan(activity, /* attempt= */ 0, "surface.rescan");
@@ -305,6 +306,37 @@ public final class HostHookInstaller {
         return activity != null ? activity.getClass().getName() : null;
     }
 
+    private static boolean isActivityAlive(Object value) {
+        if (!(value instanceof Activity)) return false;
+        Activity activity = (Activity) value;
+        if (activity.isFinishing()) return false;
+        return android.os.Build.VERSION.SDK_INT < 17 || !activity.isDestroyed();
+    }
+
+    private static boolean isFragmentHostAlive(Object fragment) {
+        if (fragment == null) return false;
+        Object added = invokeNoArg(fragment, "isAdded");
+        if (added instanceof Boolean && !((Boolean) added)) return false;
+        Object activity = invokeNoArg(fragment, "getActivity");
+        if (activity == null) activity = invokeNoArg(fragment, "requireActivity");
+        if (activity != null) return isActivityAlive(activity);
+        // A resolvable Fragment API returning null means the instance is detached. When a host
+        // update has renamed every API we use for probing, keep the old compatibility behaviour
+        // instead of suppressing injection solely because liveness could not be observed.
+        return !hasPublicNoArgMethod(fragment, "getActivity")
+                && !hasPublicNoArgMethod(fragment, "requireActivity");
+    }
+
+    private static boolean hasPublicNoArgMethod(Object target, String name) {
+        if (target == null) return false;
+        try {
+            target.getClass().getMethod(name);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     /**
      * Hook every known PreferenceFragment-shaped base class, from Melody's wrappers down to the
      * bundled AndroidX implementation. Melody 16.7.1 moved DetailMain to an outer plain
@@ -343,8 +375,9 @@ public final class HostHookInstaller {
     }
 
     private void scheduleSurfaceDispatch(Object fragment, int attempt) {
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+        mainHandler.postDelayed(() -> {
             if (controller == null) return;
+            if (!isFragmentHostAlive(fragment)) return;
             if (!isSupportedFragmentHost(fragment)) return;
             try {
                 Object screen = PrefRef.getPreferenceScreen(fragment);
@@ -925,8 +958,9 @@ public final class HostHookInstaller {
      * sheet fragment + its PreferenceScreen are attached asynchronously after onResume.
      */
     private void scheduleOneSpaceFragmentScan(Object activity, int attempt) {
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+        mainHandler.postDelayed(() -> {
             if (controller == null) return;
+            if (!isActivityAlive(activity)) return;
             try {
                 java.util.List<Object> fragments = collectFragments(activity);
                 for (Object fragment : fragments) {
@@ -957,8 +991,9 @@ public final class HostHookInstaller {
      * preference pages cannot pick up the codec block.
      */
     private void scheduleKnownFragmentScan(Object activity, int attempt, String source) {
-        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+        mainHandler.postDelayed(() -> {
             if (controller == null) return;
+            if (!isActivityAlive(activity)) return;
             boolean found = false;
             try {
                 java.util.List<Object> fragments = collectFragments(activity);
@@ -1436,6 +1471,7 @@ public final class HostHookInstaller {
     }
 
     @SuppressWarnings("deprecation")
+    @android.annotation.SuppressLint("MissingPermission")
     private static String resolveMacFromA2dp(Context context) {
         BluetoothAdapter adapter = null;
         try {

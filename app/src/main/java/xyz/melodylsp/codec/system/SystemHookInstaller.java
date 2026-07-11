@@ -24,6 +24,7 @@ import xyz.melodylsp.codec.MelodyCodecLspEntry;
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.leaudio.BluetoothLeAudioBridge;
 import xyz.melodylsp.codec.util.MLog;
+import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /**
  * Installs the privileged {@link CodecBridgeService} inside {@code com.android.bluetooth}.
@@ -504,7 +505,9 @@ public final class SystemHookInstaller {
         intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, result.originalCount);
         intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_SUCCESS, result.success);
         try {
-            context.sendBroadcast(intent);
+            if (!TrustedBroadcasts.send(context, intent)) {
+                MLog.w("native patch state broadcast was not delivered");
+            }
         } catch (Throwable t) {
             MLog.w("native patch state broadcast failed", t);
         }
@@ -549,7 +552,10 @@ public final class SystemHookInstaller {
         intent.putExtra(CodecIpc.EXTRA_GAME_MODE_SOURCE, "bt.native.sbc_s2_" + marker);
         intent.putExtra(CodecIpc.EXTRA_GAME_MODE_TTL_MS, GAME_MODE_SBC_FALLBACK_TTL_MS);
         try {
-            context.sendBroadcast(intent);
+            if (!TrustedBroadcasts.send(context, intent)) {
+                MLog.w("game mode SBC hint broadcast was not delivered");
+                return;
+            }
             MLog.event("game.mode.bt_hint",
                     "mac", redactMac(mac),
                     "s2", marker,

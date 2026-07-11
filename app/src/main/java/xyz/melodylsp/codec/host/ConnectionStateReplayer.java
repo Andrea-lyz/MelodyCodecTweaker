@@ -12,7 +12,12 @@ import android.content.IntentFilter;
 import android.os.Handler;
 import android.os.Looper;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.lang.reflect.Method;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -25,6 +30,7 @@ import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.storage.PreferenceStore;
 import xyz.melodylsp.codec.util.MLog;
+import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /**
  * Watches A2DP connection events and replays the stored codec snapshot when
@@ -59,7 +65,7 @@ public final class ConnectionStateReplayer {
     private final PreferenceStore prefs;
     private final A2dpRouteReadiness routeReadiness;
     private final String processName;
-    private final boolean replayEnabled;
+    private final ReplayOwnership replayOwnership;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<String, PendingReplay> pendingReplays = new HashMap<>();
     private final Map<String, Long> replayGenerations = new HashMap<>();
@@ -69,6 +75,8 @@ public final class ConnectionStateReplayer {
     private final Map<String, Long> userCodecWriteQuietUntilMs = new HashMap<>();
 
     private BroadcastReceiver receiver;
+    private BroadcastReceiver userWriteReceiver;
+    private BroadcastReceiver gameModeReceiver;
     private boolean bootstrapActiveQueryFallbackLogged;
     private boolean bootstrapConnectedQueryFallbackLogged;
     private long nextGameModeProbeToken;
@@ -83,7 +91,7 @@ public final class ConnectionStateReplayer {
         this.prefs = prefs;
         this.routeReadiness = routeReadiness;
         this.processName = resolveProcessName(this.context);
-        this.replayEnabled = isReplayOwnerProcess(this.context, processName);
+        this.replayOwnership = new ReplayOwnership(this.context, processName);
     }
 
     public void start() {
@@ -105,26 +113,64 @@ public final class ConnectionStateReplayer {
                     }
                 } else if (A2dpRouteReadiness.ACTION_ACTIVE_DEVICE_CHANGED.equals(action)) {
                     handleActiveDeviceChanged(intent);
-                } else if (CodecIpc.ACTION_GAME_MODE_STATE.equals(action)) {
-                    handleGameModeStateBroadcast(intent);
-                } else if (ACTION_USER_CODEC_WRITE.equals(action)) {
-                    handleUserCodecWriteBroadcast(intent);
                 }
             }
         };
         IntentFilter filter = new IntentFilter();
         filter.addAction(ACTION_CONNECTION_STATE_CHANGED);
         filter.addAction(A2dpRouteReadiness.ACTION_ACTIVE_DEVICE_CHANGED);
-        filter.addAction(CodecIpc.ACTION_GAME_MODE_STATE);
-        filter.addAction(ACTION_USER_CODEC_WRITE);
         try {
             context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
         } catch (Throwable t) {
             context.registerReceiver(receiver, filter);
         }
+        gameModeReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                if (TrustedBroadcasts.supportsSenderIdentity()
+                        && !TrustedBroadcasts.isTrustedSender(
+                        ctx,
+                        TrustedBroadcasts.captureSender(this),
+                        CodecIpc.MELODY_PKG,
+                        CodecIpc.BLUETOOTH_PKG)) {
+                    MLog.w("game mode state rejected: untrusted sender");
+                    return;
+                }
+                handleGameModeStateBroadcast(intent);
+            }
+        };
+        IntentFilter gameModeFilter = new IntentFilter(CodecIpc.ACTION_GAME_MODE_STATE);
+        // Both Melody's sibling process and com.android.bluetooth publish game-state hints.
+        // The OPlus signature permission authenticates them on API 31-33; Android 14+ also
+        // verifies the framework-supplied package/UID identity above.
+        if (!TrustedBroadcasts.registerExportedReceiver(
+                context,
+                gameModeReceiver,
+                gameModeFilter,
+                TrustedBroadcasts.PERMISSION_OPLUS_COMPONENT_SAFE,
+                mainHandler)) {
+            gameModeReceiver = null;
+            MLog.w("game mode receiver registration failed");
+        }
+        userWriteReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                handleUserCodecWriteBroadcast(intent);
+            }
+        };
+        IntentFilter userWriteFilter = new IntentFilter(ACTION_USER_CODEC_WRITE);
+        if (!TrustedBroadcasts.registerNotExportedReceiver(
+                context,
+                userWriteReceiver,
+                userWriteFilter,
+                TrustedBroadcasts.PERMISSION_OPLUS_COMPONENT_SAFE,
+                mainHandler)) {
+            userWriteReceiver = null;
+            MLog.w("user codec write receiver registration failed");
+        }
         MLog.event("replay.receiver.started",
                 "process", processName,
-                "replay", replayEnabled);
+                "replay", hasReplayOwnership());
         scheduleBootstrapScans();
     }
 
@@ -135,6 +181,21 @@ public final class ConnectionStateReplayer {
         } catch (IllegalArgumentException ignored) {
         }
         receiver = null;
+        if (userWriteReceiver != null) {
+            try {
+                context.unregisterReceiver(userWriteReceiver);
+            } catch (IllegalArgumentException ignored) {
+            }
+            userWriteReceiver = null;
+        }
+        if (gameModeReceiver != null) {
+            try {
+                context.unregisterReceiver(gameModeReceiver);
+            } catch (IllegalArgumentException ignored) {
+            }
+            gameModeReceiver = null;
+        }
+        replayOwnership.release();
     }
 
     void onUserCodecWrite(String mac, CodecRequest request, String reason) {
@@ -181,7 +242,7 @@ public final class ConnectionStateReplayer {
     }
 
     private void maybeReplayConnected(String key, long delayMs, String reason) {
-        if (!replayEnabled) {
+        if (!hasReplayOwnership()) {
             MLog.event("replay.skip.process",
                     "mac", A2dpRouteReadiness.redactMac(key),
                     "process", processName);
@@ -227,6 +288,9 @@ public final class ConnectionStateReplayer {
         synchronized (this) {
             pendingReplays.remove(key);
             userCodecWriteQuietUntilMs.remove(key);
+            gameModeActiveTypes.remove(key);
+            gameModeFallbackUntilMs.remove(key);
+            gameModeProbeSchedules.remove(key);
             bumpGenerationLocked(key);
         }
         routeReadiness.markDisconnected(key);
@@ -261,7 +325,7 @@ public final class ConnectionStateReplayer {
         String key = A2dpRouteReadiness.normalizeMac(device.getAddress());
         if (key == null) return;
         routeReadiness.markReady(key, "replay.active_broadcast");
-        if (!replayEnabled) return;
+        if (!hasReplayOwnership()) return;
         PendingReplay pending;
         Long fallbackUntil;
         synchronized (this) {
@@ -409,7 +473,7 @@ public final class ConnectionStateReplayer {
             String key,
             long expectedUntil,
             long delayMs) {
-        if (!replayEnabled) return;
+        if (!hasReplayOwnership()) return;
         long safeDelayMs = Math.max(GAME_MODE_EXIT_PROBE_MIN_DELAY_MS, delayMs);
         long dueAtMs = System.currentTimeMillis() + safeDelayMs;
         long token;
@@ -494,7 +558,7 @@ public final class ConnectionStateReplayer {
     }
 
     private void scheduleBootstrapScans() {
-        if (!replayEnabled) return;
+        if (!hasReplayOwnership()) return;
         for (int i = 0; i < BOOTSTRAP_SCAN_DELAYS_MS.length; i++) {
             final int pass = i + 1;
             long delayMs = BOOTSTRAP_SCAN_DELAYS_MS[i];
@@ -551,6 +615,7 @@ public final class ConnectionStateReplayer {
     }
 
     @SuppressWarnings("deprecation")
+    @android.annotation.SuppressLint("MissingPermission")
     private Map<String, Boolean> queryCurrentA2dpDevices() {
         Map<String, Boolean> devices = new HashMap<>();
         BluetoothAdapter adapter = resolveAdapter();
@@ -668,7 +733,7 @@ public final class ConnectionStateReplayer {
             PreferenceStore.RememberedValue stored,
             long delayMs,
             String reason) {
-        if (!replayEnabled) return;
+        if (!hasReplayOwnership()) return;
         if (skipReplayForUserCodecWriteQuiet(mac, reason)) {
             return;
         }
@@ -759,7 +824,7 @@ public final class ConnectionStateReplayer {
             PreferenceStore.RememberedValue stored,
             long generation,
             int attempt) {
-        if (!replayEnabled) return;
+        if (!hasReplayOwnership()) return;
         if (!isReplayStillCurrent(mac, stored, generation)) return;
         if (isGameModeSuppressed(mac)) {
             suppressReplayForGameMode(mac, "before_read");
@@ -800,24 +865,18 @@ public final class ConnectionStateReplayer {
             return;
         }
 
-        if (isStandardCodec(stored.codecType)) {
-            CodecRequest req = CodecRequest.fromActive(live)
-                    .codecType(stored.codecType)
-                    .codecSpecific1(0L)
-                    .codecSpecific2(0L)
-                    .codecSpecific3(0L)
-                    .codecSpecific4(0L)
-                    .sampleRate(0)
-                    .bitsPerSample(0)
-                    .channelMode(0)
-                    .build();
-            dispatchReplay(mac, stored, req, generation, attempt);
+        int replayCodecType = replayCodecType(live, stored.codecType);
+        if (stored.codecType >= 0
+                && replayCodecType < 0
+                && !sameCodecFamily(live.activeCodecType, stored.codecType)) {
+            MLog.event("replay.skip.codec_unavailable",
+                    "mac", A2dpRouteReadiness.redactMac(mac),
+                    "stored_codec", stored.codecType,
+                    "active_codec", live.activeCodecType);
             return;
         }
-
-        int replayCodecType = replayCodecType(live, stored.codecType);
         boolean codecSelectable = replayCodecType >= 0
-                && !sameCodecFamily(live.activeCodecType, replayCodecType);
+                && live.activeCodecType != replayCodecType;
         int requestCodecType = replayCodecType >= 0 ? replayCodecType : live.activeCodecType;
         boolean specific1Selectable =
                 isSpecific1Selectable(live, requestCodecType, stored.codecSpecific1);
@@ -838,6 +897,7 @@ public final class ConnectionStateReplayer {
         if (codecSelectable) {
             int capIndex = selectableCodecIndex(live, requestCodecType);
             builder.codecType(requestCodecType)
+                    .codecSpecific1(0L)
                     .codecSpecific2(0L)
                     .codecSpecific3(0L)
                     .codecSpecific4(0L)
@@ -845,6 +905,11 @@ public final class ConnectionStateReplayer {
                             live.selectableCodecBitsPerSample, capIndex)))
                     .channelMode(firstBit(selectableIntValue(
                             live.selectableCodecChannelModes, capIndex)));
+            if (!sampleRateSelectable) {
+                int targetRate = firstBit(selectableIntValue(
+                        live.selectableCodecSampleRates, capIndex));
+                if (targetRate != 0) builder.sampleRate(targetRate);
+            }
         }
         if (specific1Selectable) builder.withSpecific1(stored.codecSpecific1);
         if (sampleRateSelectable) builder.withSampleRate(stored.sampleRate);
@@ -1030,6 +1095,10 @@ public final class ConnectionStateReplayer {
         }
     }
 
+    private boolean hasReplayOwnership() {
+        return replayOwnership.acquireIfAvailable();
+    }
+
     private boolean isGameModeSuppressedLocked(String key) {
         if (hasActiveGameModeTypesLocked(key)) return true;
         // Do not clear the Bluetooth-observed fallback just because its TTL elapsed.
@@ -1111,17 +1180,22 @@ public final class ConnectionStateReplayer {
                 && first.sampleRate == second.sampleRate;
     }
 
-    private static boolean matchesStoredValue(
+    static boolean matchesStoredValue(
             CodecSnapshot live,
             PreferenceStore.RememberedValue stored) {
         if (live == null || stored == null) return false;
-        if (stored.codecType >= 0 && !sameCodecFamily(live.activeCodecType, stored.codecType)) {
-            return false;
+        if (stored.codecType >= 0 && live.activeCodecType != stored.codecType) {
+            if (!sameCodecFamily(live.activeCodecType, stored.codecType)
+                    || isCodecExplicitlySelectable(live, stored.codecType)) {
+                return false;
+            }
         }
-        if (isStandardCodec(stored.codecType)) return true;
         if (stored.sampleRate > 0 && live.activeSampleRate != stored.sampleRate) {
             return false;
         }
+        // SBC/AAC do not expose a meaningful playback-quality word, but their negotiated sample
+        // rate is still user-selectable and part of the per-device memory contract.
+        if (isStandardCodec(stored.codecType)) return true;
         if (stored.codecSpecific1 < 0L) return true;
         if (CodecLabelTable.isLhdc(live.activeCodecType)
                 || CodecLabelTable.isLhdc(stored.codecType)) {
@@ -1154,15 +1228,29 @@ public final class ConnectionStateReplayer {
         return false;
     }
 
-    private static int replayCodecType(CodecSnapshot live, int storedCodecType) {
+    static int replayCodecType(CodecSnapshot live, int storedCodecType) {
         if (live == null || storedCodecType < 0) return -1;
+        if (live.activeCodecType == storedCodecType) return live.activeCodecType;
+        int index = selectableCodecIndex(live, storedCodecType);
+        if (index >= 0) return live.selectableCodecTypes[index];
         if (sameCodecFamily(live.activeCodecType, storedCodecType)) {
             return live.activeCodecType;
         }
-        int index = selectableCodecIndex(live, storedCodecType);
-        if (index >= 0) return live.selectableCodecTypes[index];
-        if (!isStandardCodec(storedCodecType)) return storedCodecType;
+        if (live.selectableCodecTypes == null || live.selectableCodecTypes.length == 0) {
+            // Some OPlus stacks temporarily expose no capability array immediately after
+            // reconnect. Unknown capability is distinct from an explicit non-match, including
+            // for mandatory SBC and a previously negotiated AAC selection.
+            return storedCodecType;
+        }
         return -1;
+    }
+
+    private static boolean isCodecExplicitlySelectable(CodecSnapshot live, int codecType) {
+        if (live == null || live.selectableCodecTypes == null) return false;
+        for (int selectable : live.selectableCodecTypes) {
+            if (selectable == codecType) return true;
+        }
+        return false;
     }
 
     private static int selectableCodecIndex(CodecSnapshot live, int codecType) {
@@ -1198,6 +1286,7 @@ public final class ConnectionStateReplayer {
 
     private static boolean isSampleRateSelectable(CodecSnapshot live, int codecType, int value) {
         if (live == null) return false;
+        if (value < 0) return false;
         if (value == 0) return true;
         int index = selectableCodecIndex(live, codecType);
         int mask = selectableIntValue(live.selectableCodecSampleRates, index);
@@ -1231,7 +1320,7 @@ public final class ConnectionStateReplayer {
         }
     }
 
-    private static boolean isReplayOwnerProcess(Context context, String processName) {
+    private static boolean isPreferredReplayOwnerProcess(Context context, String processName) {
         if (processName == null || processName.isEmpty()) return true;
         String packageName;
         try {
@@ -1244,5 +1333,84 @@ public final class ConnectionStateReplayer {
         if (packageName.equals(processName)) return false;
         if (processName.startsWith(packageName + ":")) return processName.endsWith(":fg");
         return true;
+    }
+
+    /**
+     * Cross-process single-owner lease. Melody creates a controller in both its main and
+     * {@code :fg} processes; a kernel file lock prevents duplicate writes while allowing the
+     * surviving process to take over automatically after the former owner is killed.
+     */
+    private static final class ReplayOwnership {
+        private final File lockFile;
+        private final String processName;
+        private final boolean fallbackOwner;
+        private FileOutputStream stream;
+        private FileChannel channel;
+        private FileLock lock;
+        private boolean fileLockUnavailable;
+        private boolean failureLogged;
+
+        ReplayOwnership(Context context, String processName) {
+            File filesDir = context != null ? context.getFilesDir() : null;
+            this.lockFile = filesDir != null ? new File(filesDir, "codec-replay-owner.lock") : null;
+            this.processName = processName;
+            this.fallbackOwner = isPreferredReplayOwnerProcess(context, processName);
+        }
+
+        synchronized boolean acquireIfAvailable() {
+            if (lock != null && lock.isValid()) return true;
+            if (fileLockUnavailable || lockFile == null) return fallbackOwner;
+            closeQuietly();
+            try {
+                stream = new FileOutputStream(lockFile, true);
+                channel = stream.getChannel();
+                lock = channel.tryLock();
+                if (lock == null) {
+                    closeQuietly();
+                    return false;
+                }
+                MLog.event("replay.owner.acquired", "process", processName);
+                return true;
+            } catch (OverlappingFileLockException e) {
+                closeQuietly();
+                return false;
+            } catch (Throwable t) {
+                closeQuietly();
+                fileLockUnavailable = true;
+                if (!failureLogged) {
+                    failureLogged = true;
+                    MLog.w("replay owner file lock unavailable; using process fallback", t);
+                }
+                return fallbackOwner;
+            }
+        }
+
+        synchronized void release() {
+            closeQuietly();
+        }
+
+        private void closeQuietly() {
+            if (lock != null) {
+                try {
+                    lock.release();
+                } catch (Throwable ignored) {
+                }
+                lock = null;
+            }
+            if (channel != null) {
+                try {
+                    channel.close();
+                } catch (Throwable ignored) {
+                }
+                channel = null;
+            }
+            if (stream != null) {
+                try {
+                    stream.close();
+                } catch (Throwable ignored) {
+                }
+                stream = null;
+            }
+        }
     }
 }

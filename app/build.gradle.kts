@@ -70,4 +70,5 @@ dependencies {
     // androidx.preference / lifecycle since the host APK ships R8-minified copies and we
     // route all access through reflection (see PrefRef).
     compileOnly("androidx.annotation:annotation:1.9.1")
+    testImplementation("junit:junit:4.13.2")
 }

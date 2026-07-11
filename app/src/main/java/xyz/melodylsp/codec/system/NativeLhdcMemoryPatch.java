@@ -2,13 +2,11 @@ package xyz.melodylsp.codec.system;
 
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
-import android.system.Os;
 import android.system.OsConstants;
 
 import java.io.BufferedReader;
 import java.io.FileReader;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -49,13 +47,17 @@ final class NativeLhdcMemoryPatch {
                     hex("1f0900f149000014680f80529a008052"),
                     4,
                     hex("49000014")),
+            new PatternSpec(
+                    "branch_plus_68_pjz110_1609401",
+                    hex("1f0900f182080054a83e80529a008052"),
+                    hex("1f0900f144000014a83e80529a008052"),
+                    4,
+                    hex("44000014")),
     };
     private static final int MAX_RANGE_BYTES = 64 * 1024 * 1024;
-    private static volatile Method cachedStaticMprotect;
-    private static volatile Object cachedLibcoreOs;
-    private static volatile Method cachedLibcoreMprotect;
+    private static final int NATIVE_PATCH_OK = 0;
+    private static final int NATIVE_PATCH_ALREADY_APPLIED = 1;
     private static volatile Method cachedPeekByteArray;
-    private static volatile Method cachedPokeByteArray;
     private static volatile String nativeLibraryPath;
     private static volatile String nativeLoadError;
     private static volatile boolean nativeLoadAttempted;
@@ -81,7 +83,7 @@ final class NativeLhdcMemoryPatch {
         }
     }
 
-    static PatchResult apply() {
+    static synchronized PatchResult apply() {
         PatchResult result;
         try {
             result = applyUnchecked();
@@ -132,7 +134,22 @@ final class NativeLhdcMemoryPatch {
             return PatchResult.alreadyPatched(patchedCount, originalCount, patchedSpec);
         }
         if (originalCount != 1 || original == null) {
-            return PatchResult.unsupported(patchedCount, originalCount);
+            SemanticScan semantic = scanSemanticGuard(ranges);
+            if (semantic.patchedCount == 1 && semantic.originalCount == 0) {
+                return PatchResult.alreadyPatched(
+                        semantic.patchedCount,
+                        semantic.originalCount,
+                        "semantic_guard_v1");
+            }
+            if (semantic.originalCount != 1 || semantic.original == null
+                    || semantic.patchedCount != 0) {
+                return PatchResult.unsupported(
+                        patchedCount + semantic.patchedCount,
+                        originalCount + semantic.originalCount);
+            }
+            original = semantic.original;
+            originalCount = semantic.originalCount;
+            patchedCount = semantic.patchedCount;
         }
 
         long patchAddress = original.address + original.spec.patchDelta;
@@ -140,28 +157,217 @@ final class NativeLhdcMemoryPatch {
         if (patchRange == null) {
             return PatchResult.failed("patch_address_outside_mapping");
         }
+        if (!patchRange.executable) {
+            return PatchResult.failed("patch_mapping_not_executable");
+        }
+        if ((patchAddress & 3L) != 0L
+                || original.spec.patchBytes.length != Integer.BYTES
+                || original.spec.patchDelta < 0
+                || original.spec.patchDelta + Integer.BYTES > original.spec.original.length) {
+            return PatchResult.failed("patch_instruction_not_aligned_arm64");
+        }
+        if (!ensureNativeLoaded()) {
+            return PatchResult.failed("native_helper_unavailable:" + nativeLoadError);
+        }
 
-        int pageSize = pageSize();
-        long pageStart = alignDown(patchAddress, pageSize);
-        long pageEnd = alignUp(patchAddress + original.spec.patchBytes.length, pageSize);
-        long protectLength = pageEnd - pageStart;
-
-        boolean protectionChanged = false;
+        int expectedInstruction = readIntLe(original.spec.original, original.spec.patchDelta);
+        int replacementInstruction = readIntLe(original.spec.patchBytes, 0);
+        int nativeResult;
         try {
-            makeWritable(pageStart, protectLength, patchRange);
-            protectionChanged = true;
-            writeMemory(patchAddress, original.spec.patchBytes);
-        } finally {
-            if (protectionChanged) {
-                restoreProtection(pageStart, protectLength, patchRange);
-            }
+            nativeResult = nativePatchInstruction(
+                    patchAddress,
+                    expectedInstruction,
+                    replacementInstruction,
+                    patchRange.protectionFlags());
+        } catch (Throwable t) {
+            return PatchResult.failed("native_patch_call_failed:" + describeThrowable(t));
+        }
+        if (nativeResult != NATIVE_PATCH_OK
+                && nativeResult != NATIVE_PATCH_ALREADY_APPLIED) {
+            return PatchResult.failed(describeNativePatchResult(nativeResult));
         }
 
         byte[] verify = readMemory(original.address, original.spec.patched.length);
         if (!equalsBytes(verify, original.spec.patched)) {
             return PatchResult.failed("verify_failed");
         }
+        if (nativeResult == NATIVE_PATCH_ALREADY_APPLIED) {
+            return PatchResult.alreadyPatched(
+                    Math.max(1, patchedCount), 0, original.spec.name);
+        }
         return PatchResult.patched(patchAddress, patchedCount, originalCount, original.spec.name);
+    }
+
+    /**
+     * Finds the LHDC fixed-bitrate guard by ARM64 instruction semantics instead of compiler-
+     * generated bytes. OPlus rebuilds this function on nearly every OTA, which changes register
+     * allocation, source-line constants and branch distances even when the logic is unchanged.
+     *
+     * <p>The stable control-flow shape is: CBNZ and B.NE share a forward target, the latter is
+     * guarded by {@code cmp wN, #0x13}, followed by {@code sub xN, xM, #7},
+     * {@code cmp xN, #2}, and {@code b.hs same_target}. The forced path then selects quality mode
+     * 4. We only accept a unique match across executable mappings.</p>
+     */
+    private static SemanticScan scanSemanticGuard(List<MapRange> ranges) {
+        SemanticScan out = new SemanticScan();
+        for (MapRange range : ranges) {
+            if (!range.executable) continue;
+            byte[] bytes = readRange(range);
+            if (bytes == null) continue;
+            for (int offset = 8; offset <= bytes.length - 20; offset += 4) {
+                int branch = readIntLe(bytes, offset);
+                boolean originalBranch = isConditionalBranch(branch, 2);
+                boolean patchedBranch = isUnconditionalBranch(branch);
+                if (!originalBranch && !patchedBranch) continue;
+
+                int cmp = readIntLe(bytes, offset - 4);
+                int sub = readIntLe(bytes, offset - 8);
+                if (!isCmpXImmediate(cmp, 2) || !isSubXImmediate(sub, 7)) continue;
+                if (registerN(cmp) != registerD(sub)) continue;
+
+                long address = range.start + offset;
+                long target = branchTarget(address, branch, originalBranch);
+                if (target <= address || target - address > 0x400L) continue;
+                if (!hasCmp19AndBranchTo(bytes, range.start, offset, target)) continue;
+                if (!hasCbnzTo(bytes, range.start, offset, target)) continue;
+                if (!hasMovWImmediate(bytes, offset + 4, 4, 4)) continue;
+
+                if (originalBranch) {
+                    int replacement = encodeUnconditionalBranch(address, target);
+                    if (replacement == 0) continue;
+                    PatternSpec spec = new PatternSpec(
+                            "semantic_guard_v1",
+                            intLe(branch),
+                            intLe(replacement),
+                            0,
+                            intLe(replacement));
+                    out.originalCount++;
+                    if (out.original == null) {
+                        out.original = new Match(address, range, spec);
+                    }
+                } else {
+                    out.patchedCount++;
+                }
+            }
+        }
+        return out;
+    }
+
+    private static boolean hasCmp19AndBranchTo(
+            byte[] bytes,
+            long rangeStart,
+            int branchOffset,
+            long target) {
+        int first = Math.max(4, branchOffset - 10 * 4);
+        for (int offset = branchOffset - 4; offset >= first; offset -= 4) {
+            int branch = readIntLe(bytes, offset);
+            if (!isConditionalBranch(branch, 1)) continue;
+            if (branchTarget(rangeStart + offset, branch, true) != target) continue;
+            if (isCmpWImmediate(readIntLe(bytes, offset - 4), 0x13)) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasCbnzTo(
+            byte[] bytes,
+            long rangeStart,
+            int branchOffset,
+            long target) {
+        int first = Math.max(0, branchOffset - 14 * 4);
+        for (int offset = branchOffset - 4; offset >= first; offset -= 4) {
+            int instruction = readIntLe(bytes, offset);
+            if (!isCbnz(instruction)) continue;
+            if (branchTarget19(rangeStart + offset, instruction) == target) return true;
+        }
+        return false;
+    }
+
+    private static boolean hasMovWImmediate(
+            byte[] bytes,
+            int start,
+            int instructionCount,
+            int immediate) {
+        int end = Math.min(bytes.length - 4, start + instructionCount * 4);
+        for (int offset = start; offset <= end; offset += 4) {
+            int instruction = readIntLe(bytes, offset);
+            if ((instruction & 0xffe00000) == 0x52800000
+                    && ((instruction >>> 5) & 0xffff) == immediate) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isCmpXImmediate(int instruction, int immediate) {
+        return (instruction & 0xffc0001f) == 0xf100001f
+                && ((instruction >>> 10) & 0xfff) == immediate;
+    }
+
+    private static boolean isCmpWImmediate(int instruction, int immediate) {
+        return (instruction & 0xffc0001f) == 0x7100001f
+                && ((instruction >>> 10) & 0xfff) == immediate;
+    }
+
+    private static boolean isSubXImmediate(int instruction, int immediate) {
+        return (instruction & 0xffc00000) == 0xd1000000
+                && ((instruction >>> 10) & 0xfff) == immediate;
+    }
+
+    private static boolean isConditionalBranch(int instruction, int condition) {
+        return (instruction & 0xff000010) == 0x54000000
+                && (instruction & 0xf) == condition;
+    }
+
+    private static boolean isUnconditionalBranch(int instruction) {
+        return (instruction & 0xfc000000) == 0x14000000;
+    }
+
+    private static boolean isCbnz(int instruction) {
+        return (instruction & 0x7f000000) == 0x35000000;
+    }
+
+    private static int registerN(int instruction) {
+        return (instruction >>> 5) & 0x1f;
+    }
+
+    private static int registerD(int instruction) {
+        return instruction & 0x1f;
+    }
+
+    private static long branchTarget(long address, int instruction, boolean conditional) {
+        if (conditional) return branchTarget19(address, instruction);
+        int immediate = instruction & 0x03ffffff;
+        if ((immediate & 0x02000000) != 0) immediate |= 0xfc000000;
+        return address + ((long) immediate * 4L);
+    }
+
+    private static long branchTarget19(long address, int instruction) {
+        int immediate = (instruction >>> 5) & 0x7ffff;
+        if ((immediate & 0x40000) != 0) immediate |= 0xfff80000;
+        return address + ((long) immediate * 4L);
+    }
+
+    private static int encodeUnconditionalBranch(long address, long target) {
+        long delta = target - address;
+        if ((delta & 3L) != 0) return 0;
+        long immediate = delta / 4L;
+        if (immediate < -(1L << 25) || immediate >= (1L << 25)) return 0;
+        return 0x14000000 | ((int) immediate & 0x03ffffff);
+    }
+
+    private static int readIntLe(byte[] bytes, int offset) {
+        return (bytes[offset] & 0xff)
+                | ((bytes[offset + 1] & 0xff) << 8)
+                | ((bytes[offset + 2] & 0xff) << 16)
+                | ((bytes[offset + 3] & 0xff) << 24);
+    }
+
+    private static byte[] intLe(int value) {
+        return new byte[]{
+                (byte) value,
+                (byte) (value >>> 8),
+                (byte) (value >>> 16),
+                (byte) (value >>> 24)};
     }
 
     private static List<MapRange> readLibraryMaps() throws IOException {
@@ -204,22 +410,6 @@ final class NativeLhdcMemoryPatch {
             return out;
         } catch (Throwable t) {
             throw new Exception("peekByteArray failed: " + describeThrowable(unwrapReflection(t)),
-                    unwrapReflection(t));
-        }
-    }
-
-    private static void writeMemory(long address, byte[] bytes) throws Exception {
-        Method poke = cachedPokeByteArray;
-        if (poke == null) {
-            poke = Class.forName("libcore.io.Memory").getDeclaredMethod(
-                    "pokeByteArray", long.class, byte[].class, int.class, int.class);
-            poke.setAccessible(true);
-            cachedPokeByteArray = poke;
-        }
-        try {
-            poke.invoke(null, address, bytes, 0, bytes.length);
-        } catch (Throwable t) {
-            throw new Exception("pokeByteArray failed: " + describeThrowable(unwrapReflection(t)),
                     unwrapReflection(t));
         }
     }
@@ -270,83 +460,6 @@ final class NativeLhdcMemoryPatch {
         return null;
     }
 
-    private static void restoreProtection(long pageStart, long length, MapRange range) {
-        try {
-            mprotect(pageStart, length, range.protectionFlags());
-        } catch (Throwable t) {
-            MLog.w("lhdc memory patch restore protection failed", t);
-        }
-    }
-
-    private static void makeWritable(long pageStart, long length, MapRange range) throws Exception {
-        int withExec = OsConstants.PROT_READ | OsConstants.PROT_WRITE
-                | (range.executable ? OsConstants.PROT_EXEC : 0);
-        try {
-            mprotect(pageStart, length, withExec);
-        } catch (Throwable first) {
-            if (!range.executable) throw first;
-            MLog.w("lhdc memory patch RWX mprotect failed; retrying RW only: "
-                    + first.getClass().getSimpleName() + ":" + first.getMessage());
-            mprotect(pageStart, length, OsConstants.PROT_READ | OsConstants.PROT_WRITE);
-        }
-    }
-
-    private static void mprotect(long address, long length, int prot) throws Exception {
-        Throwable nativeError = null;
-        try {
-            if (ensureNativeLoaded()) {
-                int rc = nativeMprotect(address, length, prot);
-                if (rc == 0) return;
-                nativeError = new Exception("native rc=" + rc);
-            } else {
-                nativeError = new Exception("native load failed: " + nativeLoadError);
-            }
-        } catch (Throwable t) {
-            nativeError = unwrapReflection(t);
-        }
-
-        Throwable staticError = null;
-        try {
-            Method m = cachedStaticMprotect;
-            if (m == null) {
-                m = Class.forName("android.system.Os").getDeclaredMethod(
-                        "mprotect", long.class, long.class, int.class);
-                m.setAccessible(true);
-                cachedStaticMprotect = m;
-            }
-            m.invoke(null, address, length, prot);
-            return;
-        } catch (Throwable t) {
-            staticError = unwrapReflection(t);
-        }
-
-        try {
-            Object os = cachedLibcoreOs;
-            Method m = cachedLibcoreMprotect;
-            if (os == null || m == null) {
-                Class<?> libcore = Class.forName("libcore.io.Libcore");
-                Field osField = libcore.getDeclaredField("os");
-                osField.setAccessible(true);
-                os = osField.get(null);
-                m = os.getClass().getMethod("mprotect", long.class, long.class, int.class);
-                m.setAccessible(true);
-                cachedLibcoreOs = os;
-                cachedLibcoreMprotect = m;
-            }
-            m.invoke(os, address, length, prot);
-        } catch (Throwable t) {
-            Throwable libcoreError = unwrapReflection(t);
-            Exception combined = new Exception("mprotect unavailable; static="
-                    + describeThrowable(staticError) + " libcore="
-                    + describeThrowable(libcoreError) + " native="
-                    + describeThrowable(nativeError));
-            combined.addSuppressed(nativeError);
-            combined.addSuppressed(staticError);
-            combined.addSuppressed(libcoreError);
-            throw combined;
-        }
-    }
-
     private static synchronized boolean ensureNativeLoaded() {
         if (nativeLoaded) return true;
         if (nativeLoadAttempted) return false;
@@ -381,7 +494,36 @@ final class NativeLhdcMemoryPatch {
         }
     }
 
-    private static native int nativeMprotect(long address, long length, int prot);
+    private static native int nativePatchInstruction(
+            long address,
+            int expectedInstruction,
+            int replacementInstruction,
+            int originalProtection);
+
+    static String describeNativePatchResult(int result) {
+        if (result == NATIVE_PATCH_OK) return "native_patch_ok";
+        if (result == NATIVE_PATCH_ALREADY_APPLIED) return "native_patch_already_applied";
+        if (result == -1001) return "native_patch_invalid_argument";
+        if (result == -1002) return "native_patch_unsupported_architecture";
+        if (result == -1003) return "native_patch_instruction_changed";
+        if (result <= -2001 && result >= -2999) {
+            return "native_patch_make_writable_failed:errno=" + (-2000 - result);
+        }
+        if (result <= -3001 && result >= -3999) {
+            return "native_patch_restore_failed_before_write:errno=" + (-3000 - result);
+        }
+        if (result == -4001) return "native_patch_verify_failed_rolled_back";
+        if (result <= -5001 && result >= -5999) {
+            return "native_patch_restore_failed_rolled_back:errno=" + (-5000 - result);
+        }
+        if (result <= -6001 && result >= -6999) {
+            return "native_patch_restore_failed_permissions_dirty:errno=" + (-6000 - result);
+        }
+        if (result <= -7000 && result >= -7999) {
+            return "native_patch_rollback_verify_failed:errno=" + Math.max(0, -7000 - result);
+        }
+        return "native_patch_unknown_result:" + result;
+    }
 
     private static Throwable unwrapReflection(Throwable t) {
         if (t instanceof InvocationTargetException
@@ -394,22 +536,6 @@ final class NativeLhdcMemoryPatch {
     private static String describeThrowable(Throwable t) {
         if (t == null) return "none";
         return t.getClass().getSimpleName() + ":" + t.getMessage();
-    }
-
-    private static int pageSize() {
-        try {
-            return (int) Os.sysconf(OsConstants._SC_PAGESIZE);
-        } catch (Throwable ignored) {
-            return 4096;
-        }
-    }
-
-    private static long alignDown(long value, long alignment) {
-        return value & ~(alignment - 1L);
-    }
-
-    private static long alignUp(long value, long alignment) {
-        return (value + alignment - 1L) & ~(alignment - 1L);
     }
 
     private static byte[] hex(String value) {
@@ -498,6 +624,12 @@ final class NativeLhdcMemoryPatch {
             this.range = range;
             this.spec = spec;
         }
+    }
+
+    private static final class SemanticScan {
+        Match original;
+        int originalCount;
+        int patchedCount;
     }
 
     private static final class PatternSpec {

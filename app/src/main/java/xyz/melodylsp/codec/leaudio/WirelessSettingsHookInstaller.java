@@ -7,7 +7,6 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.os.Binder;
 import android.os.Handler;
 import android.os.Looper;
 
@@ -18,6 +17,7 @@ import dalvik.system.DexFile;
 
 import xyz.melodylsp.codec.MelodyCodecLspEntry;
 import xyz.melodylsp.codec.util.MLog;
+import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /**
  * Privileged LE Audio toggle bridge installed inside {@code com.oplus.wirelesssettings}
@@ -37,8 +37,9 @@ import xyz.melodylsp.codec.util.MLog;
  *       {@link LeAudioIpc#ACTION_LE_AUDIO_STATE} to melody.</li>
  * </ol>
  *
- * <p>Security: the receiver only acts on broadcasts carrying the shared {@link LeAudioIpc#TOKEN}
- * and (when the caller identity is available) originating from {@code com.oplus.melody}.</p>
+ * <p>Security: every sender must hold OPlus' signature-only component-safe permission. Android
+ * 14+ additionally requires a framework-attributed sender identity belonging to
+ * {@code com.oplus.melody}; the compile-time token is only a protocol marker.</p>
  */
 public final class WirelessSettingsHookInstaller {
 
@@ -104,38 +105,42 @@ public final class WirelessSettingsHookInstaller {
         BroadcastReceiver receiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context ctx, Intent intent) {
-                handleRequest(ctx, intent);
+                handleRequest(ctx, intent, TrustedBroadcasts.captureSender(this));
             }
         };
         IntentFilter filter = new IntentFilter();
         filter.addAction(LeAudioIpc.ACTION_SET_LE_AUDIO);
         filter.addAction(LeAudioIpc.ACTION_QUERY_LE_AUDIO);
-        try {
-            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
-        } catch (Throwable t) {
-            context.registerReceiver(receiver, filter);
+        if (!TrustedBroadcasts.registerExportedReceiver(
+                context,
+                receiver,
+                filter,
+                TrustedBroadcasts.PERMISSION_OPLUS_COMPONENT_SAFE,
+                mainHandler)) {
+            MLog.w("le.ws.receiver registration rejected: signature permission unavailable");
+            return;
         }
         receiverRegistered = true;
         MLog.event("le.ws.receiver.registered");
     }
 
-    private void handleRequest(Context ctx, Intent intent) {
+    private void handleRequest(
+            Context ctx,
+            Intent intent,
+            TrustedBroadcasts.SenderIdentity sender) {
         try {
             if (intent == null) return;
             if (!LeAudioIpc.TOKEN.equals(intent.getStringExtra(LeAudioIpc.EXTRA_TOKEN))) {
-                MLog.w("LE Audio request rejected: bad token");
+                MLog.w("LE Audio request rejected: protocol mismatch");
                 return;
             }
-            if (!isCallerMelody(ctx)) {
-                MLog.w("LE Audio request rejected: caller is not melody");
-                return;
-            }
+            String action = intent.getAction();
+            if (!isAuthorizedRequest(ctx, action, sender)) return;
             String mac = intent.getStringExtra(LeAudioIpc.EXTRA_MAC);
             if (mac == null || mac.isEmpty()) {
                 MLog.w("LE Audio request missing mac");
                 return;
             }
-            String action = intent.getAction();
             if (LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)) {
                 boolean enable = intent.getBooleanExtra(LeAudioIpc.EXTRA_ENABLE, false);
                 // User already confirmed on the melody side; apply directly.
@@ -146,6 +151,27 @@ public final class WirelessSettingsHookInstaller {
         } catch (Throwable t) {
             MLog.e("handleRequest failed", t);
         }
+    }
+
+    private static boolean isAuthorizedRequest(
+            Context ctx,
+            String action,
+            TrustedBroadcasts.SenderIdentity sender) {
+        if (!TrustedBroadcasts.supportsSenderIdentity()) {
+            // Android 12/13 rely on the OPlus signature permission required at registration time.
+            return LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)
+                    || LeAudioIpc.ACTION_QUERY_LE_AUDIO.equals(action);
+        }
+        boolean trusted = TrustedBroadcasts.isTrustedSender(
+                ctx, sender, LeAudioIpc.MELODY_PKG);
+        if (trusted) return true;
+
+        if (LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)) {
+            MLog.w("LE Audio wireless-settings write rejected: sender identity unavailable or untrusted");
+            return false;
+        }
+        MLog.w("LE Audio wireless-settings query rejected: untrusted sender");
+        return false;
     }
 
     /**
@@ -223,7 +249,9 @@ public final class WirelessSettingsHookInstaller {
         reply.putExtra(LeAudioIpc.EXTRA_ENABLED, enabled);
         reply.putExtra(LeAudioIpc.EXTRA_OK, ok);
         try {
-            ctx.sendBroadcast(reply);
+            if (!TrustedBroadcasts.send(ctx, reply)) {
+                MLog.w("le.ws.reply identity send failed");
+            }
             MLog.event("le.ws.reply", "supported", supported, "enabled", enabled, "ok", ok);
         } catch (Throwable t) {
             MLog.w("replyState sendBroadcast failed", t);
@@ -320,23 +348,6 @@ public final class WirelessSettingsHookInstaller {
             return adapter != null ? adapter.getRemoteDevice(mac) : null;
         } catch (Throwable t) {
             return null;
-        }
-    }
-
-    private static boolean isCallerMelody(Context ctx) {
-        try {
-            int uid = Binder.getCallingUid();
-            if (uid <= 0 || uid == android.os.Process.myUid()) {
-                return true;
-            }
-            String[] packages = ctx.getPackageManager().getPackagesForUid(uid);
-            if (packages == null) return true;
-            for (String pkg : packages) {
-                if (LeAudioIpc.MELODY_PKG.equals(pkg)) return true;
-            }
-            return false;
-        } catch (Throwable t) {
-            return true;
         }
     }
 

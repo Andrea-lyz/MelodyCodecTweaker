@@ -106,7 +106,12 @@ public final class CodecRequest implements Parcelable {
     public String toString() {
         return String.format(Locale.ROOT,
                 "CodecRequest{mac=%s codec=0x%x specific1=%d rate=0x%x bits=0x%x channel=0x%x}",
-                mac, codecType, codecSpecific1, sampleRate, bitsPerSample, channelMode);
+                redactedMac(mac), codecType, codecSpecific1, sampleRate, bitsPerSample, channelMode);
+    }
+
+    private static String redactedMac(String value) {
+        if (value == null || value.length() < 5) return "??";
+        return value.substring(0, 2) + "**" + value.substring(value.length() - 2);
     }
 
     /** Mutable builder; create a fresh one for each derived request. */
