@@ -10,31 +10,24 @@ import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.IntentFilter;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.Paint;
-import android.graphics.RectF;
-import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.GradientDrawable;
-import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
-import android.text.TextUtils;
 import android.util.DisplayMetrics;
-import android.util.TypedValue;
 import android.view.Gravity;
-import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.animation.PathInterpolator;
-import android.widget.FrameLayout;
-import android.widget.LinearLayout;
+import android.widget.AbsListView;
+import android.widget.AdapterView;
+import android.widget.ArrayAdapter;
+import android.widget.ListPopupWindow;
+import android.widget.ListView;
 import android.widget.PopupWindow;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
@@ -42,6 +35,7 @@ import java.util.Enumeration;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
@@ -64,7 +58,7 @@ import xyz.melodylsp.codec.util.TrustedBroadcasts;
  * intents through {@link CodecBridgeClient}.
  *
  * <p>Quality and sample-rate rows are plain {@code Preference} entries whose click handler
- * pops a hand-rolled small floating {@link PopupWindow}. We deliberately avoid {@code ListPreference}: R8
+ * pops a native themed {@link ListPopupWindow}. We deliberately avoid {@code ListPreference}: R8
  * stripped {@code setEntries} / {@code setEntryValues} from the host APK because the host
  * never calls them in code, so the AOSP {@code ListPreferenceDialogFragmentCompat} crashes
  * the moment the user taps the row, regardless of how we try to populate the entries by
@@ -90,6 +84,8 @@ public final class CodecController {
     private static final long REMEMBER_CONFIRM_RECHECK_DELAY_MS = 2_000L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
+    private static volatile boolean couiPopupDiscoveryAttempted;
+    private static volatile String[] discoveredCouiPopupBinding;
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
@@ -624,8 +620,7 @@ public final class CodecController {
             return;
         }
 
-        AlertDialog dialog = new android.app.AlertDialog.Builder(
-                activity, android.R.style.Theme_Material_Light_Dialog_Alert)
+        AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                 .setTitle(title)
                 .setMessage(message)
                 .setPositiveButton(positive, (d, w) -> {
@@ -635,12 +630,7 @@ public final class CodecController {
                 .setNegativeButton(negative, (d, w) -> d.dismiss())
                 .setCancelable(true)
                 .create();
-        dialog.setOnShowListener(d -> {
-            tintFallbackDialog(dialog);
-            mainHandler.postDelayed(() -> tintFallbackDialog(dialog), 60L);
-        });
         dialog.show();
-        tintFallbackDialog(dialog);
     }
 
     private void requestLeAudioToggle(Subscription sub, boolean enable) {
@@ -960,35 +950,6 @@ public final class CodecController {
         return null;
     }
 
-    private static void tintFallbackDialog(AlertDialog dialog) {
-        try {
-            int blue = Color.rgb(0, 105, 255);
-            int text = Color.rgb(25, 25, 25);
-            if (dialog.getWindow() != null) {
-                dialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.WHITE));
-            }
-            View decor = dialog.getWindow() != null ? dialog.getWindow().getDecorView() : null;
-            tintDialogText(decor, text);
-            TextView positive = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
-            TextView negative = dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
-            if (positive != null) positive.setTextColor(blue);
-            if (negative != null) negative.setTextColor(blue);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void tintDialogText(View view, int color) {
-        if (view == null) return;
-        if (view instanceof TextView) {
-            ((TextView) view).setTextColor(color);
-        }
-        if (!(view instanceof ViewGroup)) return;
-        ViewGroup group = (ViewGroup) view;
-        for (int i = 0; i < group.getChildCount(); i++) {
-            tintDialogText(group.getChildAt(i), color);
-        }
-    }
-
     /** Reflect the tracked LE Audio state onto the switch widget (visibility + checked + summary). */
     private void applyLeAudioToSwitch(Subscription sub) {
         if (!isSubscriptionActive(sub)) return;
@@ -1190,7 +1151,7 @@ public final class CodecController {
             return;
         }
         try {
-            showChoicePopup(sub, sourcePref, dialogContext, entries, checked, which -> {
+            showChoicePopup(sub, sourcePref, entries, checked, which -> {
                 int action = actions[which];
                 if (action == CODEC_MODE_AAC) {
                     if (snapshot.activeCodecType == CodecLabelTable.CODEC_AAC) {
@@ -1249,7 +1210,7 @@ public final class CodecController {
         }
         boolean finalPreserveLhdcHighBits = preserveLhdcHighBits;
         try {
-            showChoicePopup(sub, sourcePref, dialogContext, entries, checked, which -> {
+            showChoicePopup(sub, sourcePref, entries, checked, which -> {
                 long picked = finalOptions[which];
                 if (finalPreserveLhdcHighBits) {
                     picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
@@ -1310,7 +1271,7 @@ public final class CodecController {
             return;
         }
         try {
-            showChoicePopup(sub, sourcePref, dialogContext, entries, checked, which -> {
+            showChoicePopup(sub, sourcePref, entries, checked, which -> {
                 int hz = finalRates[which];
                 int bit = sampleRateHzToBit(hz);
                 if (bit < 0) return;
@@ -1333,286 +1294,318 @@ public final class CodecController {
     private static void showChoicePopup(
             Subscription sub,
             Object sourcePref,
-            Context dialogContext,
             CharSequence[] entries,
             int checked,
             ChoiceCallback callback) {
         Activity activity = resolveLiveActivity(sub);
         if (activity == null || activity.getWindow() == null) return;
-        Context popupContext = dialogContext != null ? dialogContext : activity;
         View anchor = findPreferenceView(sub, activity, sourcePref);
-        View root = anchor != null ? anchor.getRootView() : fragmentRootView(sub.fragment);
-        if (root == null) root = activity.getWindow().getDecorView();
-        if (root == null) return;
+        if (anchor == null) anchor = fragmentRootView(sub.fragment);
+        if (anchor == null) anchor = activity.getWindow().getDecorView();
+        if (anchor == null) return;
 
-        final PopupWindow[] popupRef = new PopupWindow[1];
-        final boolean[] dismissing = {false};
-        PopupShadowLayout shell = new PopupShadowLayout(popupContext, dp(popupContext, 12));
-        shell.setClipToPadding(false);
-        shell.setClipChildren(false);
-        int shadowPad = dp(popupContext, 32);
-        shell.setPadding(shadowPad, shadowPad, shadowPad, shadowPad);
+        Context couiContext = resolveLiveDialogContext(sub);
+        if (couiContext == null) couiContext = activity;
+        if (showCouiChoicePopup(couiContext, anchor, entries, checked, callback)) return;
 
-        LinearLayout list = new LinearLayout(popupContext);
-        list.setOrientation(LinearLayout.VERTICAL);
-        list.setPadding(0, dp(popupContext, 2), 0, dp(popupContext, 2));
-        int horizontal = dp(popupContext, 16);
-        int vertical = dp(popupContext, 8);
-        int rowHeight = dp(popupContext, 48);
-        int blue = Color.rgb(0, 105, 255);
-        int textColor = Color.argb(230, 0, 0, 0);
-        int dividerColor = Color.argb(20, 0, 0, 0);
-
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.WHITE);
-        bg.setCornerRadius(dp(popupContext, 12));
-        list.setBackground(bg);
-        if (Build.VERSION.SDK_INT >= 21) {
-            list.setClipToOutline(true);
-        }
-
-        for (int i = 0; i < entries.length; i++) {
-            final int index = i;
-            LinearLayout row = new LinearLayout(popupContext);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            row.setPadding(horizontal, vertical, horizontal, vertical);
-            row.setMinimumHeight(rowHeight);
-
-            TextView title = new TextView(popupContext);
-            title.setText(entries[i]);
-            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-            title.setTypeface(Typeface.create("sans-serif-regular", Typeface.NORMAL));
-            title.setSingleLine(true);
-            title.setHorizontallyScrolling(false);
-            title.setMaxLines(1);
-            title.setEllipsize(TextUtils.TruncateAt.END);
-            if (Build.VERSION.SDK_INT >= 26) {
-                title.setAutoSizeTextTypeUniformWithConfiguration(
-                        13, 16, 1, TypedValue.COMPLEX_UNIT_SP);
-            }
-            title.setGravity(Gravity.CENTER_VERTICAL);
-            title.setTextColor(i == checked ? blue : textColor);
-            row.addView(title, new LinearLayout.LayoutParams(
-                    0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-
-            if (i == checked) {
-                row.addView(new CheckMarkView(popupContext, blue), new LinearLayout.LayoutParams(
-                        dp(popupContext, 24), dp(popupContext, 24)));
-            }
-
-            row.setOnClickListener(v -> {
-                PopupWindow popup = popupRef[0];
-                dismissPopupAnimated(popup, shell, dismissing, () -> callback.onChoice(index));
-            });
-            list.addView(row, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-
-            if (i + 1 < entries.length) {
-                View divider = new View(popupContext);
-                divider.setBackgroundColor(dividerColor);
-                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                        LinearLayout.LayoutParams.MATCH_PARENT, 1);
-                lp.setMargins(horizontal, 0, horizontal, 0);
-                list.addView(divider, lp);
-            }
-        }
-        shell.addView(list, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT));
-
-        DisplayMetrics metrics = popupContext.getResources().getDisplayMetrics();
-        int edgeMargin = popupEdgeMargin(popupContext, metrics);
-        int contentWidth = Math.min(metrics.widthPixels - edgeMargin * 2 - shadowPad * 2,
-                dp(popupContext, 208));
-        int width = contentWidth + shadowPad * 2;
-        PopupWindow popup = new PopupWindow(
-                shell, width, LinearLayout.LayoutParams.WRAP_CONTENT, true);
-        popupRef[0] = popup;
-        preparePopupEnter(shell);
-        popup.setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
-        popup.setOutsideTouchable(true);
-        popup.setClippingEnabled(false);
-        popup.setInputMethodMode(PopupWindow.INPUT_METHOD_NOT_NEEDED);
-        popup.setAnimationStyle(0);
-        popup.setTouchInterceptor((v, event) -> {
-            if (event != null && event.getAction() == MotionEvent.ACTION_OUTSIDE) {
-                dismissPopupAnimated(popup, shell, dismissing, null);
-                return true;
-            }
-            return false;
+        // Compatibility fallback for Melody builds where the bundled COUI popup was renamed.
+        ArrayAdapter<CharSequence> adapter = new ArrayAdapter<>(
+                activity,
+                android.R.layout.simple_list_item_single_choice,
+                android.R.id.text1,
+                entries);
+        ListPopupWindow popup = new ListPopupWindow(activity);
+        popup.setAdapter(adapter);
+        popup.setAnchorView(anchor);
+        popup.setModal(true);
+        popup.setDropDownGravity(Gravity.END);
+        popup.setWidth(dp(activity, 208));
+        popup.setVerticalOffset(-anchor.getHeight());
+        popup.setOnItemClickListener((parent, view, position, id) -> {
+            popup.dismiss();
+            callback.onChoice(position);
         });
-        if (Build.VERSION.SDK_INT >= 21) {
-            popup.setElevation(0);
+        popup.show();
+
+        ListView list = popup.getListView();
+        if (list != null) {
+            list.setChoiceMode(AbsListView.CHOICE_MODE_SINGLE);
+            if (checked >= 0 && checked < entries.length) {
+                list.setItemChecked(checked, true);
+                popup.setSelection(checked);
+            }
         }
-        int x = metrics.widthPixels - edgeMargin - width + shadowPad;
-        int y = Math.round(metrics.heightPixels * 0.38f);
-        if (anchor != null) {
-            int[] loc = new int[2];
-            anchor.getLocationInWindow(loc);
-            int boundaryRight = findPopupRightBoundary(anchor, popupContext, metrics);
-            x = boundaryRight - width + shadowPad;
-            x = Math.max(edgeMargin,
-                    Math.min(x, metrics.widthPixels - edgeMargin - width + shadowPad));
-            y = loc[1] - dp(popupContext, 8) - shadowPad;
-        }
-        int popupHeightEstimate = entries.length * rowHeight
-                + Math.max(0, entries.length - 1)
-                + dp(popupContext, 4) + shadowPad * 2;
-        int minY = dp(popupContext, 96);
-        int maxY = Math.max(minY,
-                metrics.heightPixels - popupHeightEstimate - dp(popupContext, 96));
-        y = Math.max(minY, Math.min(y, maxY));
-        popup.showAtLocation(root, Gravity.TOP | Gravity.START, x, y);
-        startPopupEnter(shell);
     }
 
-    private static void preparePopupEnter(View content) {
-        content.setAlpha(0f);
-        content.setScaleX(0.96f);
-        content.setScaleY(0.96f);
-    }
-
-    private static void startPopupEnter(View content) {
-        content.post(() -> {
-            setPopupAnimationPivot(content);
-            content.animate().cancel();
-            content.animate()
-                    .alpha(1f)
-                    .scaleX(1f)
-                    .scaleY(1f)
-                    .setDuration(220L)
-                    .setInterpolator(new PathInterpolator(0.33f, 0f, 0.67f, 1f))
-                    .start();
-        });
-    }
-
-    private static void dismissPopupAnimated(
-            PopupWindow popup,
-            View content,
-            boolean[] dismissing,
-            Runnable afterDismiss) {
-        if (popup == null || !popup.isShowing()) {
-            if (afterDismiss != null) afterDismiss.run();
-            return;
-        }
-        if (dismissing[0]) return;
-        dismissing[0] = true;
-        setPopupAnimationPivot(content);
-        content.animate().cancel();
-        final boolean[] finished = {false};
-        Runnable finish = () -> {
-            if (finished[0]) return;
-            finished[0] = true;
-            if (popup.isShowing()) popup.dismiss();
-            if (afterDismiss != null) afterDismiss.run();
+    private static boolean showCouiChoicePopup(
+            Context context,
+            View anchor,
+            CharSequence[] entries,
+            int checked,
+            ChoiceCallback callback) {
+        String[][] bindings = {
+                {
+                        "L2.e", "L2.o", "g", "i", "j", "v"
+                },
+                {
+                        "J2.C0399e", "J2.q", "f2733g", "f2735i", "f2736j", "f2645v"
+                },
+                {
+                        "Y1.C0480e", "Y1.o", "f", "f5923g", "f5924h", "f5840v"
+                }
         };
-        content.animate()
-                .alpha(0f)
-                .scaleX(0.98f)
-                .scaleY(0.98f)
-                .setDuration(160L)
-                .setInterpolator(new PathInterpolator(0.33f, 0f, 0.67f, 1f))
-                .withEndAction(finish)
-                .start();
-        content.postDelayed(finish, 220L);
-    }
-
-    private static void setPopupAnimationPivot(View content) {
-        content.setPivotX(content.getWidth() - content.getPaddingRight());
-        content.setPivotY(content.getPaddingTop());
-    }
-
-    private static final class PopupShadowLayout extends FrameLayout {
-        private final Paint shadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final RectF shadowRect = new RectF();
-        private final float cornerRadius;
-        private final float density;
-
-        PopupShadowLayout(Context context, float cornerRadius) {
-            super(context);
-            this.cornerRadius = cornerRadius;
-            this.density = Math.max(1f, context.getResources().getDisplayMetrics().density);
-            shadowPaint.setColor(Color.WHITE);
-            shadowPaint.setStyle(Paint.Style.FILL);
-            shadowPaint.setShadowLayer(20f * density, 0f, 5f * density,
-                    Color.argb(30, 0, 0, 0));
-            setLayerType(View.LAYER_TYPE_SOFTWARE, null);
-            setWillNotDraw(false);
+        for (String[] binding : bindings) {
+            if (tryShowCouiChoicePopup(
+                    context, anchor, entries, checked, callback, binding)) return true;
         }
 
-        @Override
-        protected void onDraw(Canvas canvas) {
-            shadowRect.set(
-                    getPaddingLeft(),
-                    getPaddingTop(),
-                    getWidth() - getPaddingRight(),
-                    getHeight() - getPaddingBottom());
-            canvas.drawRoundRect(shadowRect, cornerRadius, cornerRadius, shadowPaint);
-            super.onDraw(canvas);
+        String[] discovered = discoverCouiPopupBinding(context);
+        if (discovered != null
+                && tryShowCouiChoicePopup(
+                        context, anchor, entries, checked, callback, discovered)) {
+            return true;
         }
+        MLog.event("ui.choice.popup", "impl", "framework_fallback", "count", entries.length);
+        return false;
     }
 
-    private static final class CheckMarkView extends View {
-        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private static boolean tryShowCouiChoicePopup(
+            Context context,
+            View anchor,
+            CharSequence[] entries,
+            int checked,
+            ChoiceCallback callback,
+            String[] binding) {
+        try {
+            ClassLoader loader = context.getClassLoader();
+            Class<?> popupClass = Class.forName(binding[0], false, loader);
+            Class<?> itemClass = Class.forName(binding[1], false, loader);
+            Object popupObject = popupClass.getConstructor(Context.class).newInstance(context);
+            if (!(popupObject instanceof PopupWindow)) return false;
+            PopupWindow popup = (PopupWindow) popupObject;
 
-        CheckMarkView(Context context, int color) {
-            super(context);
-            float density = context.getResources().getDisplayMetrics().density;
-            paint.setColor(color);
-            paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(Math.max(1.5f, 1.7f * density));
-            paint.setStrokeCap(Paint.Cap.ROUND);
-            paint.setStrokeJoin(Paint.Join.ROUND);
-        }
-
-        @Override
-        protected void onDraw(Canvas canvas) {
-            super.onDraw(canvas);
-            float w = getWidth();
-            float h = getHeight();
-            canvas.drawLine(w * 0.20f, h * 0.54f, w * 0.42f, h * 0.74f, paint);
-            canvas.drawLine(w * 0.42f, h * 0.74f, w * 0.82f, h * 0.26f, paint);
-        }
-    }
-
-    private static int findPopupRightBoundary(View anchor, Context context, DisplayMetrics metrics) {
-        int edgeMargin = popupEdgeMargin(context, metrics);
-        int fallbackRight = metrics.widthPixels - edgeMargin;
-        if (anchor == null) return fallbackRight;
-        int[] loc = new int[2];
-        int bestRight = 0;
-        int bestDistance = Integer.MAX_VALUE;
-        View cur = anchor;
-        int minCardWidth = Math.round(metrics.widthPixels * 0.55f);
-        int tolerance = dp(context, 12);
-        while (cur != null) {
-            int width = cur.getWidth();
-            cur.getLocationInWindow(loc);
-            int right = loc[0] + width;
-            int distance = Math.abs(right - fallbackRight);
-            if (width >= minCardWidth
-                    && distance <= tolerance
-                    && distance < bestDistance) {
-                bestRight = right;
-                bestDistance = distance;
+            ArrayList<Object> items = new ArrayList<>(entries.length);
+            for (int i = 0; i < entries.length; i++) {
+                Object item = itemClass.getDeclaredConstructor().newInstance();
+                setField(item, binding[2], String.valueOf(entries[i]));
+                setField(item, binding[3], i == checked);
+                setField(item, binding[4], true);
+                items.add(item);
             }
-            Object parent = cur.getParent();
-            cur = parent instanceof View ? (View) parent : null;
+
+            Method setItems = findCouiSetItemsMethod(popupClass);
+            if (setItems == null) throw new NoSuchMethodException(binding[0] + " setItems");
+            setItems.invoke(popupObject, items);
+            popup.setTouchable(true);
+            popup.setFocusable(true);
+            popup.setOutsideTouchable(true);
+            popup.update();
+
+            AdapterView.OnItemClickListener listener = (parent, view, position, id) -> {
+                popup.dismiss();
+                callback.onChoice(position);
+            };
+            setField(popupObject, binding[5], listener);
+
+            Method show = findCouiPopupShowMethod(popupClass);
+            if (show == null) throw new NoSuchMethodException(binding[0] + " show");
+            // COUI treats explicit offsets as a point inside the anchor.  Put that point on
+            // the row's physical right edge so the popup opens inward and its right edge
+            // follows the preference/card boundary.  MIN_VALUE asks COUI to center on the
+            // whole anchor, which leaves the popup fixed in the middle of a full-width row.
+            int anchorX = anchor.getWidth();
+            int anchorY = anchor.getHeight() / 2;
+            Class<?>[] params = show.getParameterTypes();
+            if (View.class.isAssignableFrom(params[0])) {
+                show.invoke(popupObject, anchor, anchorX, anchorY);
+            } else {
+                show.invoke(popupObject, anchorX, anchorY, anchor);
+            }
+            MLog.event("ui.choice.popup", "impl", binding[0], "count", entries.length);
+            return true;
+        } catch (Throwable t) {
+            Throwable cause = t.getCause() != null ? t.getCause() : t;
+            MLog.event("ui.choice.popup.candidate_failed",
+                    "impl", binding[0],
+                    "error", cause.getClass().getSimpleName());
+            return false;
         }
-        if (bestRight > 0) return bestRight;
-        return fallbackRight;
     }
 
-    private static int popupEdgeMargin(Context context, DisplayMetrics metrics) {
-        float density = metrics.density > 0f
-                ? metrics.density
-                : context.getResources().getDisplayMetrics().density;
-        if (density <= 0f) density = 1f;
-        int widthDp = Math.round(metrics.widthPixels / density);
-        int heightDp = Math.round(metrics.heightPixels / density);
-        if (widthDp >= 840 && heightDp >= 480) return dp(context, 40);
-        if (widthDp >= 600) return dp(context, 24);
-        return dp(context, 16);
+    private static Method findCouiSetItemsMethod(Class<?> popupClass) {
+        for (Method method : popupClass.getMethods()) {
+            Class<?>[] params = method.getParameterTypes();
+            if (params.length == 1
+                    && List.class.isAssignableFrom(params[0])
+                    && method.getReturnType() == void.class) {
+                return method;
+            }
+        }
+        return null;
+    }
+
+    private static Method findCouiPopupShowMethod(Class<?> popupClass) {
+        for (Method method : popupClass.getMethods()) {
+            if (method.getDeclaringClass() != popupClass
+                    || method.getReturnType() != void.class
+                    || Modifier.isStatic(method.getModifiers())) continue;
+            Class<?>[] params = method.getParameterTypes();
+            if (params.length != 3) continue;
+            boolean viewFirst = View.class.isAssignableFrom(params[0])
+                    && params[1] == int.class && params[2] == int.class;
+            boolean viewLast = params[0] == int.class && params[1] == int.class
+                    && View.class.isAssignableFrom(params[2]);
+            if (viewFirst || viewLast) return method;
+        }
+        return null;
+    }
+
+    private static String[] discoverCouiPopupBinding(Context context) {
+        if (couiPopupDiscoveryAttempted) return discoveredCouiPopupBinding;
+        synchronized (CodecController.class) {
+            if (couiPopupDiscoveryAttempted) return discoveredCouiPopupBinding;
+            discoveredCouiPopupBinding = scanCouiPopupBinding(context);
+            couiPopupDiscoveryAttempted = true;
+            return discoveredCouiPopupBinding;
+        }
+    }
+
+    private static String[] scanCouiPopupBinding(Context context) {
+        DexFile dex = null;
+        try {
+            String sourceDir = context.getApplicationInfo() != null
+                    ? context.getApplicationInfo().sourceDir : null;
+            if (sourceDir == null) return null;
+            dex = new DexFile(sourceDir);
+            Enumeration<String> entries = dex.entries();
+            ArrayList<String> compactClasses = new ArrayList<>();
+            while (entries.hasMoreElements()) {
+                String name = entries.nextElement();
+                if (isCompactObfuscatedClass(name)) compactClasses.add(name);
+            }
+
+            ClassLoader loader = context.getClassLoader();
+            for (String popupName : compactClasses) {
+                Class<?> popupClass;
+                try {
+                    popupClass = Class.forName(popupName, false, loader);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                Class<?> parent = popupClass.getSuperclass();
+                if (parent == null
+                        || !"com.coui.appcompat.poplist.a".equals(parent.getName())
+                        || !PopupWindow.class.isAssignableFrom(popupClass)
+                        || findCouiSetItemsMethod(popupClass) == null
+                        || findCouiPopupShowMethod(popupClass) == null) {
+                    continue;
+                }
+                try {
+                    popupClass.getConstructor(Context.class);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+
+                Field listener = firstFieldOfType(
+                        popupClass, AdapterView.OnItemClickListener.class);
+                if (listener == null) continue;
+                String packageName = popupClass.getPackage() != null
+                        ? popupClass.getPackage().getName() : "";
+                for (String itemName : compactClasses) {
+                    if (!itemName.startsWith(packageName + ".")) continue;
+                    Class<?> itemClass;
+                    try {
+                        itemClass = Class.forName(itemName, false, loader);
+                        itemClass.getDeclaredConstructor();
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    Field[] itemFields = popupItemFields(itemClass);
+                    if (itemFields == null) continue;
+                    String[] binding = {
+                            popupClass.getName(),
+                            itemClass.getName(),
+                            itemFields[0].getName(),
+                            itemFields[1].getName(),
+                            itemFields[2].getName(),
+                            listener.getName()
+                    };
+                    MLog.event("ui.choice.popup.discovered",
+                            "impl", binding[0], "item", binding[1]);
+                    return binding;
+                }
+            }
+        } catch (Throwable t) {
+            MLog.event("ui.choice.popup.discovery_failed",
+                    "error", t.getClass().getSimpleName());
+        } finally {
+            if (dex != null) {
+                try {
+                    dex.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private static boolean isCompactObfuscatedClass(String name) {
+        if (name == null || name.indexOf('$') >= 0) return false;
+        int dot = name.indexOf('.');
+        if (dot <= 0 || dot != name.lastIndexOf('.')) return false;
+        String packageName = name.substring(0, dot);
+        return packageName.length() <= 3;
+    }
+
+    private static Field firstFieldOfType(Class<?> cls, Class<?> fieldType) {
+        ArrayList<Field> matches = new ArrayList<>();
+        for (Field field : cls.getDeclaredFields()) {
+            if (!Modifier.isStatic(field.getModifiers()) && field.getType() == fieldType) {
+                matches.add(field);
+            }
+        }
+        if (matches.isEmpty()) return null;
+        matches.sort((left, right) -> left.getName().compareTo(right.getName()));
+        return matches.get(0);
+    }
+
+    /** Returns text, selected and enabled fields for the bundled PopupListItem model. */
+    private static Field[] popupItemFields(Class<?> itemClass) {
+        if (itemClass.getSuperclass() != Object.class
+                || !Modifier.isFinal(itemClass.getModifiers())) return null;
+        Field text = null;
+        int stringCount = 0;
+        int intCount = 0;
+        int drawableCount = 0;
+        int listCount = 0;
+        ArrayList<Field> booleans = new ArrayList<>();
+        for (Field field : itemClass.getDeclaredFields()) {
+            if (Modifier.isStatic(field.getModifiers())) continue;
+            Class<?> type = field.getType();
+            if (type == String.class) {
+                text = field;
+                stringCount++;
+            }
+            else if (type == boolean.class) booleans.add(field);
+            else if (type == int.class) intCount++;
+            else if ("android.graphics.drawable.Drawable".equals(type.getName())) drawableCount++;
+            else if (ArrayList.class.isAssignableFrom(type)) listCount++;
+        }
+        if (stringCount != 1 || text == null || booleans.size() != 2 || intCount < 4
+                || drawableCount != 1 || listCount != 1) return null;
+        booleans.sort((left, right) -> left.getName().compareTo(right.getName()));
+        return new Field[]{text, booleans.get(0), booleans.get(1)};
+    }
+
+    private static void setField(Object target, String name, Object value) throws Exception {
+        Field field;
+        try {
+            field = target.getClass().getField(name);
+        } catch (NoSuchFieldException ignored) {
+            field = target.getClass().getDeclaredField(name);
+            field.setAccessible(true);
+        }
+        field.set(target, value);
     }
 
     private static Activity resolveLiveActivity(Subscription sub) {
