@@ -45,6 +45,7 @@ import dalvik.system.DexFile;
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
+import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.bt.BluetoothCodecReflect;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
@@ -103,6 +104,8 @@ public final class CodecController {
     private final Map<String, Long> classicRestoreDeadlines = new HashMap<>();
     private final Map<String, CodecSnapshot> lastHighQualitySnapshots = new HashMap<>();
     private final Map<String, Long> codecWriteGenerations = new HashMap<>();
+    /** Logical LHDC policy is separate from AUTO used by the quality governor on the wire. */
+    private final Map<String, Integer> lhdcPoliciesByMac = new HashMap<>();
     private BroadcastReceiver memorySnapshotReceiver;
     private volatile boolean nativePatchUnsupported;
 
@@ -1001,7 +1004,7 @@ public final class CodecController {
         if (PrefRef.isVisible(sub.prefs.codecModeOption)) {
             PrefRef.setSummary(sub.prefs.codecModeOption, STATE_RESTORING_CLASSIC);
         }
-        PrefRef.setSummary(sub.prefs.qualityOption, STATE_RESTORING_CLASSIC);
+        PrefRef.setSummary(sub.prefs.qualityOption, "");
         PrefRef.setSummary(sub.prefs.sampleRateOption, STATE_RESTORING_CLASSIC);
         setBlockDisabled(sub, true);
         if (sub.prefs.leAudioSwitch != null) {
@@ -1195,10 +1198,15 @@ public final class CodecController {
         }
         CharSequence[] entries = new CharSequence[options.length];
         int checked = -1;
+        int selectedPolicy = preserveLhdcHighBits
+                ? selectedLhdcPolicy(sub.mac, snapshot)
+                : -1;
         for (int i = 0; i < options.length; i++) {
             entries[i] = CodecLabelTable.qualityLabel(context, snapshot.activeCodecType, options[i]);
-            if (qualityValueMatches(snapshot.activeCodecType,
-                    options[i], snapshot.activeCodecSpecific1)) {
+            if (preserveLhdcHighBits
+                    ? LhdcQualityPolicy.normalize((int) (options[i] & 0xFFL)) == selectedPolicy
+                    : qualityValueMatches(snapshot.activeCodecType,
+                            options[i], snapshot.activeCodecSpecific1)) {
                 checked = i;
             }
         }
@@ -1213,13 +1221,32 @@ public final class CodecController {
             showChoicePopup(sub, sourcePref, entries, checked, which -> {
                 long picked = finalOptions[which];
                 if (finalPreserveLhdcHighBits) {
+                    int previousPolicy = selectedLhdcPolicy(sub.mac, snapshot);
+                    int pickedPolicy = LhdcQualityPolicy.normalize((int) (picked & 0xFFL));
+                    lhdcPoliciesByMac.put(sub.mac, pickedPolicy);
                     picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
+                    if (pickedPolicy == previousPolicy) {
+                        LhdcQualityPolicy.send(
+                                context, sub.mac, pickedPolicy, "quality_picker_reaffirm");
+                        refreshSnapshot(sub);
+                        return;
+                    }
                 }
                 CodecRequest.Builder builder = CodecRequest.fromActive(snapshot)
                         .withSpecific1(picked);
                 builder.withSampleRate(linkedSampleRateForQuality(snapshot, picked));
                 CodecRequest req = builder.build();
-                applyWrite(sub, req);
+                if (finalPreserveLhdcHighBits) {
+                    int previousPolicy = selectedPolicy;
+                    applyWrite(sub, req, (result, error) -> {
+                        lhdcPoliciesByMac.put(sub.mac, previousPolicy);
+                        LhdcQualityPolicy.send(
+                                context, sub.mac, previousPolicy, "quality_picker_rollback");
+                        return false;
+                    });
+                } else {
+                    applyWrite(sub, req);
+                }
             });
         } catch (Throwable t) {
             MLog.e("showQualityPicker dialog.show failed", t);
@@ -1237,6 +1264,32 @@ public final class CodecController {
             options = CodecLabelTable.qualityFallback(snapshot.activeCodecType);
         }
         return options != null ? options : new long[0];
+    }
+
+    private int selectedLhdcPolicy(String mac, CodecSnapshot snapshot) {
+        Integer sessionPolicy = mac != null ? lhdcPoliciesByMac.get(mac) : null;
+        if (sessionPolicy != null) return LhdcQualityPolicy.normalize(sessionPolicy);
+        PreferenceStore.RememberedValue remembered = mac != null ? prefs.readSnapshot(mac) : null;
+        if (remembered != null
+                && snapshot != null
+                && sameCodecFamily(remembered.codecType, snapshot.activeCodecType)) {
+            int policy = LhdcQualityPolicy.fromSpecific1(remembered.codecSpecific1);
+            lhdcPoliciesByMac.put(mac, policy);
+            return policy;
+        }
+        return LhdcQualityPolicy.fromSpecific1(
+                snapshot != null ? snapshot.activeCodecSpecific1 : 0L);
+    }
+
+    private int lhdcPolicyForRequest(Subscription sub, CodecRequest request) {
+        if (request == null || !CodecLabelTable.isLhdc(request.codecType)) {
+            return LhdcQualityPolicy.ADAPTIVE;
+        }
+        Integer selected = sub != null && sub.mac != null
+                ? lhdcPoliciesByMac.get(sub.mac) : null;
+        return selected != null
+                ? LhdcQualityPolicy.normalize(selected)
+                : LhdcQualityPolicy.fromSpecific1(request.codecSpecific1);
     }
 
     private void showSampleRatePicker(Subscription sub, Object sourcePref) {
@@ -1841,7 +1894,11 @@ public final class CodecController {
         prefs.writeSnapshot(
                 snapshot.mac,
                 snapshot.activeCodecType,
-                snapshot.activeCodecSpecific1,
+                CodecLabelTable.isLhdc(snapshot.activeCodecType)
+                        ? LhdcQualityPolicy.logicalSpecific1(
+                                snapshot.activeCodecSpecific1,
+                                selectedLhdcPolicy(snapshot.mac, snapshot))
+                        : snapshot.activeCodecSpecific1,
                 snapshot.activeSampleRate);
         MLog.event("remember.write.initialized",
                 "mac", A2dpRouteReadiness.redactMac(snapshot.mac),
@@ -1914,8 +1971,14 @@ public final class CodecController {
                     "request", request);
             return;
         }
-        replayer.onUserCodecWrite(sub != null ? sub.mac : null, request, "codec_write");
-        bridge.setCodec(request, () -> isCurrentCodecWrite(sub, generation))
+        int lhdcPolicy = lhdcPolicyForRequest(sub, request);
+        CodecRequest transportRequest = LhdcQualityPolicy.transportRequest(request, lhdcPolicy);
+        if (CodecLabelTable.isLhdc(request.codecType)) {
+            LhdcQualityPolicy.send(context, sub.mac, lhdcPolicy, "codec_write");
+        }
+        replayer.onUserCodecWrite(
+                sub != null ? sub.mac : null, transportRequest, "codec_write");
+        bridge.setCodec(transportRequest, () -> isCurrentCodecWrite(sub, generation))
                 .whenComplete((result, ex) -> mainHandler.post(() -> {
             if (!isCurrentCodecWrite(sub, generation)) {
                 MLog.event("write.stale.ignore",
@@ -1984,15 +2047,23 @@ public final class CodecController {
         if (confirmedSnapshot != null
                 && sameDevice(sub.mac, confirmedSnapshot.mac)
                 && confirmedSnapshot.activeCodecType == request.codecType) {
+            long specific1 = confirmedSnapshot.activeCodecSpecific1;
+            if (CodecLabelTable.isLhdc(confirmedSnapshot.activeCodecType)) {
+                specific1 = LhdcQualityPolicy.logicalSpecific1(
+                        specific1, lhdcPolicyForRequest(sub, request));
+            }
             prefs.writeSnapshot(
                     sub.mac,
                     confirmedSnapshot.activeCodecType,
-                    confirmedSnapshot.activeCodecSpecific1,
+                    specific1,
                     confirmedSnapshot.activeSampleRate);
             return;
         }
-        prefs.writeSnapshot(
-                sub.mac, request.codecType, request.codecSpecific1, request.sampleRate);
+        long specific1 = CodecLabelTable.isLhdc(request.codecType)
+                ? LhdcQualityPolicy.logicalSpecific1(
+                        request.codecSpecific1, lhdcPolicyForRequest(sub, request))
+                : request.codecSpecific1;
+        prefs.writeSnapshot(sub.mac, request.codecType, specific1, request.sampleRate);
     }
 
     /**
@@ -2050,7 +2121,11 @@ public final class CodecController {
         if (CodecLabelTable.isLhdc(request.codecType)) {
             long active = snapshot.activeCodecSpecific1 & 0xFFL;
             long requested = request.codecSpecific1 & 0xFFL;
-            return active == requested || isLhdcFixedCeilingPair(active, requested);
+            long transported = LhdcQualityPolicy.transportSpecific1(
+                    requested, LhdcQualityPolicy.fromSpecific1(requested)) & 0xFFL;
+            return active == requested
+                    || active == transported
+                    || isLhdcFixedCeilingPair(active, requested);
         }
         return snapshot.activeCodecSpecific1 == request.codecSpecific1;
     }
@@ -2063,9 +2138,13 @@ public final class CodecController {
     }
 
     private boolean shouldShowNativePatchUnsupportedToast(CodecRequest request) {
-        return nativePatchUnsupported
-                && request != null
-                && CodecLabelTable.isLhdc(request.codecType);
+        if (!nativePatchUnsupported
+                || request == null
+                || !CodecLabelTable.isLhdc(request.codecType)) return false;
+        long quality = request.codecSpecific1 & 0xFFL;
+        // The three user policies use AUTO/500 or the native governor and no longer depend on
+        // the legacy fixed-900/1000 instruction patch.
+        return quality == CodecLabelTable.LHDC_QUALITY_FIXED_900;
     }
 
     private void showWriteFailedToastForSnapshot(CodecSnapshot snapshot) {
@@ -2507,7 +2586,7 @@ public final class CodecController {
             PrefRef.setTitle(sub.prefs.codecDisplay,
                     Strings.CODEC_BLOCK_TITLE + " : " + state);
         }
-        PrefRef.setSummary(sub.prefs.qualityOption, state);
+        PrefRef.setSummary(sub.prefs.qualityOption, "");
         PrefRef.setSummary(sub.prefs.sampleRateOption, state);
         PrefRef.setVisible(sub.prefs.codecModeOption, false);
         PrefRef.setVisible(sub.prefs.qualityOption, true);
@@ -2530,7 +2609,7 @@ public final class CodecController {
         PrefRef.setVisible(sub.prefs.codecModeOption, false);
         PrefRef.setVisible(sub.prefs.qualityOption, true);
         PrefRef.setVisible(sub.prefs.sampleRateOption, true);
-        PrefRef.setSummary(sub.prefs.qualityOption, Strings.STATE_A2DP_WAITING);
+        PrefRef.setSummary(sub.prefs.qualityOption, "");
         PrefRef.setSummary(sub.prefs.sampleRateOption, Strings.STATE_A2DP_WAITING);
         setBlockDisabled(sub, false);
         if (sub.prefs.rememberToggle != null) {
@@ -2668,23 +2747,9 @@ public final class CodecController {
             PrefRef.setVisible(q, false);
             return;
         }
-        // Show the current quality as the row's summary, exact match or fallback.
-        boolean known = false;
-        for (long opt : options) {
-            if (qualityValueMatches(snapshot.activeCodecType,
-                    opt, snapshot.activeCodecSpecific1)) {
-                known = true;
-                break;
-            }
-        }
-        if (known || CodecLabelTable.isKnownQuality(
-                snapshot.activeCodecType, snapshot.activeCodecSpecific1)) {
-            PrefRef.setSummary(q, CodecLabelTable.qualityLabel(
-                    context, snapshot.activeCodecType, snapshot.activeCodecSpecific1));
-        } else {
-            PrefRef.setSummary(q,
-                    String.format(Strings.QUALITY_UNKNOWN_VALUE_FORMAT, snapshot.activeCodecSpecific1));
-        }
+        // The governor's internal 1000/900/500/400 transitions are diagnostic-only. Keeping the
+        // row summary empty avoids exposing transport state or making the row visually unstable.
+        PrefRef.setSummary(q, "");
         PrefRef.setVisible(q, true);
     }
 
