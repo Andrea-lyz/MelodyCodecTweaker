@@ -47,6 +47,8 @@ public final class SystemHookInstaller {
             "com.oplus.bluetooth.feature.smartaudio.OplusBluetoothSmartAudioInterface";
     private static final String MELODY_PKG = "com.oplus.melody";
     private static final long GAME_MODE_SBC_FALLBACK_TTL_MS = 180_000L;
+    private static final long LHDC_QUEUE_SAMPLE_INTERVAL_MS = 200L;
+    private static final long LHDC_QUEUE_IDLE_INTERVAL_MS = 1_000L;
     private static final long[] NATIVE_PATCH_RETRY_DELAYS_MS = {
             0L, 350L, 1_500L, 5_000L, 12_000L
     };
@@ -66,6 +68,10 @@ public final class SystemHookInstaller {
     private boolean nativePatchRunning;
     private boolean nativePatchScheduled;
     private int nativePatchAttempts;
+    private Object smartAudioInterface;
+    private Method smartAudioQueueLengthMethod;
+    private boolean smartAudioQueueSampleScheduled;
+    private int smartAudioQueueSampleFailures;
 
     public SystemHookInstaller(
             MelodyCodecLspEntry module, ClassLoader classLoader, String sourceDir) {
@@ -86,6 +92,7 @@ public final class SystemHookInstaller {
         hookLifecycle(a2dpCls);
         hookCodecConfigUpdated(a2dpCls);
         hookNativeCodecPreferenceLogger();
+        hookSmartAudioQueueSampler();
         hookRemoteChoppyReport();
     }
 
@@ -442,6 +449,91 @@ public final class SystemHookInstaller {
             MLog.event("lhdc.governor.choppy_hooks", "count", hooked);
         } catch (Throwable t) {
             MLog.w("LHDC remote choppy hook unavailable", t);
+        }
+    }
+
+    private void hookSmartAudioQueueSampler() {
+        try {
+            Class<?> cls = Class.forName(CLASS_OPLUS_SMART_AUDIO, false, classLoader);
+            Method queueLength = cls.getDeclaredMethod("getAudioQueueLengthNative");
+            queueLength.setAccessible(true);
+            int hooked = 0;
+            for (Method method : cls.getDeclaredMethods()) {
+                if (!"getInstance".equals(method.getName())
+                        || method.getParameterTypes().length != 1
+                        || method.getReturnType() != cls) {
+                    continue;
+                }
+                method.setAccessible(true);
+                module.hook(method).intercept(chain -> {
+                    Object result = chain.proceed();
+                    captureSmartAudioInterface(result, queueLength, "getInstance");
+                    return result;
+                });
+                hooked++;
+            }
+            for (Method method : cls.getDeclaredMethods()) {
+                if (!"init".equals(method.getName())
+                        || method.getParameterTypes().length != 0) {
+                    continue;
+                }
+                method.setAccessible(true);
+                module.hook(method).intercept(chain -> {
+                    captureSmartAudioInterface(chain.getThisObject(), queueLength, "init");
+                    return chain.proceed();
+                });
+                hooked++;
+            }
+            MLog.event("lhdc.governor.queue_hooks", "count", hooked);
+        } catch (Throwable t) {
+            MLog.w("LHDC queue sampler hook unavailable", t);
+        }
+    }
+
+    private void captureSmartAudioInterface(Object instance, Method queueLength, String source) {
+        if (instance == null || queueLength == null) return;
+        boolean changed;
+        synchronized (this) {
+            changed = smartAudioInterface != instance;
+            smartAudioInterface = instance;
+            smartAudioQueueLengthMethod = queueLength;
+            if (!smartAudioQueueSampleScheduled) {
+                smartAudioQueueSampleScheduled = true;
+                mainHandler.postDelayed(this::sampleLhdcQueue,
+                        LHDC_QUEUE_SAMPLE_INTERVAL_MS);
+            }
+        }
+        if (changed) MLog.event("lhdc.governor.queue_source", "source", source);
+    }
+
+    private void sampleLhdcQueue() {
+        Object instance;
+        Method method;
+        synchronized (this) {
+            smartAudioQueueSampleScheduled = false;
+            instance = smartAudioInterface;
+            method = smartAudioQueueLengthMethod;
+        }
+        long nextDelay = LHDC_QUEUE_IDLE_INTERVAL_MS;
+        if (instance != null && method != null && NativeLhdcMemoryPatch.shouldSampleQueue()) {
+            nextDelay = LHDC_QUEUE_SAMPLE_INTERVAL_MS;
+            try {
+                Object value = method.invoke(instance);
+                if (value instanceof Integer) {
+                    NativeLhdcMemoryPatch.reportQueueLength((Integer) value);
+                    smartAudioQueueSampleFailures = 0;
+                }
+            } catch (Throwable t) {
+                if (++smartAudioQueueSampleFailures <= 3) {
+                    MLog.w("LHDC queue sample invocation failed", t);
+                }
+            }
+        }
+        synchronized (this) {
+            if (!smartAudioQueueSampleScheduled && smartAudioInterface != null) {
+                smartAudioQueueSampleScheduled = true;
+                mainHandler.postDelayed(this::sampleLhdcQueue, nextDelay);
+            }
         }
     }
 

@@ -10,10 +10,10 @@ import xyz.melodylsp.codec.label.CodecLabelTable;
 public class LhdcQualityPolicyTest {
 
     @Test
-    public void qualityPolicyUsesAutoOnTransportAndPreservesHighBits() {
+    public void qualityPolicyUsesFixed1000OnTransportAndPreservesHighBits() {
         long logical = 0x8000L | CodecLabelTable.LHDC_QUALITY_FIXED_1000;
         assertEquals(
-                0x8000L | CodecLabelTable.LHDC_QUALITY_ABR,
+                logical,
                 LhdcQualityPolicy.transportSpecific1(logical, LhdcQualityPolicy.QUALITY));
         assertEquals(
                 logical,

@@ -1225,7 +1225,12 @@ public final class CodecController {
                     int pickedPolicy = LhdcQualityPolicy.normalize((int) (picked & 0xFFL));
                     lhdcPoliciesByMac.put(sub.mac, pickedPolicy);
                     picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
-                    if (pickedPolicy == previousPolicy) {
+                    long expectedTransport = LhdcQualityPolicy.transportSpecific1(
+                            picked, pickedPolicy);
+                    boolean transportAlreadyMatches =
+                            (snapshot.activeCodecSpecific1 & 0xFFL)
+                                    == (expectedTransport & 0xFFL);
+                    if (pickedPolicy == previousPolicy && transportAlreadyMatches) {
                         LhdcQualityPolicy.send(
                                 context, sub.mac, pickedPolicy, "quality_picker_reaffirm");
                         refreshSnapshot(sub);
@@ -2747,9 +2752,15 @@ public final class CodecController {
             PrefRef.setVisible(q, false);
             return;
         }
-        // The governor's internal 1000/900/500/400 transitions are diagnostic-only. Keeping the
-        // row summary empty avoids exposing transport state or making the row visually unstable.
-        PrefRef.setSummary(q, "");
+        long displayQuality = snapshot.activeCodecSpecific1;
+        if (CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+            displayQuality = LhdcQualityPolicy.logicalSpecific1(
+                    displayQuality, selectedLhdcPolicy(sub.mac, snapshot));
+        }
+        // Show the stable user policy only. The governor's internal 1000/900/500/400 transitions
+        // remain diagnostic-only and never make this row flicker between transport states.
+        PrefRef.setSummary(q, CodecLabelTable.qualityLabel(
+                context, snapshot.activeCodecType, displayQuality));
         PrefRef.setVisible(q, true);
     }
 

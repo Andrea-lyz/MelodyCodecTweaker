@@ -10,10 +10,11 @@ import xyz.melodylsp.codec.util.TrustedBroadcasts;
 /**
  * User-facing LHDC playback policies and their transport representation.
  *
- * <p>Quality priority is intentionally transported as LHDC AUTO. The native governor keeps the
- * encoder in that mode and changes only the encoder's target bitrate, so playback-time protection
- * never calls {@code setCodecConfigPreference()} and therefore does not rebuild the A2DP session.
- * The logical value remains {@link #QUALITY} for UI selection and per-headset memory.</p>
+ * <p>Quality priority is transported as the real fixed 1000 kbps mode, so Android developer
+ * options and the codec configuration remain truthful. The native governor captures the active
+ * encoder through its fixed-bitrate setter, then applies temporary congestion protection only
+ * inside the encoder. Playback-time protection never calls {@code setCodecConfigPreference()} and
+ * therefore does not rebuild the A2DP session.</p>
  */
 public final class LhdcQualityPolicy {
 
@@ -47,8 +48,7 @@ public final class LhdcQualityPolicy {
 
     public static long transportSpecific1(long specific1, int policy) {
         int normalized = normalize(policy);
-        int transport = normalized == QUALITY ? ADAPTIVE : normalized;
-        return (specific1 & ~0xFFL) | (transport & 0xFFL);
+        return (specific1 & ~0xFFL) | (normalized & 0xFFL);
     }
 
     public static CodecRequest transportRequest(CodecRequest request, int policy) {

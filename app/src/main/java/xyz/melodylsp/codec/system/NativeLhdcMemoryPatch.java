@@ -13,6 +13,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 
+import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.BuildConfig;
 
@@ -64,6 +65,7 @@ final class NativeLhdcMemoryPatch {
     private static volatile boolean nativeLoaded;
     private static volatile PatchResult lastResult;
     private static volatile boolean governorInstalled;
+    private static volatile int governorPolicy = LhdcQualityPolicy.ADAPTIVE;
 
     private NativeLhdcMemoryPatch() {
     }
@@ -100,7 +102,7 @@ final class NativeLhdcMemoryPatch {
         return lastResult;
     }
 
-    /** Installs the encoder-thread LHDC queue hook. Safe to call repeatedly. */
+    /** Installs the fixed-bitrate setter capture. Safe to call repeatedly. */
     static synchronized boolean installGovernor() {
         if (governorInstalled) return true;
         if (!ensureNativeLoaded()) {
@@ -126,6 +128,7 @@ final class NativeLhdcMemoryPatch {
         if (!ensureNativeLoaded()) return false;
         try {
             nativeSetGovernorPolicy(policy);
+            governorPolicy = LhdcQualityPolicy.normalize(policy);
             if (!governorInstalled) installGovernor();
             return true;
         } catch (Throwable t) {
@@ -141,6 +144,19 @@ final class NativeLhdcMemoryPatch {
             nativeReportChoppy(level);
         } catch (Throwable t) {
             MLog.w("lhdc governor choppy report failed", t);
+        }
+    }
+
+    static boolean shouldSampleQueue() {
+        return governorInstalled && governorPolicy == LhdcQualityPolicy.QUALITY;
+    }
+
+    static void reportQueueLength(int length) {
+        if (length < 0 || !shouldSampleQueue()) return;
+        try {
+            nativeReportQueueLength(length);
+        } catch (Throwable t) {
+            MLog.w("lhdc governor queue sample failed", t);
         }
     }
 
@@ -548,6 +564,8 @@ final class NativeLhdcMemoryPatch {
     private static native int nativeInstallGovernor();
 
     private static native void nativeSetGovernorPolicy(int policy);
+
+    private static native void nativeReportQueueLength(int length);
 
     private static native void nativeReportChoppy(int level);
 
