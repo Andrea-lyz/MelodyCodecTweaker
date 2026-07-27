@@ -1,1 +1,1 @@
-欧加耳机音质助手 MelodyCodecTweaker 是一个面向欧真加官方「无线耳机」App 的 LSPosed 模块，让部分原本藏在系统蓝牙栈里的编解码器、播放质量、采样率和 LE Audio 状态可以直接在耳机控制面板里操作。
+欧加耳机音质助手 MelodyCodecTweaker 是一个面向欧真加官方「无线耳机」App 的 LSPosed 模块，把编解码器、播放质量、采样率和 LE Audio 控制直接加入耳机面板，并为 LHDC 音质优先提供实时码率与链路拥塞治理。

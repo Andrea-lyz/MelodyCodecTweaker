@@ -201,16 +201,34 @@ jobs:
           git push origin "HEAD:${GITHUB_REF_NAME}"
           git push origin "${{ steps.version.outputs.tag }}"
 
-      - name: Sync source and tag to Xposed Modules Repo
+      - name: Sync release page and tag to Xposed Modules Repo
         env:
           LSP_REPO_TOKEN: ${{ secrets.LSP_REPO_TOKEN }}
         run: |
           git config --local --unset-all http.https://github.com/.extraheader || true
           git config --global --unset-all http.https://github.com/.extraheader || true
-          git remote remove lsp 2>/dev/null || true
-          git remote add lsp "https://x-access-token:${LSP_REPO_TOKEN}@github.com/Xposed-Modules-Repo/xyz.melodylsp.codec.git"
-          git push --force lsp "HEAD:${GITHUB_REF_NAME}"
-          git push --force lsp "${{ steps.version.outputs.tag }}"
+          LSP_DIR="${RUNNER_TEMP}/xyz.melodylsp.codec"
+          git clone "https://x-access-token:${LSP_REPO_TOKEN}@github.com/Xposed-Modules-Repo/xyz.melodylsp.codec.git" "$LSP_DIR"
+          git -C "$LSP_DIR" config user.name "github-actions[bot]"
+          git -C "$LSP_DIR" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Xposed Modules Repo is a user-facing release page. Keep source code in the
+          # canonical repository and publish only metadata plus the images used by README.
+          git -C "$LSP_DIR" rm -r --ignore-unmatch .
+          cp docs/lsp/README.md "$LSP_DIR/README.md"
+          cp docs/lsp/SCOPE "$LSP_DIR/SCOPE"
+          cp docs/lsp/SOURCE_URL "$LSP_DIR/SOURCE_URL"
+          cp docs/lsp/SUMMARY "$LSP_DIR/SUMMARY"
+          cp docs/banner.png "$LSP_DIR/banner.png"
+          cp docs/PY_QR.png "$LSP_DIR/PY_QR.png"
+
+          git -C "$LSP_DIR" add -A
+          if ! git -C "$LSP_DIR" diff --cached --quiet; then
+            git -C "$LSP_DIR" commit -m "chore: release ${{ steps.version.outputs.tag }} [skip ci]"
+          fi
+          git -C "$LSP_DIR" push origin "HEAD:main"
+          git -C "$LSP_DIR" tag -f -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
+          git -C "$LSP_DIR" push --force origin "${{ steps.version.outputs.tag }}"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

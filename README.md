@@ -1,8 +1,27 @@
 # 欧加耳机音质助手
 
+<p align="center">
+  <img src="docs/banner.png" alt="欧加耳机音质助手：让官方耳机面板更完整" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/Andrea-lyz/MelodyCodecTweaker/releases/latest">下载最新版</a> ·
+  <a href="https://github.com/Andrea-lyz/MelodyCodecTweaker/issues">问题反馈</a> ·
+  <a href="https://github.com/Xposed-Modules-Repo/xyz.melodylsp.codec">Xposed Modules Repo</a>
+</p>
+
 `MelodyCodecTweaker` 是一个面向 OPPO / OnePlus「无线耳机」App 的 LSPosed 模块。它不会替换系统文件，也不会修改「无线耳机」App 安装包，而是在运行时注入音质控制项，让部分原本藏在系统蓝牙栈里的编解码器、播放质量、采样率和 LE Audio 状态可以直接在耳机控制面板里操作。
 
 模块主要服务于 ColorOS / OPlus 系设备上的 `com.oplus.melody`，同时配合 `com.android.bluetooth` 和 `com.oplus.wirelesssettings` 作用域完成更稳定的状态读取和写入。
+
+## 2.1.0 更新重点
+
+- LHDC 播放质量固定为三个面向用户的策略：**自适应、连接优先、音质优先**，不再把底层质量码直接暴露给用户。
+- 「自适应」继续使用 OPlus / LHDC 原有 ABR；「连接优先」请求约 500 / 560 kbps；「音质优先」以 1000 kbps 为目标，并由模块内置治理器在 1000 / 900 / 500 / 400 kbps 之间动态保护链路。
+- 「自适应」和「音质优先」会在播放质量摘要中显示编码器当前码率，便于直接观察实际运行状态；「连接优先」保持简洁显示。
+- 音质优先治理器同时接入编码队列、耳机卡顿回报与 Android 已解析的 Bluetooth Quality Report。它会根据 AFH 可用信道、重传和无接收统计判断何时值得重新尝试高码率，并按耳机、按 500→900 / 900→1000 边界分别学习，减少 900↔500 往返震荡。
+- 降档只修改 LHDC 编码器目标码率，不触发整条 A2DP 重连或改写采样率；队列达到 90% 持续 300 ms 时保护降档，队列打满时立即处理，链路稳定后再逐级回升。
+- 重新连接后的记忆回放、192 kHz 恢复和诊断状态进一步收敛；结构化诊断默认不在后台持续记录，只有用户主动开始记录问题时才限时开启。
 
 ## 支持作者
 
@@ -15,7 +34,8 @@
 - 在「无线耳机」主面板 `DetailMainActivity` 注入蓝牙音质区域。
 - 在 OneSpace 快捷面板 `OneSpaceDetailActivity` 注入同一套控制项。
 - 显示当前协议：SBC、AAC、LDAC、LHDC、LC3 等。
-- 支持播放质量切换，例如 LHDC 的连接优先、均衡、音质优先，以及 LDAC 的 330 / 660 / 990 kbps。
+- 支持播放质量切换，例如 LHDC 的自适应、连接优先、音质优先，以及 LDAC 的 330 / 660 / 990 kbps。
+- 自适应与音质优先可显示 LHDC 编码器实时码率；音质优先附带 1000 kbps 锚定的链路拥塞治理。
 - 支持采样率切换，根据当前耳机和协议动态显示 44.1 / 48 / 96 / 192 kHz 等可选项。
 - 播放质量和采样率会做联动修正，尽量避免写入蓝牙栈不接受的组合。
 - 支持按耳机记忆选择，重新连接后自动应用上次设置。
@@ -138,6 +158,25 @@ LE Audio 开关只会在模块判断当前设备支持时显示。判断来源�
 - 采样率来自 `sampleRate` bitmask。
 - 写入优先使用 `setCodecConfigPreference()` 并等待系统广播确认。
 
+LHDC 对用户固定显示三种策略，底层映射如下：
+
+| 面板选项 | 底层策略 | 行为 |
+| --- | --- | --- |
+| 自适应 | OPlus / LHDC ABR（质量码 9） | 由厂商算法预测链路并优先保证连续播放；显示编码器当前码率。 |
+| 连接优先 | 固定中档（质量码 6） | 请求约 500 / 560 kbps，适合干扰较强或距离较远的环境。 |
+| 音质优先 | 1000 kbps 目标（质量码 8） | 以 1000 kbps 为锚点，模块在 1000 / 900 / 500 / 400 kbps 梯度内保护和恢复；显示当前码率。 |
+
+「音质优先」不是把 1000 kbps 永久焊死。它表达的是用户的质量上限和回升意愿：链路能承受时主动靠近 1000 kbps，出现拥塞时先保证播放连续性。与厂商「自适应」相比，它更积极追求高码率，也更依赖事后反馈；因此治理器尽量把码率切换留在编码器内部，避免重新协商 A2DP、改变 192 kHz / 24 bit 设置或产生明显断音。
+
+治理器的主要信号与状态机：
+
+- `getAudioQueueLengthNative()` 的编码队列由蓝牙主线程采样。队列达到容量的 90% 并持续 300 ms 时保护降档，打满时立即降档；队列低于 25% 且持续稳定 15 秒后才允许逐级升档。
+- `onRemoteChoppyReport()` 提供耳机侧卡顿反馈。5 秒内连续回报会把 1000→900→500→400 的保护力度逐步加深。
+- `AdapterService.bluetoothQualityReportReadyCallback(BluetoothDevice, BluetoothQualityReport)` 提供系统已经解析完成的 BQR。模块读取 `BqrCommon` 中的 AFH、retransmission、noRx、RSSI、SNR、overflow / underflow 等字段。有效采样间隔限定为 3～15 秒；升档健康窗口要求 unused AFH ≤ 39（即至少约 40 个可用信道）、重传 ≤ 25 次 / 秒且 noRx ≤ 25 次 / 秒。
+- 500→900 与 900→1000 分别保存失败记录。某个边界在 5 分钟内快速失败两次后会被暂时锁住；只有连续健康 BQR 窗口、低队列和无拥塞时间同时达标，才开放一次恢复探测。
+- 恢复探测失败后，证据门槛从 3 个健康窗口 / 30 秒依次提高到 5 个 / 60 秒和 10 个 / 120 秒；探测稳定 60 秒后清除该边界的失败历史。
+- 所有学习状态按耳机 MAC 隔离，并在当前 `com.android.bluetooth` 进程生命周期内保留。切换耳机不会继承上一只耳机的坏链路判断。
+
 写入路径会按能力降级：
 
 1. Melody 进程内直接反射 A2DP 隐藏 API。
@@ -146,9 +185,9 @@ LE Audio 开关只会在模块判断当前设备支持时显示。判断来源�
 4. 对 LDAC / 采样率尝试写入开发者选项 `Settings.Global`。
 5. 最后尝试 root shell fallback。
 
-`Settings.Global` 和 root fallback 只暂存开发者选项，不会为了强制重协商而关闭整个蓝牙适配器；模块仍会回读当前 A2DP 状态，只有实际挡位匹配才报告成功。暂存值未即时生效时，会等待下一次自然重连/协商，不会把 shell 退出码误当成 codec 已生效。
+`Settings.Global` 和 root fallback 只暂存开发者选项，不会为了强制重协商而关闭整个蓝牙适配器；模块仍会回读当前 A2DP 状态，只有实际挡位匹配才报告成功。暂存值未即时生效时，会等待下一次自然重连 / 协商，不会把 shell 退出码误当成 codec 已生效。
 
-LHDC 的实时切换更依赖厂商蓝牙栈。模块会直接写入目标播放质量 / 采样率组合，避免一次切换里额外触发 A2DP 重配置。如果蓝牙栈拒绝当前组合，模块会尽量自动选择兼容采样率，例如从「均衡 / 48 kHz」切换到「音质优先」时先提升到可用采样率。
+LHDC 的策略切换仍然依赖厂商蓝牙栈。模块会直接写入目标播放质量 / 采样率组合，避免一次切换里额外触发 A2DP 重配置。如果蓝牙栈拒绝当前组合，模块会尽量自动选择兼容采样率，例如从「连接优先 / 48 kHz」切换到「音质优先」时先提升到可用采样率。实时码率取自 `liblhdcv5BT_enc.so` 的编码器状态；没有音频流、native helper 未适配或编码器未提供读取接口时，摘要会只显示策略名称，而不会伪造数值。
 
 ## 兼容策略
 
@@ -195,16 +234,23 @@ LHDC 的实时切换更依赖厂商蓝牙栈。模块会直接写入目标播放
 - Android 12 / 13 无法读取普通广播发送者身份，因此请求和响应 receiver 分别要求 OPlus component-safe 或 Bluetooth privileged signature permission；编译期 token 只做协议版本校验，不再作为安全边界。
 - 蓝牙侧在真正调用 `A2dpService` 前再次校验 MAC、活动连接、codec 类型和 bitmask 能力。诊断入口也有 signature permission、消息长度、时间范围和频率限制。
 
-## LHDC V5 运行时内存补丁
+## LHDC V5 运行时治理与内存补丁
 
-当前版本已内置 LSPosed 进程内 native helper 和多 pattern 运行时补丁表，用来处理部分 OPlus / ColorOS 蓝牙栈忽略 LHDC V5 固定 900 / 1000 kbps 目标码率的问题。只要启用 `com.android.bluetooth` 作用域，模块会在蓝牙进程启动后自动尝试运行时内存补丁。
+当前版本在 `com.android.bluetooth` 进程中提供两层独立能力：面向「音质优先」的编码器治理器，以及兼容旧 OPlus 固定码率保护逻辑的 ARM64 指令补丁。三种用户策略不依赖旧补丁才能成立；旧补丁仍作为已验证 ROM 的兼容层保留。
+
+治理器会解析当前已加载的 `liblhdcv5BT_enc.so` 导出符号，并在 `libbluetooth_jni.so` 的可写数据段或紧邻匿名 `.bss` 中查找 `lhdcv5BT_encode` 与 `lhdcv5BT_free_handle` 的唯一回调 owner。只有两个 owner 都唯一命中时才用原子指针替换包裹 encode / free 调用，从真实 encode 路径捕获活动 handle，再调用 `lhdcv5BT_set_target_bitrate_inx` 调整码率、通过 `lhdcv5BT_get_bitrate` 回读。它不会修改 loader entry、relocation、GOT 或可执行页；候选为零或多于一个时直接停止安装。
+
+Java 侧将队列、remote choppy 与 BQR 归一到逐耳机链路状态，native 侧只在音质优先模式执行 1000 / 900 / 500 / 400 kbps 梯度切换。策略切换、encoder handle 更换或耳机释放都会重置对应运行时状态，避免把失效 handle 带到下一条音频流。
+
+旧指令补丁用于处理部分 OPlus / ColorOS 蓝牙栈忽略 LHDC V5 固定 900 / 1000 kbps 目标码率的问题。启用 `com.android.bluetooth` 作用域后，模块会在蓝牙进程启动时自动尝试，仍然坚持唯一命中与失败关闭。
 
 适配口径：
 
+- 治理器不按手机型号写死地址。它要求 `liblhdcv5BT_enc.so` 保留四个目标导出，并要求 encode / free 回调在当前 `libbluetooth_jni.so` 可写数据区各自只有一个 owner。
 - 补丁优先按 `/system/lib64/libbluetooth_jni.so` 内目标函数附近的已知机器码 pattern 命中，不按手机型号写死白名单。
 - 已知 pattern 未命中时，会按 ARM64 指令语义和控制流关系识别同一个保护分支，并根据原分支目标动态生成补丁指令。编译器只改变寄存器分配、源码行号常量或分支距离时，通常不再需要为每次 OTA 单独加 pattern。
 - 已离线验证一加 13 PJZ110 `16.0.9.401` 的新蓝牙库可命中；此前还实测过一加 13、一加 15、一加 Ace 6 Pro、一加 Ace 6T、一加 12，以及用户反馈的 PLC110 `C16.0.8.300`，可解除系统侧对 LHDC V5 固定 1 Mbps 目标码率的限制。
-- 最终是否稳定显示 1000 kbps 还取决于耳机、耳机固件、当前采样率和蓝牙栈协商结果；部分 LHDC V5 设备组合可能会把「音质优先」确认到实际可用最高挡位，例如 900 kbps。
+- 最终能否运行治理器、以及当前环境能否稳定维持 1000 kbps，仍取决于系统蓝牙库布局、耳机、耳机固件、采样率和无线链路。治理器未安装时会失败关闭，不会对未知 owner 或地址强行写入。
 
 补丁流程：
 
@@ -262,7 +308,7 @@ evt=lhdc.memory_patch status=unsupported ... patched=0 original=0 success=false
 
 这种情况不会替换系统文件，也不会强行写入未知地址。请提供反馈包或对应 `libbluetooth_jni.so`，后续可以按新库族补充 pattern。反馈包里的 `diagnostics.txt`、`timeline.txt`、`events.jsonl` 会记录 native patch 状态。
 
-在支持 1 Mbps 的耳机链路上，实测补丁生效后，LHDC V5 音质优先可稳定进入约 1000 kbps 档位，蓝牙栈在重新配置 encoder 时会出现 `quality_mode=HIGH1_1000(8)`，切换后不会回落到自适应。若当前耳机或系统组合只向蓝牙栈暴露到 900 kbps，模块会把 900 kbps 作为「音质优先」的实际确认结果处理，避免误显示为未知挡位或切换失败。
+在支持 1 Mbps 的耳机链路上，策略写入成功后会看到 `quality_mode=HIGH1_1000(8)`；开始播放后摘要显示的是治理器回读到的实时码率。环境不支持 1000 kbps 时，治理器可能稳定停留在 900、500 或 400 kbps，这仍属于「音质优先」策略，而不是回落成「自适应」。若当前耳机或系统组合只向蓝牙栈暴露到 900 kbps，模块也会把 900 kbps 作为音质优先的有效确认结果。
 
 如果想验证 1000 kbps，请先开实时监听，再触发一次 A2DP 重新协商，例如在模块里切到自适应后再切回音质优先，或者重连耳机。不要只在稳定播放中用 `logcat -d` 查询；encoder 不会持续输出当前码率。
 
@@ -316,6 +362,8 @@ adb logcat -s MelodyCodecLsp:V
 - `evt=scope.wirelesssettings.context.ready`：无线设置作用域是否加载。
 - `le.melody.state.recv`：LE Audio 状态是否回传到 Melody。
 - `evt=lhdc.memory_patch`：LHDC V5 运行时内存补丁加载、命中和验证状态。
+- `evt=lhdc.governor.install` / `LhdcGovernorNative`：编码器回调 owner 扫描、策略切换和码率升降档。
+- `evt=lhdc.bqr`：BQR 链路样本、健康窗口、当前探测上限和两个升档边界的锁定状态。
 - `evt=remember.write`：按耳机记忆是否写入。
 - `evt=replay.dispatch` / `evt=replay.outcome`：重连后记忆重放和确认结果。
 - `evt=diag.session.start`：诊断页开始一次问题记录。
@@ -342,7 +390,7 @@ app/build/outputs/apk/release/
 GitHub Actions 分为两个入口：
 
 - `Build APK`：推送 `main` / `master`、PR 或手动触发时执行，用于日常开发构建，产物名带 `dev` 和提交号。
-- `Release APK`：仅手动触发。它会按 patch / minor / major 或指定版本号自动抬升 `versionName` 和 `versionCode`，构建签名 APK，提交版本号变更，创建符合 Xposed Modules Repo 规则的 `versionCode-versionName` tag（例如 `4-1.2.0`），并在 GitHub Release 中写入手填说明和自动生成的提交记录。发布工作流还会把源码、tag 和 APK Release 自动同步到 `Xposed-Modules-Repo/xyz.melodylsp.codec`，需要在源仓库配置 `LSP_REPO_TOKEN` secret。
+- `Release APK`：仅手动触发。它会按 patch / minor / major 或指定版本号自动抬升 `versionName` 和 `versionCode`，构建签名 APK，提交版本号变更，创建符合 Xposed Modules Repo 规则的 `versionCode-versionName` tag（例如 `4-1.2.0`），并在 GitHub Release 中写入手填说明和自动生成的提交记录。发布工作流只会把面向用户的 README、作用域元数据和必要图片同步到 `Xposed-Modules-Repo/xyz.melodylsp.codec`，源码始终以本仓库为准；工作流需要配置 `LSP_REPO_TOKEN` secret。
 - KSU / Magisk native patch 已过时，不再作为常规 Release 附件发布；如需极端兜底，可从 `ksu/oplus_lhdcv5_native_patch/` 手动生成 zip。
 
 ## 项目结构
@@ -363,9 +411,18 @@ app/src/main/
     ├── host/        # Melody 页面注入与 UI 控制
     ├── leaudio/     # LE Audio 状态、IPC 与无线设置桥接
     ├── storage/     # 按耳机保存记忆项
-    ├── system/      # com.android.bluetooth 侧 bridge
+    ├── system/      # com.android.bluetooth 侧 bridge、BQR 与链路状态机
     ├── ui/          # 模块内置诊断页、总开关和桌面图标开关
     └── util/        # 日志
+
+app/src/main/cpp/
+└── native_lhdc_patch.cpp  # ARM64 安全补丁、encoder 捕获与码率治理器
+
+docs/lsp/
+├── README.md        # Xposed Modules Repo 面向普通用户的发布页
+├── SCOPE
+├── SOURCE_URL
+└── SUMMARY
 
 ksu/oplus_lhdcv5_native_patch/
 ├── META-INF/com/google/android/updater-script
