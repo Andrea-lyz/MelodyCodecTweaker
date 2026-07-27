@@ -497,10 +497,6 @@ public final class SystemHookInstaller {
         }
 
         NativeLhdcMemoryPatch.PatchResult result = NativeLhdcMemoryPatch.apply();
-        // Application.onCreate can run just before libbluetooth_jni enters dl_iterate_phdr.
-        // The memory scan above is the first reliable proof that the library is mapped, so retry
-        // the queue hook here instead of waiting for the user's first policy broadcast.
-        NativeLhdcMemoryPatch.installGovernor();
         try {
             MLog.event("lhdc.memory_patch",
                     "status", result.status,
