@@ -63,6 +63,8 @@ final class NativeLhdcMemoryPatch {
     private static volatile boolean nativeLoadAttempted;
     private static volatile boolean nativeLoaded;
     private static volatile PatchResult lastResult;
+    private static volatile boolean governorInstallAttempted;
+    private static volatile boolean governorInstalled;
 
     private NativeLhdcMemoryPatch() {
     }
@@ -97,6 +99,49 @@ final class NativeLhdcMemoryPatch {
 
     static PatchResult lastResult() {
         return lastResult;
+    }
+
+    /** Installs the encoder-thread LHDC queue hook. Safe to call repeatedly. */
+    static synchronized boolean installGovernor() {
+        if (governorInstalled) return true;
+        if (!ensureNativeLoaded()) {
+            MLog.event("lhdc.governor.install",
+                    "ok", false,
+                    "result", "native_helper_unavailable",
+                    "detail", nativeLoadError);
+            return false;
+        }
+        governorInstallAttempted = true;
+        int result;
+        try {
+            result = nativeInstallGovernor();
+        } catch (Throwable t) {
+            MLog.w("lhdc governor native install failed", t);
+            return false;
+        }
+        governorInstalled = result >= 0;
+        MLog.event("lhdc.governor.install", "ok", governorInstalled, "result", result);
+        return governorInstalled;
+    }
+
+    static boolean setGovernorPolicy(int policy) {
+        if (!governorInstalled && !installGovernor()) return false;
+        try {
+            nativeSetGovernorPolicy(policy);
+            return true;
+        } catch (Throwable t) {
+            MLog.w("lhdc governor policy update failed", t);
+            return false;
+        }
+    }
+
+    static void reportRemoteChoppy(int level) {
+        if (level <= 0 || (!governorInstalled && !governorInstallAttempted)) return;
+        try {
+            nativeReportChoppy(level);
+        } catch (Throwable t) {
+            MLog.w("lhdc governor choppy report failed", t);
+        }
     }
 
     private static PatchResult applyUnchecked() throws Exception {
@@ -499,6 +544,12 @@ final class NativeLhdcMemoryPatch {
             int expectedInstruction,
             int replacementInstruction,
             int originalProtection);
+
+    private static native int nativeInstallGovernor();
+
+    private static native void nativeSetGovernorPolicy(int policy);
+
+    private static native void nativeReportChoppy(int level);
 
     static String describeNativePatchResult(int result) {
         if (result == NATIVE_PATCH_OK) return "native_patch_ok";
