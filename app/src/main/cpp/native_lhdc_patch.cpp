@@ -1,12 +1,14 @@
 #include <errno.h>
 #include <android/log.h>
 #include <atomic>
-#include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
 #include <jni.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -312,6 +314,145 @@ bool ends_with(const char* value, const char* suffix) {
             && strcmp(value + value_length - suffix_length, suffix) == 0;
 }
 
+struct LoadedImage {
+    uintptr_t base = 0;
+    char path[384] = {};
+};
+
+bool find_loaded_image(const char* suffix, LoadedImage* out) {
+    if (suffix == nullptr || out == nullptr) return false;
+    FILE* maps = fopen("/proc/self/maps", "re");
+    if (maps == nullptr) return false;
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        unsigned long long offset = 0;
+        char perms[5] = {};
+        char path[384] = {};
+        if (sscanf(line, "%llx-%llx %4s %llx %*s %*s %383s",
+                &start, &end, perms, &offset, path) != 5) {
+            continue;
+        }
+        if (offset != 0 || !ends_with(path, suffix)) continue;
+        out->base = static_cast<uintptr_t>(start);
+        snprintf(out->path, sizeof(out->path), "%s", path);
+        found = true;
+        break;
+    }
+    fclose(maps);
+    return found;
+}
+
+bool file_range_valid(size_t offset, size_t length, size_t file_size) {
+    return offset <= file_size && length <= file_size - offset;
+}
+
+void* resolve_elf64_export(const LoadedImage& image, const char* symbol_name) {
+    if (image.base == 0 || image.path[0] == '\0' || symbol_name == nullptr) return nullptr;
+    const int fd = open(image.path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    struct stat status {};
+    if (fstat(fd, &status) != 0 || status.st_size <= 0) {
+        close(fd);
+        return nullptr;
+    }
+    const size_t file_size = static_cast<size_t>(status.st_size);
+    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return nullptr;
+
+    void* resolved = nullptr;
+    const auto* bytes = static_cast<const uint8_t*>(mapped);
+    if (file_range_valid(0, sizeof(Elf64_Ehdr), file_size)) {
+        const auto* header = reinterpret_cast<const Elf64_Ehdr*>(bytes);
+        const bool valid_header = memcmp(header->e_ident, ELFMAG, SELFMAG) == 0
+                && header->e_ident[EI_CLASS] == ELFCLASS64
+                && header->e_ident[EI_DATA] == ELFDATA2LSB
+                && header->e_machine == EM_AARCH64
+                && header->e_shentsize == sizeof(Elf64_Shdr)
+                && header->e_shnum > 0;
+        const size_t sections_size = static_cast<size_t>(header->e_shnum)
+                * sizeof(Elf64_Shdr);
+        if (valid_header
+                && file_range_valid(static_cast<size_t>(header->e_shoff),
+                        sections_size, file_size)) {
+            const auto* sections = reinterpret_cast<const Elf64_Shdr*>(
+                    bytes + static_cast<size_t>(header->e_shoff));
+            for (Elf64_Half i = 0; i < header->e_shnum && resolved == nullptr; ++i) {
+                const Elf64_Shdr& symbols_section = sections[i];
+                if (symbols_section.sh_type != SHT_DYNSYM
+                        || symbols_section.sh_entsize != sizeof(Elf64_Sym)
+                        || symbols_section.sh_link >= header->e_shnum
+                        || !file_range_valid(static_cast<size_t>(symbols_section.sh_offset),
+                                static_cast<size_t>(symbols_section.sh_size), file_size)) {
+                    continue;
+                }
+                const Elf64_Shdr& strings_section = sections[symbols_section.sh_link];
+                if (strings_section.sh_type != SHT_STRTAB
+                        || !file_range_valid(static_cast<size_t>(strings_section.sh_offset),
+                                static_cast<size_t>(strings_section.sh_size), file_size)) {
+                    continue;
+                }
+                const auto* symbols = reinterpret_cast<const Elf64_Sym*>(
+                        bytes + static_cast<size_t>(symbols_section.sh_offset));
+                const size_t symbol_count = static_cast<size_t>(symbols_section.sh_size)
+                        / sizeof(Elf64_Sym);
+                const char* strings = reinterpret_cast<const char*>(
+                        bytes + static_cast<size_t>(strings_section.sh_offset));
+                const size_t strings_size = static_cast<size_t>(strings_section.sh_size);
+                for (size_t index = 0; index < symbol_count; ++index) {
+                    const Elf64_Sym& symbol = symbols[index];
+                    if (symbol.st_shndx == SHN_UNDEF
+                            || ELF64_ST_TYPE(symbol.st_info) != STT_FUNC
+                            || symbol.st_name >= strings_size) {
+                        continue;
+                    }
+                    const char* name = strings + symbol.st_name;
+                    const size_t remaining = strings_size - symbol.st_name;
+                    if (memchr(name, '\0', remaining) == nullptr
+                            || strcmp(name, symbol_name) != 0) {
+                        continue;
+                    }
+                    if (symbol.st_value <= UINTPTR_MAX - image.base) {
+                        resolved = reinterpret_cast<void*>(
+                                image.base + static_cast<uintptr_t>(symbol.st_value));
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    munmap(mapped, file_size);
+    return resolved;
+}
+
+bool is_executable_library_address(uintptr_t address, const char* library_path) {
+    FILE* maps = fopen("/proc/self/maps", "re");
+    if (maps == nullptr) return false;
+    char line[512];
+    bool valid = false;
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        char perms[5] = {};
+        char path[384] = {};
+        if (sscanf(line, "%llx-%llx %4s %*s %*s %*s %383s",
+                &start, &end, perms, path) != 4) {
+            continue;
+        }
+        if (address >= start && address < end
+                && perms[0] == 'r' && perms[2] == 'x'
+                && strcmp(path, library_path) == 0) {
+            valid = true;
+            break;
+        }
+    }
+    fclose(maps);
+    return valid;
+}
+
 int mapping_protection(uintptr_t address) {
     FILE* maps = fopen("/proc/self/maps", "re");
     if (maps == nullptr) return 0;
@@ -345,27 +486,54 @@ bool replace_writable_pointer(void** slot, void* expected, void* replacement) {
     return __atomic_compare_exchange_n(
             slot, &current, replacement, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
+
+void scan_pointer_range(
+        uintptr_t start,
+        uintptr_t end,
+        void* expected,
+        void*** candidate,
+        int* candidate_count) {
+    constexpr uintptr_t kMaxGovernorScanBytes = 32U * 1024U * 1024U;
+    if (start >= end || end - start > kMaxGovernorScanBytes
+            || expected == nullptr || candidate == nullptr || candidate_count == nullptr) {
+        return;
+    }
+    uintptr_t begin = (start + sizeof(void*) - 1U) & ~(sizeof(void*) - 1U);
+    for (uintptr_t address = begin; address + sizeof(void*) <= end;
+            address += sizeof(void*)) {
+        auto** slot = reinterpret_cast<void**>(address);
+        if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) == expected) {
+            *candidate = slot;
+            ++(*candidate_count);
+        }
+    }
+}
 #endif
 
 int hook_existing_encoder_pointer() {
 #if !defined(__aarch64__)
     return -2;
 #else
-    void* encoder = dlopen(kEncoderLibrary, RTLD_NOW | RTLD_NOLOAD);
-    if (encoder == nullptr) return -3;
-    void* adjust = dlsym(encoder, kAdjustSymbol);
-    void* target = dlsym(encoder, kSetTargetSymbol);
-    if (adjust == nullptr || target == nullptr) {
-        dlclose(encoder);
+    LoadedImage encoder;
+    if (!find_loaded_image(kEncoderLibrary, &encoder)) return -3;
+    void* adjust = resolve_elf64_export(encoder, kAdjustSymbol);
+    void* target = resolve_elf64_export(encoder, kSetTargetSymbol);
+    if (adjust == nullptr || target == nullptr
+            || !is_executable_library_address(
+                    reinterpret_cast<uintptr_t>(adjust), encoder.path)
+            || !is_executable_library_address(
+                    reinterpret_cast<uintptr_t>(target), encoder.path)) {
         return -4;
     }
 
-    // Fail closed unless the already-resolved adjust callback has one unique writable owner.
-    // We never touch dlsym/PLT/GOT or any Bluetooth startup-time symbol resolution.
+    // Fail closed unless the callback has exactly one writable owner in libbluetooth_jni's
+    // file-backed data or its immediately adjacent linker-created anonymous .bss mapping.
+    // No loader entry, relocation, GOT or executable page is modified.
     void** candidate = nullptr;
     int candidate_count = 0;
     FILE* maps = fopen("/proc/self/maps", "re");
     char line[512];
+    uintptr_t bluetooth_tail = 0;
     while (maps != nullptr && fgets(line, sizeof(line), maps) != nullptr) {
         unsigned long long start = 0;
         unsigned long long end = 0;
@@ -373,19 +541,24 @@ int hook_existing_encoder_pointer() {
         char path[384] = {};
         if (sscanf(line, "%llx-%llx %4s %*s %*s %*s %383s",
                 &start, &end, perms, path) != 4) continue;
-        if (perms[0] != 'r' || perms[1] != 'w' || !ends_with(path, kBluetoothLibrary)) {
-            continue;
-        }
-        uintptr_t begin = (static_cast<uintptr_t>(start) + sizeof(void*) - 1U)
-                & ~(sizeof(void*) - 1U);
-        for (uintptr_t address = begin;
-                address + sizeof(void*) <= static_cast<uintptr_t>(end);
-                address += sizeof(void*)) {
-            auto** slot = reinterpret_cast<void**>(address);
-            if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) == adjust) {
-                candidate = slot;
-                ++candidate_count;
+        const bool bluetooth_mapping = ends_with(path, kBluetoothLibrary);
+        const bool writable = perms[0] == 'r' && perms[1] == 'w';
+        if (bluetooth_mapping) {
+            bluetooth_tail = static_cast<uintptr_t>(end);
+            if (writable) {
+                scan_pointer_range(static_cast<uintptr_t>(start),
+                        static_cast<uintptr_t>(end), adjust, &candidate, &candidate_count);
             }
+        } else if (bluetooth_tail != 0
+                && static_cast<uintptr_t>(start) == bluetooth_tail
+                && writable
+                && strcmp(path, "[anon:.bss]") == 0) {
+            scan_pointer_range(static_cast<uintptr_t>(start),
+                    static_cast<uintptr_t>(end), adjust, &candidate, &candidate_count);
+            bluetooth_tail = static_cast<uintptr_t>(end);
+        } else if (bluetooth_tail != 0
+                && static_cast<uintptr_t>(start) >= bluetooth_tail) {
+            bluetooth_tail = 0;
         }
     }
     if (maps != nullptr) fclose(maps);
@@ -402,9 +575,8 @@ int hook_existing_encoder_pointer() {
     } else if (candidate_count > 1) {
         result = -6;
     }
-    dlclose(encoder);
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=encoder.scan candidates=%d result=%d adjust=%p target=%p",
+            "evt=encoder.scan mode=elf_symbol candidates=%d result=%d adjust=%p target=%p",
             candidate_count, result, adjust, target);
     return result;
 #endif
