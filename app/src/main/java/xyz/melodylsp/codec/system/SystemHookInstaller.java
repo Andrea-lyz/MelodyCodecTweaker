@@ -43,8 +43,6 @@ public final class SystemHookInstaller {
     private static final String CLASS_A2DP_NATIVE_INTERFACE =
             "com.android.bluetooth.a2dp.A2dpNativeInterface";
     private static final String CLASS_BT_UTILS = "com.android.bluetooth.Utils";
-    private static final String CLASS_OPLUS_SMART_AUDIO =
-            "com.oplus.bluetooth.feature.smartaudio.OplusBluetoothSmartAudioInterface";
     private static final String MELODY_PKG = "com.oplus.melody";
     private static final long GAME_MODE_SBC_FALLBACK_TTL_MS = 180_000L;
     private static final long[] NATIVE_PATCH_RETRY_DELAYS_MS = {
@@ -86,7 +84,6 @@ public final class SystemHookInstaller {
         hookLifecycle(a2dpCls);
         hookCodecConfigUpdated(a2dpCls);
         hookNativeCodecPreferenceLogger();
-        hookRemoteChoppyReport();
     }
 
     private Class<?> resolveA2dpServiceClass() {
@@ -187,7 +184,6 @@ public final class SystemHookInstaller {
                 if (app instanceof Context) {
                     appContext = ((Context) app).getApplicationContext();
                     NativeLhdcMemoryPatch.configureModuleContext(appContext);
-                    NativeLhdcMemoryPatch.installGovernor();
                     MLog.setDiagnosticContext(appContext, "bluetooth");
                     MLog.event("scope.system.context.ready");
                     ensureLeAudioBridge(appContext);
@@ -414,35 +410,6 @@ public final class SystemHookInstaller {
             hooked++;
         }
         MLog.event("bt.native.codec.hooks", "count", hooked, "class", nativeCls.getName());
-    }
-
-    private void hookRemoteChoppyReport() {
-        try {
-            Class<?> cls = Class.forName(CLASS_OPLUS_SMART_AUDIO, false, classLoader);
-            int hooked = 0;
-            for (Method method : cls.getDeclaredMethods()) {
-                if (!"onRemoteChoppyReport".equals(method.getName())) continue;
-                Class<?>[] params = method.getParameterTypes();
-                if (params.length != 2 || params[0] != int.class || params[1] != byte[].class) {
-                    continue;
-                }
-                try {
-                    method.setAccessible(true);
-                } catch (Throwable ignored) {
-                }
-                module.hook(method).intercept(chain -> {
-                    Object[] args = chain.getArgs().toArray();
-                    int level = args.length > 0 && args[0] instanceof Integer
-                            ? (Integer) args[0] : 0;
-                    NativeLhdcMemoryPatch.reportRemoteChoppy(level);
-                    return chain.proceed();
-                });
-                hooked++;
-            }
-            MLog.event("lhdc.governor.choppy_hooks", "count", hooked);
-        } catch (Throwable t) {
-            MLog.w("LHDC remote choppy hook unavailable", t);
-        }
     }
 
     private synchronized void scheduleNativeLhdcMemoryPatch(String reason) {

@@ -24,8 +24,6 @@ public final class CodecIpc {
             "xyz.melodylsp.codec.action.NATIVE_PATCH_STATE";
     public static final String ACTION_GAME_MODE_STATE =
             "xyz.melodylsp.codec.action.GAME_MODE_STATE";
-    public static final String ACTION_SET_LHDC_POLICY =
-            "xyz.melodylsp.codec.action.SET_LHDC_POLICY";
 
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_REQUEST_ID = "request_id";
@@ -65,8 +63,6 @@ public final class CodecIpc {
     public static final String EXTRA_GAME_MODE_TYPE = "game_mode_type";
     public static final String EXTRA_GAME_MODE_SOURCE = "game_mode_source";
     public static final String EXTRA_GAME_MODE_TTL_MS = "game_mode_ttl_ms";
-    public static final String EXTRA_LHDC_POLICY = "lhdc_policy";
-    public static final String EXTRA_LHDC_POLICY_REASON = "lhdc_policy_reason";
 
     public static final String TOKEN = "mlcdc-codec-v1";
 

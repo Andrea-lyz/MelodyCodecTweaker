@@ -63,7 +63,6 @@ public final class FeedbackCollector {
 
     private static final String[] BLUETOOTH_LOG_PATTERNS = {
             "MelodyCodecLsp",
-            "MelodyLhdcGov",
             "LSPosedFramework",
             "bluetooth-a2dp",
             "btif_a2dp",
@@ -114,11 +113,10 @@ public final class FeedbackCollector {
     };
     private static final String MODULE_LOGCAT_COMMAND =
             "/system/bin/logcat -d -b all -t 20000 "
-                    + "MelodyCodecLsp:V MelodyLhdcGov:V '*:S'";
+                    + "MelodyCodecLsp:V '*:S'";
     private static final String BLUETOOTH_LOGCAT_COMMAND =
             "/system/bin/logcat -d -b all -t 50000 "
                     + "MelodyCodecLsp:V "
-                    + "MelodyLhdcGov:V "
                     + "bluetooth-a2dp:V soc_bta_av:V "
                     + "a2dp_vendor_lhdcv5:V a2dp_vendor_lhdcv5_encoder:V '*:S'";
     private static final int MAX_COMMAND_OUTPUT_CHARS = 4_000_000;

@@ -27,7 +27,6 @@ import java.util.Set;
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
-import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.storage.PreferenceStore;
 import xyz.melodylsp.codec.util.MLog;
@@ -925,19 +924,11 @@ public final class ConnectionStateReplayer {
             CodecRequest req,
             long generation,
             int attempt) {
-        int policy = CodecLabelTable.isLhdc(req.codecType)
-                ? LhdcQualityPolicy.fromSpecific1(stored.codecSpecific1)
-                : LhdcQualityPolicy.ADAPTIVE;
-        CodecRequest transportRequest = LhdcQualityPolicy.transportRequest(req, policy);
-        if (CodecLabelTable.isLhdc(req.codecType)) {
-            LhdcQualityPolicy.send(context, mac, policy, "remember_replay");
-        }
         MLog.event("replay.dispatch",
                 "mac", A2dpRouteReadiness.redactMac(mac),
                 "attempt", attempt,
-                "policy", policy,
-                "request", transportRequest);
-        bridge.setCodec(transportRequest, () -> isReplayStillCurrent(mac, stored, generation))
+                "request", req);
+        bridge.setCodec(req, () -> isReplayStillCurrent(mac, stored, generation))
                 .whenComplete((result, throwable) -> {
             if (throwable != null) {
                 MLog.e("replay future failed", throwable);
@@ -1210,11 +1201,7 @@ public final class ConnectionStateReplayer {
                 || CodecLabelTable.isLhdc(stored.codecType)) {
             long active = live.activeCodecSpecific1 & 0xFFL;
             long remembered = stored.codecSpecific1 & 0xFFL;
-            long transported = LhdcQualityPolicy.transportSpecific1(
-                    remembered, LhdcQualityPolicy.fromSpecific1(remembered)) & 0xFFL;
-            return active == remembered
-                    || active == transported
-                    || isLhdcFixedCeilingPair(active, remembered);
+            return active == remembered || isLhdcFixedCeilingPair(active, remembered);
         }
         return live.activeCodecSpecific1 == stored.codecSpecific1;
     }

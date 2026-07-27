@@ -37,7 +37,6 @@ public final class CodecBroadcastBridge {
         filter.addAction(CodecIpc.ACTION_QUERY_CODEC);
         filter.addAction(CodecIpc.ACTION_SET_CODEC);
         filter.addAction(CodecIpc.ACTION_SET_OPTIONAL_CODECS);
-        filter.addAction(CodecIpc.ACTION_SET_LHDC_POLICY);
         filter.addAction(CodecIpc.ACTION_QUERY_NATIVE_PATCH);
         if (!TrustedBroadcasts.registerExportedReceiver(
                 context,
@@ -94,17 +93,6 @@ public final class CodecBroadcastBridge {
                 reply(requestId, mac, snapshot, result == CodecRequest.RESULT_OK, result);
                 MLog.event("codec.bt.set_optional", "result", result,
                         "enable", enable, "mac", mac);
-            } else if (CodecIpc.ACTION_SET_LHDC_POLICY.equals(action)) {
-                int policy = intent.getIntExtra(
-                        CodecIpc.EXTRA_LHDC_POLICY,
-                        xyz.melodylsp.codec.bridge.LhdcQualityPolicy.ADAPTIVE);
-                String reason = intent.getStringExtra(CodecIpc.EXTRA_LHDC_POLICY_REASON);
-                boolean applied = NativeLhdcMemoryPatch.setGovernorPolicy(policy);
-                MLog.event("lhdc.governor.policy",
-                        "applied", applied,
-                        "policy", policy,
-                        "reason", reason,
-                        "mac", redactMac(mac));
             }
         } catch (Throwable t) {
             MLog.e("codec bluetooth request failed", t);
@@ -118,7 +106,6 @@ public final class CodecBroadcastBridge {
             // Android 12/13 rely on the OPlus signature permission required at registration time.
             return CodecIpc.ACTION_SET_CODEC.equals(action)
                     || CodecIpc.ACTION_SET_OPTIONAL_CODECS.equals(action)
-                    || CodecIpc.ACTION_SET_LHDC_POLICY.equals(action)
                     || CodecIpc.ACTION_QUERY_CODEC.equals(action)
                     || CodecIpc.ACTION_QUERY_NATIVE_PATCH.equals(action);
         }
@@ -127,8 +114,7 @@ public final class CodecBroadcastBridge {
         if (trusted) return true;
 
         boolean write = CodecIpc.ACTION_SET_CODEC.equals(action)
-                || CodecIpc.ACTION_SET_OPTIONAL_CODECS.equals(action)
-                || CodecIpc.ACTION_SET_LHDC_POLICY.equals(action);
+                || CodecIpc.ACTION_SET_OPTIONAL_CODECS.equals(action);
         if (write) {
             MLog.w("codec bluetooth write rejected: sender identity unavailable or untrusted");
             return false;
@@ -148,11 +134,6 @@ public final class CodecBroadcastBridge {
                 intent.getIntExtra(CodecIpc.EXTRA_SAMPLE_RATE, 0),
                 intent.getIntExtra(CodecIpc.EXTRA_BITS_PER_SAMPLE, 0),
                 intent.getIntExtra(CodecIpc.EXTRA_CHANNEL_MODE, 0));
-    }
-
-    private static String redactMac(String mac) {
-        if (mac == null || mac.length() < 5) return "??";
-        return mac.substring(0, 2) + "**" + mac.substring(mac.length() - 2);
     }
 
     private void reply(
