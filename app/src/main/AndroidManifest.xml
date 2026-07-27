@@ -63,6 +63,7 @@
 
         <receiver
             android:name=".diag.DiagnosticEventReceiver"
+            android:enabled="false"
             android:exported="true"
             android:permission="oplus.permission.OPLUS_COMPONENT_SAFE">
             <intent-filter>

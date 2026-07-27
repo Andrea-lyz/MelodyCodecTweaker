@@ -1,6 +1,10 @@
 package xyz.melodylsp.codec.util;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.util.Log;
 
 import java.util.ArrayList;
@@ -9,6 +13,7 @@ import java.util.regex.Pattern;
 
 import io.github.libxposed.api.XposedInterface;
 import xyz.melodylsp.codec.BuildConfig;
+import xyz.melodylsp.codec.MelodyCodecLspEntry;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 
 /**
@@ -24,6 +29,8 @@ public final class MLog {
     private static volatile String hostVersion = "?";
     private static volatile Context diagnosticContext;
     private static volatile String diagnosticScope = "unknown";
+    private static volatile long diagnosticRecordingUntilMs;
+    private static volatile BroadcastReceiver diagnosticControlReceiver;
     private static final Object PENDING_LOCK = new Object();
     private static final List<PendingDiagnostic> pendingDiagnostics = new ArrayList<>();
     private static final int MAX_PENDING_DIAGNOSTICS = 128;
@@ -46,7 +53,74 @@ public final class MLog {
         if (scope != null && !scope.isEmpty()) {
             diagnosticScope = scope;
         }
-        flushPendingDiagnostics(appContext, diagnosticScope);
+        refreshDiagnosticRecordingFromRemotePreferences();
+        registerDiagnosticControlReceiver(appContext);
+        if (isDiagnosticRecordingActive(System.currentTimeMillis())) {
+            flushPendingDiagnostics(appContext, diagnosticScope);
+        } else {
+            clearPendingDiagnostics();
+        }
+    }
+
+    public static void configureDiagnosticRecordingUntil(long untilMs) {
+        diagnosticRecordingUntilMs = Math.max(0L, untilMs);
+        if (!isDiagnosticRecordingActive(System.currentTimeMillis())) {
+            clearPendingDiagnostics();
+        }
+    }
+
+    static boolean isRecordingActive(long untilMs, long nowMs) {
+        return untilMs > 0L && untilMs > nowMs;
+    }
+
+    private static boolean isDiagnosticRecordingActive(long nowMs) {
+        return isRecordingActive(diagnosticRecordingUntilMs, nowMs);
+    }
+
+    private static void refreshDiagnosticRecordingFromRemotePreferences() {
+        try {
+            MelodyCodecLspEntry entry = MelodyCodecLspEntry.current();
+            if (entry == null) return;
+            SharedPreferences preferences = entry.getRemotePreferences(DiagnosticEvents.MODULE_PREFS);
+            configureDiagnosticRecordingUntil(
+                    preferences.getLong(DiagnosticEvents.KEY_RECORDING_UNTIL, 0L));
+        } catch (Throwable ignored) {
+            configureDiagnosticRecordingUntil(0L);
+        }
+    }
+
+    private static synchronized void registerDiagnosticControlReceiver(Context context) {
+        if (context == null || diagnosticControlReceiver != null) return;
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context receiverContext, Intent intent) {
+                if (intent == null
+                        || !DiagnosticEvents.ACTION_RECORDING_CONTROL.equals(intent.getAction())) {
+                    return;
+                }
+                if (TrustedBroadcasts.supportsSenderIdentity()
+                        && !TrustedBroadcasts.isTrustedSender(
+                        receiverContext,
+                        TrustedBroadcasts.captureSender(this),
+                        BuildConfig.APPLICATION_ID)) {
+                    return;
+                }
+                configureDiagnosticRecordingUntil(intent.getLongExtra(
+                        DiagnosticEvents.EXTRA_RECORDING_UNTIL, 0L));
+                eventLogOnly("diag.recording.control",
+                        "active", isDiagnosticRecordingActive(System.currentTimeMillis()),
+                        "scope", diagnosticScope);
+            }
+        };
+        IntentFilter filter = new IntentFilter(DiagnosticEvents.ACTION_RECORDING_CONTROL);
+        if (TrustedBroadcasts.registerExportedReceiver(
+                context,
+                receiver,
+                filter,
+                DiagnosticEvents.PERMISSION_MEMORY_SNAPSHOT_REQUEST,
+                null)) {
+            diagnosticControlReceiver = receiver;
+        }
     }
 
     /** Called by {@link xyz.melodylsp.codec.host.HostHookInstaller} once host package info is known. */
@@ -86,11 +160,23 @@ public final class MLog {
 
     /** Structured event log; {@code kvPairs} is appended as {@code k=v} pairs separated by spaces. */
     public static void event(String name, Object... kvPairs) {
+        emitEvent(name, true, kvPairs);
+    }
+
+    /**
+     * Structured logcat event that is intentionally omitted from the persistent diagnostic ring.
+     * Use this for high-frequency telemetry whose raw samples remain available in feedback logcat.
+     */
+    public static void eventLogOnly(String name, Object... kvPairs) {
+        emitEvent(name, false, kvPairs);
+    }
+
+    private static void emitEvent(String name, boolean persistDiagnostic, Object... kvPairs) {
         StringBuilder sb = new StringBuilder("evt=").append(name);
         for (int i = 0; i + 1 < kvPairs.length; i += 2) {
             sb.append(' ').append(kvPairs[i]).append('=').append(kvPairs[i + 1]);
         }
-        emit(Log.INFO, sb.toString(), null);
+        emit(Log.INFO, sb.toString(), null, persistDiagnostic);
     }
 
     /** Returns a single-token throwable summary suitable for structured event values. */
@@ -108,6 +194,11 @@ public final class MLog {
     }
 
     private static void emit(int priority, String message, Throwable t) {
+        emit(priority, message, t, true);
+    }
+
+    private static void emit(
+            int priority, String message, Throwable t, boolean persistDiagnostic) {
         long time = System.currentTimeMillis();
         String prefixed = prefix() + redactBluetoothAddresses(message);
         String safeStack = t != null
@@ -128,11 +219,13 @@ public final class MLog {
             }
         }
         String diagnosticMessage = t == null ? prefixed : prefixed + '\n' + safeStack;
-        Context context = diagnosticContext;
-        if (context != null) {
-            DiagnosticEvents.send(context, diagnosticScope, priority, diagnosticMessage, time);
-        } else {
-            enqueuePendingDiagnostic(priority, diagnosticMessage, time);
+        if (persistDiagnostic && isDiagnosticRecordingActive(time)) {
+            Context context = diagnosticContext;
+            if (context != null) {
+                DiagnosticEvents.send(context, diagnosticScope, priority, diagnosticMessage, time);
+            } else {
+                enqueuePendingDiagnostic(priority, diagnosticMessage, time);
+            }
         }
     }
 
@@ -165,6 +258,12 @@ public final class MLog {
         }
         for (PendingDiagnostic pending : copy) {
             DiagnosticEvents.send(context, scope, pending.priority, pending.message, pending.time);
+        }
+    }
+
+    private static void clearPendingDiagnostics() {
+        synchronized (PENDING_LOCK) {
+            pendingDiagnostics.clear();
         }
     }
 

@@ -59,6 +59,7 @@ constexpr const char* kEncoderLibrary = "liblhdcv5BT_enc.so";
 constexpr const char* kEncodeSymbol = "lhdcv5BT_encode";
 constexpr const char* kFreeHandleSymbol = "lhdcv5BT_free_handle";
 constexpr const char* kSetTargetSymbol = "lhdcv5BT_set_target_bitrate_inx";
+constexpr const char* kGetBitrateSymbol = "lhdcv5BT_get_bitrate";
 #endif
 
 constexpr int kPolicyConnection = 6;
@@ -70,20 +71,41 @@ constexpr uint32_t kRate500 = 6;
 constexpr uint32_t kRate900 = 7;
 constexpr uint32_t kRate1000 = 8;
 constexpr uint32_t kDefaultQueueCapacity = 45;
+constexpr uint64_t kCriticalOccupancyPercent = 90ULL;
+constexpr uint64_t kCriticalHoldMs = 300ULL;
+constexpr uint64_t kUpgradeStableMs = 15'000ULL;
+constexpr uint64_t kUpgradeFailureWindowMs = 10'000ULL;
+constexpr uint64_t kUpgradeRecoveryMs = 60'000ULL;
+constexpr uint64_t kStreamingRecentMs = 2'000ULL;
+constexpr uint64_t kUpgradeBackoffStepsMs[] = {
+        15'000ULL, 30'000ULL, 60'000ULL, 120'000ULL, 300'000ULL
+};
+constexpr uint32_t kGovernorEventQuickFailure = 1;
+constexpr uint32_t kGovernorEventUpgradeStable = 2;
 
 using SetTargetBitrateFn = int32_t (*)(void*, uint32_t);
+using GetBitrateFn = int32_t (*)(void*, uint32_t*);
 using FreeHandleFn = int32_t (*)(void*);
 using EncodeFn = int32_t (*)(
         void*, void*, uint32_t, uint8_t*, uint32_t, uint32_t*, uint32_t*);
 
 std::atomic<SetTargetBitrateFn> g_set_target{nullptr};
+std::atomic<GetBitrateFn> g_get_bitrate{nullptr};
 std::atomic<FreeHandleFn> g_free_handle{nullptr};
 std::atomic<EncodeFn> g_encode{nullptr};
 std::atomic<void*> g_active_encoder_handle{nullptr};
+std::atomic<uint64_t> g_last_encode_ms{0};
 std::atomic<int> g_policy{kPolicyAdaptive};
 std::atomic<uint32_t> g_policy_epoch{1};
 std::atomic<uint64_t> g_choppy_sequence{0};
 std::atomic<int> g_choppy_level{0};
+std::atomic<uint32_t> g_probe_ceiling_rate{kRate1000};
+std::atomic<uint64_t> g_governor_event{0};
+
+struct UpgradeBoundaryRuntime {
+    uint32_t failure_count = 0;
+    uint64_t backoff_until_ms = 0;
+};
 
 // Queue-governor state. Java serializes queue samples on the Bluetooth main looper.
 void* g_governor_handle = nullptr;
@@ -91,13 +113,15 @@ uint32_t g_seen_policy_epoch = 0;
 uint64_t g_seen_choppy_sequence = 0;
 uint32_t g_current_rate = kRate1000;
 uint32_t g_queue_capacity = kDefaultQueueCapacity;
-uint64_t g_high_since_ms = 0;
 uint64_t g_critical_since_ms = 0;
 uint64_t g_low_since_ms = 0;
 uint64_t g_last_transition_ms = 0;
 uint64_t g_last_congestion_ms = 0;
 uint64_t g_last_upgrade_ms = 0;
-uint64_t g_upgrade_backoff_until_ms = 0;
+uint32_t g_last_upgrade_from = 0;
+uint32_t g_last_upgrade_to = 0;
+UpgradeBoundaryRuntime g_boundary_500_to_900;
+UpgradeBoundaryRuntime g_boundary_900_to_1000;
 uint64_t g_choppy_window_start_ms = 0;
 uint32_t g_choppy_count = 0;
 std::mutex g_governor_mutex;
@@ -119,6 +143,28 @@ int bitrate_for_rate(uint32_t rate) {
     }
 }
 
+uint64_t pack_governor_event(uint32_t event, uint32_t from, uint32_t to) {
+    return static_cast<uint64_t>(event & 0xffU)
+            | (static_cast<uint64_t>(from & 0xffU) << 8U)
+            | (static_cast<uint64_t>(to & 0xffU) << 16U);
+}
+
+void publish_governor_event(uint32_t event, uint32_t from, uint32_t to) {
+    g_governor_event.store(pack_governor_event(event, from, to),
+            std::memory_order_release);
+}
+
+UpgradeBoundaryRuntime* boundary_for_upgrade(uint32_t from, uint32_t to) {
+    if (from == kRate500 && to == kRate900) return &g_boundary_500_to_900;
+    if (from == kRate900 && to == kRate1000) return &g_boundary_900_to_1000;
+    return nullptr;
+}
+
+uint32_t clamp_to_probe_ceiling(uint32_t target) {
+    const uint32_t ceiling = g_probe_ceiling_rate.load(std::memory_order_acquire);
+    return target > ceiling ? ceiling : target;
+}
+
 void governor_log_transition(
         const char* reason, uint32_t from, uint32_t to, uint32_t queue, int result) {
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
@@ -134,15 +180,45 @@ void reset_encoder_state(void* handle, uint32_t epoch, uint64_t now) {
     // first real write and leave the encoder at the OEM ABR's previous (often very low) target.
     g_current_rate = 0;
     g_queue_capacity = kDefaultQueueCapacity;
-    g_high_since_ms = 0;
     g_critical_since_ms = 0;
     g_low_since_ms = 0;
     g_last_transition_ms = 0;
     g_last_congestion_ms = now;
     g_last_upgrade_ms = 0;
-    g_upgrade_backoff_until_ms = 0;
+    g_last_upgrade_from = 0;
+    g_last_upgrade_to = 0;
+    g_boundary_500_to_900 = {};
+    g_boundary_900_to_1000 = {};
+    g_governor_event.store(0, std::memory_order_release);
     g_choppy_window_start_ms = now;
     g_choppy_count = 0;
+}
+
+bool record_upgrade_failure(uint64_t now, const char* reason) {
+    if (g_last_upgrade_ms == 0 || now - g_last_upgrade_ms > kUpgradeFailureWindowMs) {
+        return false;
+    }
+    if (reason != nullptr && strcmp(reason, "remote_choppy") == 0 && g_choppy_count < 2) {
+        return false;
+    }
+    UpgradeBoundaryRuntime* boundary =
+            boundary_for_upgrade(g_last_upgrade_from, g_last_upgrade_to);
+    if (boundary == nullptr) return false;
+    const size_t step_count = sizeof(kUpgradeBackoffStepsMs)
+            / sizeof(kUpgradeBackoffStepsMs[0]);
+    const size_t step = boundary->failure_count < step_count
+            ? boundary->failure_count : step_count - 1U;
+    const uint64_t delay_ms = kUpgradeBackoffStepsMs[step];
+    ++boundary->failure_count;
+    boundary->backoff_until_ms = now + delay_ms;
+    publish_governor_event(kGovernorEventQuickFailure,
+            g_last_upgrade_from, g_last_upgrade_to);
+    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+            "evt=upgrade.backoff boundary=%d-%d failures=%u delay_ms=%llu",
+            bitrate_for_rate(g_last_upgrade_from), bitrate_for_rate(g_last_upgrade_to),
+            boundary->failure_count,
+            static_cast<unsigned long long>(delay_ms));
+    return true;
 }
 
 bool set_rate(uint32_t target, const char* reason, uint32_t queue, uint64_t now, bool upgrade) {
@@ -155,13 +231,24 @@ bool set_rate(uint32_t target, const char* reason, uint32_t queue, uint64_t now,
     if (result != 0) return false;
     g_current_rate = target;
     g_last_transition_ms = now;
-    g_high_since_ms = 0;
     g_critical_since_ms = 0;
     g_low_since_ms = 0;
     if (upgrade) {
         g_last_upgrade_ms = now;
+        g_last_upgrade_from = previous;
+        g_last_upgrade_to = target;
     } else {
-        g_last_upgrade_ms = 0;
+        bool keep_pending_choppy = false;
+        if (target < previous) {
+            const bool recorded = record_upgrade_failure(now, reason);
+            keep_pending_choppy = !recorded
+                    && g_last_upgrade_ms != 0
+                    && now - g_last_upgrade_ms <= kUpgradeFailureWindowMs
+                    && reason != nullptr
+                    && strcmp(reason, "remote_choppy") == 0
+                    && g_choppy_count < 2;
+        }
+        if (!keep_pending_choppy) g_last_upgrade_ms = 0;
     }
     return true;
 }
@@ -169,9 +256,28 @@ bool set_rate(uint32_t target, const char* reason, uint32_t queue, uint64_t now,
 void note_congestion(uint64_t now) {
     g_last_congestion_ms = now;
     g_low_since_ms = 0;
-    if (g_last_upgrade_ms != 0 && now - g_last_upgrade_ms <= 10'000ULL) {
-        g_upgrade_backoff_until_ms = now + 300'000ULL;
+}
+
+void maybe_reset_upgrade_failures(uint64_t now) {
+    if (g_last_upgrade_ms == 0) return;
+    if (g_current_rate < g_last_upgrade_to) return;
+    UpgradeBoundaryRuntime* boundary =
+            boundary_for_upgrade(g_last_upgrade_from, g_last_upgrade_to);
+    if (boundary == nullptr) return;
+    const uint64_t stable_from = g_last_upgrade_ms > g_last_congestion_ms
+            ? g_last_upgrade_ms : g_last_congestion_ms;
+    if (now - stable_from < kUpgradeRecoveryMs) {
+        return;
     }
+    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+            "evt=upgrade.recovered boundary=%d-%d failures=%u",
+            bitrate_for_rate(g_last_upgrade_from), bitrate_for_rate(g_last_upgrade_to),
+            boundary->failure_count);
+    boundary->failure_count = 0;
+    boundary->backoff_until_ms = 0;
+    publish_governor_event(kGovernorEventUpgradeStable,
+            g_last_upgrade_from, g_last_upgrade_to);
+    g_last_upgrade_ms = 0;
 }
 
 void apply_choppy_protection(uint32_t queue, uint64_t now) {
@@ -203,19 +309,27 @@ void quality_governor_sample(void* handle, uint32_t queue) {
     const uint32_t epoch = g_policy_epoch.load(std::memory_order_acquire);
     if (handle != g_governor_handle || epoch != g_seen_policy_epoch) {
         reset_encoder_state(handle, epoch, now);
-        set_rate(kRate1000, "quality_start", queue, now, true);
+        const uint32_t start_rate = clamp_to_probe_ceiling(kRate1000);
+        set_rate(start_rate, "quality_start", queue, now, false);
     }
     if (g_current_rate == 0) {
-        set_rate(kRate1000, "quality_start_retry", queue, now, true);
+        const uint32_t start_rate = clamp_to_probe_ceiling(kRate1000);
+        set_rate(start_rate, "quality_start_retry", queue, now, false);
     }
+    maybe_reset_upgrade_failures(now);
     if (queue > g_queue_capacity) g_queue_capacity = queue;
+    const uint32_t probe_ceiling =
+            g_probe_ceiling_rate.load(std::memory_order_acquire);
+    if (g_current_rate > probe_ceiling) {
+        set_rate(probe_ceiling, "probe_ceiling", queue, now, false);
+        return;
+    }
     apply_choppy_protection(queue, now);
 
     const uint64_t occupancy = static_cast<uint64_t>(queue) * 100ULL;
     const uint64_t capacity = static_cast<uint64_t>(g_queue_capacity);
     const bool full = queue >= g_queue_capacity;
-    const bool critical = occupancy >= capacity * 85ULL;
-    const bool high = occupancy >= capacity * 65ULL;
+    const bool critical = occupancy >= capacity * kCriticalOccupancyPercent;
     const bool low = occupancy <= capacity * 25ULL;
 
     if (full) {
@@ -225,13 +339,8 @@ void quality_governor_sample(void* handle, uint32_t queue) {
         return;
     }
 
-    if (high) {
-        note_congestion(now);
-        if (g_high_since_ms == 0) g_high_since_ms = now;
-    } else {
-        g_high_since_ms = 0;
-    }
     if (critical) {
+        note_congestion(now);
         if (g_critical_since_ms == 0) g_critical_since_ms = now;
     } else {
         g_critical_since_ms = 0;
@@ -240,25 +349,11 @@ void quality_governor_sample(void* handle, uint32_t queue) {
     const bool transition_hold_elapsed = g_last_transition_ms == 0
             || now - g_last_transition_ms >= 700ULL;
     if (transition_hold_elapsed
-            && high
-            && g_last_upgrade_ms != 0
-            && now - g_last_upgrade_ms <= 10'000ULL
-            && g_current_rate >= kRate900) {
-        set_rate(kRate500, "upgrade_failed", queue, now, false);
-        return;
-    }
-    if (transition_hold_elapsed
             && g_critical_since_ms != 0
-            && now - g_critical_since_ms >= 300ULL
-            && g_current_rate >= kRate900) {
-        set_rate(kRate500, "queue_critical", queue, now, false);
-        return;
-    }
-    if (transition_hold_elapsed
-            && g_high_since_ms != 0
-            && now - g_high_since_ms >= 200ULL
-            && g_current_rate == kRate1000) {
-        set_rate(kRate900, "queue_rising", queue, now, false);
+            && now - g_critical_since_ms >= kCriticalHoldMs
+            && g_current_rate > kRate400) {
+        const uint32_t target = g_current_rate >= kRate900 ? kRate500 : kRate400;
+        set_rate(target, "queue_critical", queue, now, false);
         return;
     }
 
@@ -267,21 +362,24 @@ void quality_governor_sample(void* handle, uint32_t queue) {
         return;
     }
     if (g_low_since_ms == 0) g_low_since_ms = now;
-    if (now < g_upgrade_backoff_until_ms) return;
 
     uint64_t required_stable_ms = 0;
     uint32_t target = g_current_rate;
     if (g_current_rate == kRate400) {
-        required_stable_ms = 20'000ULL;
+        required_stable_ms = kUpgradeStableMs;
         target = kRate500;
     } else if (g_current_rate == kRate500) {
-        required_stable_ms = 60'000ULL;
+        required_stable_ms = kUpgradeStableMs;
         target = kRate900;
     } else if (g_current_rate == kRate900) {
-        required_stable_ms = 120'000ULL;
+        required_stable_ms = kUpgradeStableMs;
         target = kRate1000;
     }
     if (required_stable_ms == 0) return;
+    target = clamp_to_probe_ceiling(target);
+    if (target <= g_current_rate) return;
+    UpgradeBoundaryRuntime* boundary = boundary_for_upgrade(g_current_rate, target);
+    if (boundary != nullptr && now < boundary->backoff_until_ms) return;
     const uint64_t stable_from = g_low_since_ms > g_last_congestion_ms
             ? g_low_since_ms : g_last_congestion_ms;
     if (now - stable_from >= required_stable_ms) {
@@ -297,6 +395,7 @@ extern "C" int32_t melody_lhdc_encode(
         uint32_t output_bytes,
         uint32_t* encoded_bytes,
         uint32_t* encoded_frames) {
+    g_last_encode_ms.store(monotonic_ms(), std::memory_order_release);
     void* previous = g_active_encoder_handle.load(std::memory_order_acquire);
     if (handle != nullptr && handle != previous) {
         if (g_active_encoder_handle.compare_exchange_strong(
@@ -315,8 +414,9 @@ extern "C" int32_t melody_lhdc_encode(
 extern "C" int32_t melody_lhdc_free_handle(void* handle) {
     std::lock_guard<std::mutex> lock(g_governor_mutex);
     void* expected = handle;
-    g_active_encoder_handle.compare_exchange_strong(
+    const bool released = g_active_encoder_handle.compare_exchange_strong(
             expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
+    if (released) g_last_encode_ms.store(0, std::memory_order_release);
     if (g_governor_handle == handle) g_governor_handle = nullptr;
     FreeHandleFn original = g_free_handle.load(std::memory_order_acquire);
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
@@ -538,6 +638,12 @@ int hook_existing_encoder_pointer() {
     void* encode = resolve_elf64_export(encoder, kEncodeSymbol);
     void* free_handle = resolve_elf64_export(encoder, kFreeHandleSymbol);
     void* target = resolve_elf64_export(encoder, kSetTargetSymbol);
+    void* bitrate_getter = resolve_elf64_export(encoder, kGetBitrateSymbol);
+    if (bitrate_getter != nullptr
+            && !is_executable_library_address(
+                    reinterpret_cast<uintptr_t>(bitrate_getter), encoder.path)) {
+        bitrate_getter = nullptr;
+    }
     if (encode == nullptr || free_handle == nullptr || target == nullptr
             || !is_executable_library_address(
                     reinterpret_cast<uintptr_t>(encode), encoder.path)
@@ -600,6 +706,8 @@ int hook_existing_encoder_pointer() {
         // Publish every forward target before exposing either wrapper to Bluetooth threads.
         g_set_target.store(reinterpret_cast<SetTargetBitrateFn>(target),
                 std::memory_order_release);
+        g_get_bitrate.store(reinterpret_cast<GetBitrateFn>(bitrate_getter),
+                std::memory_order_release);
         g_free_handle.store(reinterpret_cast<FreeHandleFn>(free_handle),
                 std::memory_order_release);
         g_encode.store(reinterpret_cast<EncodeFn>(encode), std::memory_order_release);
@@ -618,8 +726,9 @@ int hook_existing_encoder_pointer() {
     }
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
             "evt=encoder.scan mode=fixed_encode encode_candidates=%d free_candidates=%d "
-            "result=%d encode=%p target=%p free=%p",
-            encode_candidate_count, free_candidate_count, result, encode, target, free_handle);
+            "result=%d encode=%p target=%p getter=%p free=%p",
+            encode_candidate_count, free_candidate_count, result,
+            encode, target, bitrate_getter, free_handle);
     return result;
 #endif
 }
@@ -651,9 +760,71 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorPolicy(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorProbeCeilingKbps(
+        JNIEnv*, jclass, jint ceiling_kbps) {
+    uint32_t rate = kRate1000;
+    if (ceiling_kbps <= 500) {
+        rate = kRate500;
+    } else if (ceiling_kbps <= 900) {
+        rate = kRate900;
+    }
+    g_probe_ceiling_rate.store(rate, std::memory_order_release);
+    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+            "evt=probe.ceiling bitrate=%d", bitrate_for_rate(rate));
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeConsumeGovernorEvent(
+        JNIEnv*, jclass) {
+    return static_cast<jlong>(
+            g_governor_event.exchange(0, std::memory_order_acq_rel));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetGovernorBitrateKbps(
+        JNIEnv*, jclass) {
+    const int policy = g_policy.load(std::memory_order_acquire);
+    if (policy != kPolicyQuality && policy != kPolicyAdaptive) return 0;
+    std::lock_guard<std::mutex> lock(g_governor_mutex);
+    void* handle = g_active_encoder_handle.load(std::memory_order_acquire);
+    GetBitrateFn getter = g_get_bitrate.load(std::memory_order_acquire);
+    if (handle != nullptr && getter != nullptr) {
+        uint32_t bitrate = 0;
+        if (getter(handle, &bitrate) == 0) {
+            if (bitrate >= 64'000U && bitrate <= 1'000'000U) {
+                return static_cast<jint>(bitrate / 1000U);
+            }
+            // Keep compatibility with vendor variants that already report kbps.
+            if (bitrate >= 64U && bitrate <= 1000U) {
+                return static_cast<jint>(bitrate);
+            }
+        }
+    }
+    // The quality governor still has an exact local value when the optional getter is absent.
+    if (policy == kPolicyQuality && g_governor_handle != nullptr) {
+        return bitrate_for_rate(g_current_rate);
+    }
+    return 0;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeIsGovernorStreaming(
+        JNIEnv*, jclass) {
+    if (g_active_encoder_handle.load(std::memory_order_acquire) == nullptr) return JNI_FALSE;
+    const uint64_t last_encode_ms = g_last_encode_ms.load(std::memory_order_acquire);
+    const uint64_t now = monotonic_ms();
+    return last_encode_ms != 0 && now >= last_encode_ms
+            && now - last_encode_ms <= kStreamingRecentMs ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeReportQueueLength(
         JNIEnv*, jclass, jint length) {
     if (length < 0 || g_policy.load(std::memory_order_acquire) != kPolicyQuality) return;
+    const uint64_t last_encode_ms = g_last_encode_ms.load(std::memory_order_acquire);
+    const uint64_t now = monotonic_ms();
+    if (last_encode_ms == 0 || now < last_encode_ms
+            || now - last_encode_ms > kStreamingRecentMs) return;
     std::lock_guard<std::mutex> lock(g_governor_mutex);
     void* handle = g_active_encoder_handle.load(std::memory_order_acquire);
     if (handle != nullptr) {

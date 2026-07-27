@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
@@ -42,6 +43,10 @@ public final class SystemHookInstaller {
     private static final String CLASS_A2DP_SERVICE = "com.android.bluetooth.a2dp.A2dpService";
     private static final String CLASS_A2DP_NATIVE_INTERFACE =
             "com.android.bluetooth.a2dp.A2dpNativeInterface";
+    private static final String CLASS_ADAPTER_SERVICE =
+            "com.android.bluetooth.btservice.AdapterService";
+    private static final String CLASS_BLUETOOTH_QUALITY_REPORT =
+            "android.bluetooth.BluetoothQualityReport";
     private static final String CLASS_BT_UTILS = "com.android.bluetooth.Utils";
     private static final String CLASS_OPLUS_SMART_AUDIO =
             "com.oplus.bluetooth.feature.smartaudio.OplusBluetoothSmartAudioInterface";
@@ -49,6 +54,8 @@ public final class SystemHookInstaller {
     private static final long GAME_MODE_SBC_FALLBACK_TTL_MS = 180_000L;
     private static final long LHDC_QUEUE_SAMPLE_INTERVAL_MS = 200L;
     private static final long LHDC_QUEUE_IDLE_INTERVAL_MS = 1_000L;
+    private static final long BQR_DIAGNOSTIC_INTERVAL_MS = 60_000L;
+    private static final int LHDC_QUEUE_CAPACITY = 45;
     private static final long[] NATIVE_PATCH_RETRY_DELAYS_MS = {
             0L, 350L, 1_500L, 5_000L, 12_000L
     };
@@ -72,16 +79,28 @@ public final class SystemHookInstaller {
     private Method smartAudioQueueLengthMethod;
     private boolean smartAudioQueueSampleScheduled;
     private int smartAudioQueueSampleFailures;
+    private final LhdcLinkHealthController linkHealthController;
+    private String activeLhdcMac;
+    private String lastBqrDiagnosticState;
+    private long lastBqrDiagnosticMs;
 
     public SystemHookInstaller(
             MelodyCodecLspEntry module, ClassLoader classLoader, String sourceDir) {
         this.module = module;
         this.classLoader = classLoader;
         this.sourceDir = sourceDir;
+        this.linkHealthController = new LhdcLinkHealthController((mac, ceilingKbps, reason) -> {
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+            MLog.event("lhdc.link.probe_ceiling",
+                    "mac", redactMac(mac),
+                    "ceilingKbps", ceilingKbps,
+                    "reason", reason);
+        });
     }
 
     public void install() {
         hookApplicationOnCreate();
+        hookBluetoothQualityReports();
         Class<?> a2dpCls = resolveA2dpServiceClass();
         if (a2dpCls == null) {
             MLog.w("A2dpService not found in com.android.bluetooth (scope misconfigured?)");
@@ -423,6 +442,151 @@ public final class SystemHookInstaller {
         MLog.event("bt.native.codec.hooks", "count", hooked, "class", nativeCls.getName());
     }
 
+    private void hookBluetoothQualityReports() {
+        try {
+            Class<?> adapterClass = Class.forName(CLASS_ADAPTER_SERVICE, false, classLoader);
+            Class<?> reportClass = Class.forName(
+                    CLASS_BLUETOOTH_QUALITY_REPORT, false, classLoader);
+            BqrAccessors accessors = BqrAccessors.resolve(reportClass);
+            Method activeDevices = findMethod(adapterClass, "getActiveDevices", int.class);
+            if (activeDevices != null) activeDevices.setAccessible(true);
+            int hooked = 0;
+            for (Method method : adapterClass.getDeclaredMethods()) {
+                if (!"bluetoothQualityReportReadyCallback".equals(method.getName())) continue;
+                Class<?>[] params = method.getParameterTypes();
+                if (params.length != 2
+                        || params[0] != BluetoothDevice.class
+                        || !CLASS_BLUETOOTH_QUALITY_REPORT.equals(params[1].getName())) {
+                    continue;
+                }
+                method.setAccessible(true);
+                Method finalActiveDevices = activeDevices;
+                module.hook(method).intercept(chain -> {
+                    Object result = chain.proceed();
+                    try {
+                        Object[] args = chain.getArgs().toArray();
+                        captureBluetoothQualityReport(
+                                chain.getThisObject(), args, accessors, finalActiveDevices);
+                    } catch (Throwable t) {
+                        MLog.w("BQR callback extraction failed", t);
+                    }
+                    return result;
+                });
+                hooked++;
+            }
+            MLog.event("lhdc.link.bqr_hooks", "count", hooked,
+                    "class", adapterClass.getName());
+        } catch (Throwable t) {
+            MLog.w("BQR hook unavailable; local LHDC governor remains active", t);
+        }
+    }
+
+    private void captureBluetoothQualityReport(
+            Object adapterService,
+            Object[] args,
+            BqrAccessors accessors,
+            Method activeDevicesMethod) throws Exception {
+        if (args == null || args.length < 2 || !(args[0] instanceof BluetoothDevice)) return;
+        BluetoothDevice device = (BluetoothDevice) args[0];
+        Object report = args[1];
+        if (report == null || accessors.intValue(accessors.qualityReportId, report) != 1) return;
+        Object common = accessors.bqrCommon.invoke(report);
+        if (common == null) return;
+        String mac = macFromDeviceArg(device);
+        if (mac == null) return;
+        LhdcLinkHealthController.BqrSample sample = new LhdcLinkHealthController.BqrSample(
+                accessors.intValue(accessors.unusedAfhChannels, common),
+                accessors.intValue(accessors.unidealAfhChannels, common),
+                accessors.longValue(accessors.retransmissionCount, common),
+                accessors.longValue(accessors.noRxCount, common),
+                accessors.longValue(accessors.nakCount, common),
+                accessors.intValue(accessors.rssi, common),
+                accessors.intValue(accessors.snr, common),
+                accessors.longValue(accessors.overflowCount, common),
+                accessors.longValue(accessors.underflowCount, common));
+        long capturedAtMs = SystemClock.elapsedRealtime();
+        mainHandler.post(() -> handleBluetoothQualityReport(
+                adapterService, device, mac, sample, capturedAtMs, activeDevicesMethod));
+    }
+
+    private void handleBluetoothQualityReport(
+            Object adapterService,
+            BluetoothDevice device,
+            String mac,
+            LhdcLinkHealthController.BqrSample sample,
+            long capturedAtMs,
+            Method activeDevicesMethod) {
+        if (!isActiveA2dpDevice(adapterService, device, mac, activeDevicesMethod)) {
+            MLog.event("lhdc.link.bqr_ignored", "mac", redactMac(mac), "reason", "not_active");
+            return;
+        }
+        activeLhdcMac = mac;
+        linkHealthController.activate(mac, capturedAtMs);
+        boolean streaming = NativeLhdcMemoryPatch.isGovernorStreaming();
+        linkHealthController.onBqrSample(mac, sample, capturedAtMs, streaming);
+        LhdcLinkHealthController.Snapshot snapshot =
+                linkHealthController.snapshot(mac, capturedAtMs);
+        Object[] telemetry = {
+                "mac", redactMac(mac),
+                "unusedAfh", sample.unusedAfhChannels,
+                "usableAfh", snapshot.usableAfhChannels,
+                "unidealAfh", sample.unidealAfhChannels,
+                "retransmissions", sample.retransmissionCount,
+                "retransmissionsPerSec", rateText(snapshot.retransmissionsPerSecond),
+                "noRx", sample.noRxCount,
+                "noRxPerSec", rateText(snapshot.noRxPerSecond),
+                "nak", sample.nakCount,
+                "rssi", sample.rssi,
+                "snr", sample.snr,
+                "overflow", sample.overflowCount,
+                "underflow", sample.underflowCount,
+                "streaming", streaming,
+                "healthyWindows", snapshot.healthyBqrWindows,
+                "ceilingKbps", snapshot.ceilingKbps,
+                "lock500to900", snapshot.boundary500To900Locked,
+                "lock900to1000", snapshot.boundary900To1000Locked,
+                "requiredHealthyWindows", snapshot.requiredHealthyBqrWindows,
+                "requiredQuietMs", snapshot.requiredQuietMs
+        };
+        MLog.eventLogOnly("lhdc.link.bqr", telemetry);
+        String diagnosticState = mac + '|' + streaming + '|'
+                + snapshot.healthyBqrWindows + '|' + snapshot.ceilingKbps + '|'
+                + snapshot.boundary500To900Locked + '|'
+                + snapshot.boundary900To1000Locked + '|'
+                + snapshot.requiredHealthyBqrWindows + '|' + snapshot.requiredQuietMs;
+        if (!diagnosticState.equals(lastBqrDiagnosticState)
+                || capturedAtMs - lastBqrDiagnosticMs >= BQR_DIAGNOSTIC_INTERVAL_MS) {
+            lastBqrDiagnosticState = diagnosticState;
+            lastBqrDiagnosticMs = capturedAtMs;
+            MLog.event("lhdc.link.bqr_summary", telemetry);
+        }
+    }
+
+    private boolean isActiveA2dpDevice(
+            Object adapterService,
+            BluetoothDevice device,
+            String mac,
+            Method activeDevicesMethod) {
+        if (adapterService != null && activeDevicesMethod != null) {
+            try {
+                Object value = activeDevicesMethod.invoke(adapterService, 2);
+                if (value instanceof List) {
+                    for (Object active : (List<?>) value) {
+                        if (device.equals(active) || mac.equals(macFromDeviceArg(active))) return true;
+                    }
+                    return false;
+                }
+            } catch (Throwable t) {
+                MLog.w("BQR active A2DP filter failed; using current-device fallback", t);
+            }
+        }
+        return activeLhdcMac == null || mac.equals(activeLhdcMac);
+    }
+
+    private static String rateText(double value) {
+        return Double.isNaN(value) ? "?" : String.format(Locale.ROOT, "%.1f", value);
+    }
+
     private void hookRemoteChoppyReport() {
         try {
             Class<?> cls = Class.forName(CLASS_OPLUS_SMART_AUDIO, false, classLoader);
@@ -442,6 +606,13 @@ public final class SystemHookInstaller {
                     int level = args.length > 0 && args[0] instanceof Integer
                             ? (Integer) args[0] : 0;
                     NativeLhdcMemoryPatch.reportRemoteChoppy(level);
+                    if (level > 0) {
+                        long nowMs = SystemClock.elapsedRealtime();
+                        mainHandler.post(() -> {
+                            String mac = activeLhdcMac;
+                            if (mac != null) linkHealthController.onCongestion(mac, nowMs);
+                        });
+                    }
                     return chain.proceed();
                 });
                 hooked++;
@@ -520,7 +691,33 @@ public final class SystemHookInstaller {
             try {
                 Object value = method.invoke(instance);
                 if (value instanceof Integer) {
-                    NativeLhdcMemoryPatch.reportQueueLength((Integer) value);
+                    int length = (Integer) value;
+                    NativeLhdcMemoryPatch.reportQueueLength(length);
+                    long nowMs = SystemClock.elapsedRealtime();
+                    String mac = activeLhdcMac;
+                    NativeLhdcMemoryPatch.GovernorEvent event =
+                            NativeLhdcMemoryPatch.consumeGovernorEvent();
+                    if (mac != null) {
+                        if (NativeLhdcMemoryPatch.isGovernorStreaming()) {
+                            linkHealthController.onQueueSample(
+                                    mac, length, LHDC_QUEUE_CAPACITY, nowMs);
+                        }
+                        if (event != null) {
+                            linkHealthController.onGovernorEvent(
+                                    mac, event.type, event.fromKbps, event.toKbps, nowMs);
+                            LhdcLinkHealthController.Snapshot snapshot =
+                                    linkHealthController.snapshot(mac, nowMs);
+                            MLog.event("lhdc.link.governor_event",
+                                    "mac", redactMac(mac),
+                                    "type", event.type,
+                                    "fromKbps", event.fromKbps,
+                                    "toKbps", event.toKbps,
+                                    "ceilingKbps", snapshot.ceilingKbps,
+                                    "requiredHealthyWindows",
+                                    snapshot.requiredHealthyBqrWindows,
+                                    "requiredQuietMs", snapshot.requiredQuietMs);
+                        }
+                    }
                     smartAudioQueueSampleFailures = 0;
                 }
             } catch (Throwable t) {
@@ -781,6 +978,77 @@ public final class SystemHookInstaller {
             return m.invoke(target);
         } catch (Throwable ignored) {
             return null;
+        }
+    }
+
+    private static final class BqrAccessors {
+        final Method qualityReportId;
+        final Method bqrCommon;
+        final Method unusedAfhChannels;
+        final Method unidealAfhChannels;
+        final Method retransmissionCount;
+        final Method noRxCount;
+        final Method nakCount;
+        final Method rssi;
+        final Method snr;
+        final Method overflowCount;
+        final Method underflowCount;
+
+        private BqrAccessors(
+                Method qualityReportId,
+                Method bqrCommon,
+                Method unusedAfhChannels,
+                Method unidealAfhChannels,
+                Method retransmissionCount,
+                Method noRxCount,
+                Method nakCount,
+                Method rssi,
+                Method snr,
+                Method overflowCount,
+                Method underflowCount) {
+            this.qualityReportId = qualityReportId;
+            this.bqrCommon = bqrCommon;
+            this.unusedAfhChannels = unusedAfhChannels;
+            this.unidealAfhChannels = unidealAfhChannels;
+            this.retransmissionCount = retransmissionCount;
+            this.noRxCount = noRxCount;
+            this.nakCount = nakCount;
+            this.rssi = rssi;
+            this.snr = snr;
+            this.overflowCount = overflowCount;
+            this.underflowCount = underflowCount;
+        }
+
+        static BqrAccessors resolve(Class<?> reportClass) throws Exception {
+            Method bqrCommon = requiredNoArg(reportClass, "getBqrCommon");
+            Class<?> commonClass = bqrCommon.getReturnType();
+            return new BqrAccessors(
+                    requiredNoArg(reportClass, "getQualityReportId"),
+                    bqrCommon,
+                    requiredNoArg(commonClass, "getUnusedAfhChannelCount"),
+                    requiredNoArg(commonClass, "getAfhSelectUnidealChannelCount"),
+                    requiredNoArg(commonClass, "getRetransmissionCount"),
+                    requiredNoArg(commonClass, "getNoRxCount"),
+                    requiredNoArg(commonClass, "getNakCount"),
+                    requiredNoArg(commonClass, "getRssi"),
+                    requiredNoArg(commonClass, "getSnr"),
+                    requiredNoArg(commonClass, "getOverflowCount"),
+                    requiredNoArg(commonClass, "getUnderflowCount"));
+        }
+
+        int intValue(Method method, Object target) throws Exception {
+            return ((Number) method.invoke(target)).intValue();
+        }
+
+        long longValue(Method method, Object target) throws Exception {
+            return ((Number) method.invoke(target)).longValue();
+        }
+
+        private static Method requiredNoArg(Class<?> cls, String name) throws Exception {
+            Method method = findMethod(cls, name);
+            if (method == null) throw new NoSuchMethodException(cls.getName() + '#' + name);
+            method.setAccessible(true);
+            return method;
         }
     }
 

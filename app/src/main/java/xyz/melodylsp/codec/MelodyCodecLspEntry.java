@@ -8,6 +8,7 @@ import androidx.annotation.NonNull;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
+import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.host.HostHookInstaller;
 import xyz.melodylsp.codec.leaudio.WirelessSettingsHookInstaller;
 import xyz.melodylsp.codec.settings.SettingsHookInstaller;
@@ -45,6 +46,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
     @Override
     public void onModuleLoaded(@NonNull ModuleLoadedParam param) {
         MLog.attach(this);
+        refreshDiagnosticRecordingState();
         MLog.event("module.loaded", "process", param.getProcessName(),
                 "framework", getFrameworkName(),
                 "framework_version", getFrameworkVersionCode(),
@@ -54,6 +56,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
     @Override
     public void onPackageLoaded(@NonNull PackageLoadedParam param) {
         MLog.attach(this);
+        refreshDiagnosticRecordingState();
         String pkg = param.getPackageName();
         if (HOST_PKG.equals(pkg)) {
             installHostScope(param);
@@ -125,6 +128,16 @@ public final class MelodyCodecLspEntry extends XposedModule {
         } catch (Throwable t) {
             log(Log.WARN, MLog.TAG, "moduleEnabled fallback to true: " + t.getMessage());
             return true;
+        }
+    }
+
+    private void refreshDiagnosticRecordingState() {
+        try {
+            SharedPreferences sp = getRemotePreferences(DiagnosticEvents.MODULE_PREFS);
+            MLog.configureDiagnosticRecordingUntil(
+                    sp.getLong(DiagnosticEvents.KEY_RECORDING_UNTIL, 0L));
+        } catch (Throwable ignored) {
+            MLog.configureDiagnosticRecordingUntil(0L);
         }
     }
 

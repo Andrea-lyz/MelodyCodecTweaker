@@ -1,8 +1,11 @@
 package xyz.melodylsp.codec.diag;
 
 import android.content.Context;
+import android.content.ComponentName;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.util.Log;
 
 import java.text.SimpleDateFormat;
@@ -26,6 +29,14 @@ public final class DiagnosticEvents {
     public static final String KEY_EVENTS_JSON = "events_jsonl";
     public static final String KEY_SESSION_ID = "session.id";
     public static final String KEY_SESSION_STARTED = "session.started";
+    public static final String KEY_SESSION_EXPIRES = "session.expires";
+    public static final String KEY_SESSION_ENDED = "session.ended";
+    public static final String MODULE_PREFS = "module_prefs";
+    public static final String KEY_RECORDING_UNTIL = "diagnostics.recording_until";
+    public static final String ACTION_RECORDING_CONTROL =
+            BuildConfig.APPLICATION_ID + ".action.DIAGNOSTIC_RECORDING_CONTROL";
+    public static final String EXTRA_RECORDING_UNTIL = "recording_until";
+    public static final long RECORDING_DURATION_MS = 30 * 60_000L;
     public static final String EXTRA_SCOPE = "scope";
     public static final String EXTRA_PRIORITY = "priority";
     public static final String EXTRA_MESSAGE = "message";
@@ -43,6 +54,12 @@ public final class DiagnosticEvents {
     private static final String KEY_MEMORY_SNAPSHOT_COUNT = "memory.snapshot.count";
     private static final String KEY_MEMORY_REPLAY_CHAIN = "memory.replay.chain";
     private static final String KEY_MEMORY_REPLAY_TIME = "memory.replay.time";
+    private static final String[] DIAGNOSTIC_SCOPES = {
+            "com.oplus.melody",
+            "com.android.bluetooth",
+            "com.oplus.wirelesssettings",
+            "com.android.settings"
+    };
 
     private DiagnosticEvents() {
     }
@@ -83,11 +100,14 @@ public final class DiagnosticEvents {
     public static String startSession(Context context) {
         if (context == null) return "";
         long now = System.currentTimeMillis();
+        long expires = now + RECORDING_DURATION_MS;
         String id = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date(now));
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = sp.edit()
                 .putString(KEY_SESSION_ID, id)
                 .putLong(KEY_SESSION_STARTED, now)
+                .putLong(KEY_SESSION_EXPIRES, expires)
+                .remove(KEY_SESSION_ENDED)
                 .remove(KEY_EVENTS)
                 .remove(KEY_EVENTS_JSON);
         for (String key : sp.getAll().keySet()) {
@@ -98,9 +118,90 @@ public final class DiagnosticEvents {
                 editor.remove(key);
             }
         }
-        editor.apply();
-        record(context, "module", Log.INFO, "evt=diag.session.start id=" + id, now);
+        editor.commit();
+        context.getSharedPreferences(MODULE_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putLong(KEY_RECORDING_UNTIL, expires)
+                .commit();
+        setReceiverEnabled(context, true);
+        record(context, "module", Log.INFO,
+                "evt=diag.session.start id=" + id + " expires=" + expires, now);
+        notifyRecordingState(context, expires);
         return id;
+    }
+
+    public static boolean isRecording(Context context) {
+        if (context == null) return false;
+        return isRecordingUntil(recordingUntil(context), System.currentTimeMillis());
+    }
+
+    public static long recordingUntil(Context context) {
+        if (context == null) return 0L;
+        return context.getSharedPreferences(MODULE_PREFS, Context.MODE_PRIVATE)
+                .getLong(KEY_RECORDING_UNTIL, 0L);
+    }
+
+    static boolean isRecordingUntil(long until, long now) {
+        return until > 0L && until > now;
+    }
+
+    public static void stopSession(Context context, String reason) {
+        if (context == null) return;
+        long now = System.currentTimeMillis();
+        context.getSharedPreferences(MODULE_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putLong(KEY_RECORDING_UNTIL, 0L)
+                .commit();
+        SharedPreferences diagnostics = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        record(context, "module", Log.INFO,
+                "evt=diag.session.stop reason=" + safe(reason), now);
+        diagnostics.edit().putLong(KEY_SESSION_ENDED, now).apply();
+        notifyRecordingState(context, 0L);
+        setReceiverEnabled(context, false);
+    }
+
+    public static void reconcileReceiverState(Context context) {
+        if (context == null) return;
+        long until = recordingUntil(context);
+        boolean active = isRecordingUntil(until, System.currentTimeMillis());
+        if (!active && until > 0L) {
+            context.getSharedPreferences(MODULE_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putLong(KEY_RECORDING_UNTIL, 0L)
+                    .commit();
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putLong(KEY_SESSION_ENDED, System.currentTimeMillis())
+                    .apply();
+            notifyRecordingState(context, 0L);
+        }
+        setReceiverEnabled(context, active);
+    }
+
+    private static void notifyRecordingState(Context context, long until) {
+        for (String packageName : DIAGNOSTIC_SCOPES) {
+            try {
+                Intent intent = new Intent(ACTION_RECORDING_CONTROL);
+                intent.setPackage(packageName);
+                intent.putExtra(EXTRA_RECORDING_UNTIL, until);
+                TrustedBroadcasts.send(context, intent);
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    static void setReceiverEnabled(Context context, boolean enabled) {
+        try {
+            ComponentName receiver = new ComponentName(context, DiagnosticEventReceiver.class);
+            int state = enabled
+                    ? PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                    : PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+            int flags = PackageManager.DONT_KILL_APP;
+            if (Build.VERSION.SDK_INT >= 29) flags |= PackageManager.SYNCHRONOUS;
+            context.getPackageManager().setComponentEnabledSetting(receiver, state, flags);
+        } catch (Throwable t) {
+            Log.w("MelodyCodecLsp", "diagnostic receiver state update failed", t);
+        }
     }
 
     public static void record(Context context, Intent intent) {
@@ -161,7 +262,7 @@ public final class DiagnosticEvents {
     }
 
     public static String status(SharedPreferences sp, String key) {
-        return sp.getString("status." + key, "not seen");
+        return sp.getString("status." + key, "尚未采集");
     }
 
     public static String detail(SharedPreferences sp, String key) {
@@ -296,6 +397,18 @@ public final class DiagnosticEvents {
         if (message.contains("evt=lhdc.memory_patch")
                 || message.contains("evt=native.patch.state.recv")) {
             mark(editor, "native.patch", stateFromMessage(message), message, time);
+        }
+        if (message.contains("evt=lhdc.link.bqr_hooks")) {
+            mark(editor, "lhdc.link.bqr",
+                    message.contains("count=0") ? "attention" : "hooked", message, time);
+        }
+        if (message.contains("evt=lhdc.link.bqr_summary")) {
+            mark(editor, "lhdc.link.bqr", "active", message, time);
+            mark(editor, "lhdc.link.governor", "active", message, time);
+        }
+        if (message.contains("evt=lhdc.link.probe_ceiling")
+                || message.contains("evt=lhdc.link.governor_event")) {
+            mark(editor, "lhdc.link.governor", "active", message, time);
         }
         if (message.contains("evt=dexkit.")) {
             mark(editor, "dexkit", stateFromMessage(message), message, time);

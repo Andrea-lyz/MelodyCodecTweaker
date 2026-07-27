@@ -137,6 +137,15 @@ final class NativeLhdcMemoryPatch {
         }
     }
 
+    static void setGovernorProbeCeilingKbps(int ceilingKbps) {
+        if (!governorInstalled && !installGovernor()) return;
+        try {
+            nativeSetGovernorProbeCeilingKbps(ceilingKbps);
+        } catch (Throwable t) {
+            MLog.w("lhdc governor probe ceiling update failed", t);
+        }
+    }
+
     static void reportRemoteChoppy(int level) {
         if (level <= 0) return;
         if (!governorInstalled && !installGovernor()) return;
@@ -151,12 +160,71 @@ final class NativeLhdcMemoryPatch {
         return governorInstalled && governorPolicy == LhdcQualityPolicy.QUALITY;
     }
 
+    static int currentGovernorBitrateKbps() {
+        if (!governorInstalled
+                || !nativeLoaded
+                || (governorPolicy != LhdcQualityPolicy.QUALITY
+                && governorPolicy != LhdcQualityPolicy.ADAPTIVE)) return 0;
+        try {
+            return nativeGetGovernorBitrateKbps();
+        } catch (Throwable t) {
+            MLog.w("lhdc governor bitrate read failed", t);
+            return 0;
+        }
+    }
+
+    static boolean isGovernorStreaming() {
+        if (!governorInstalled || !nativeLoaded) return false;
+        try {
+            return nativeIsGovernorStreaming();
+        } catch (Throwable t) {
+            MLog.w("lhdc governor streaming state read failed", t);
+            return false;
+        }
+    }
+
     static void reportQueueLength(int length) {
         if (length < 0 || !shouldSampleQueue()) return;
         try {
             nativeReportQueueLength(length);
         } catch (Throwable t) {
             MLog.w("lhdc governor queue sample failed", t);
+        }
+    }
+
+    static GovernorEvent consumeGovernorEvent() {
+        if (!governorInstalled || !nativeLoaded) return null;
+        try {
+            long packed = nativeConsumeGovernorEvent();
+            if (packed == 0L) return null;
+            int event = (int) (packed & 0xffL);
+            int fromKbps = bitrateForNativeRate((int) ((packed >>> 8) & 0xffL));
+            int toKbps = bitrateForNativeRate((int) ((packed >>> 16) & 0xffL));
+            if (fromKbps == 0 || toKbps == 0) return null;
+            return new GovernorEvent(event, fromKbps, toKbps);
+        } catch (Throwable t) {
+            MLog.w("lhdc governor event read failed", t);
+            return null;
+        }
+    }
+
+    private static int bitrateForNativeRate(int rate) {
+        if (rate == 5) return 400;
+        if (rate == 6) return 500;
+        if (rate == 7) return 900;
+        if (rate == 8) return 1000;
+        return 0;
+    }
+
+    static final class GovernorEvent {
+        final int type;
+        final int fromKbps;
+        final int toKbps;
+
+        GovernorEvent(int type, int fromKbps, int toKbps) {
+            this.type = type;
+            this.fromKbps = fromKbps;
+            this.toKbps = toKbps;
         }
     }
 
@@ -564,6 +632,14 @@ final class NativeLhdcMemoryPatch {
     private static native int nativeInstallGovernor();
 
     private static native void nativeSetGovernorPolicy(int policy);
+
+    private static native void nativeSetGovernorProbeCeilingKbps(int ceilingKbps);
+
+    private static native long nativeConsumeGovernorEvent();
+
+    private static native int nativeGetGovernorBitrateKbps();
+
+    private static native boolean nativeIsGovernorStreaming();
 
     private static native void nativeReportQueueLength(int length);
 

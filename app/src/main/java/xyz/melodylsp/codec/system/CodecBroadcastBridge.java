@@ -239,11 +239,14 @@ public final class CodecBroadcastBridge {
 
     private static void writeNativePatchState(Intent intent) {
         NativeLhdcMemoryPatch.PatchResult result = NativeLhdcMemoryPatch.lastResult();
-        if (result == null) return;
-        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS, result.status);
-        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_DETAIL, result.reason);
-        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, result.patchedCount);
-        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, result.originalCount);
-        intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_SUCCESS, result.success);
+        if (result != null) {
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS, result.status);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_DETAIL, result.reason);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, result.patchedCount);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, result.originalCount);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_SUCCESS, result.success);
+        }
+        intent.putExtra(CodecIpc.EXTRA_LHDC_GOVERNOR_BITRATE_KBPS,
+                NativeLhdcMemoryPatch.currentGovernorBitrateKbps());
     }
 }

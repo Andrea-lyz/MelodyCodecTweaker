@@ -31,4 +31,11 @@ public final class DiagnosticEventReceiverTest {
         assertFalse(DiagnosticEventReceiver.allowEvent(10_001, 1_000L));
         assertTrue(DiagnosticEventReceiver.allowEvent(10_002, 1_000L));
     }
+
+    @Test
+    public void recordingWindowRequiresFutureDeadline() {
+        assertFalse(DiagnosticEvents.isRecordingUntil(0L, 10_000L));
+        assertFalse(DiagnosticEvents.isRecordingUntil(10_000L, 10_000L));
+        assertTrue(DiagnosticEvents.isRecordingUntil(10_001L, 10_000L));
+    }
 }

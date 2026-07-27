@@ -53,6 +53,8 @@ public final class FeedbackCollector {
             "bridge.le.ws",
             "dexkit",
             "native.patch",
+            "lhdc.link.bqr",
+            "lhdc.link.governor",
             "codec.write",
             "remember.write",
             "remember.replay",
@@ -64,6 +66,9 @@ public final class FeedbackCollector {
     private static final String[] BLUETOOTH_LOG_PATTERNS = {
             "MelodyCodecLsp",
             "MelodyLhdcGov",
+            "BluetoothQualityReportNativeInterface",
+            "BluetoothQualityReportJni",
+            "BqrCommon",
             "LSPosedFramework",
             "bluetooth-a2dp",
             "btif_a2dp",
@@ -119,6 +124,8 @@ public final class FeedbackCollector {
             "/system/bin/logcat -d -b all -t 50000 "
                     + "MelodyCodecLsp:V "
                     + "MelodyLhdcGov:V "
+                    + "BluetoothQualityReportNativeInterface:V "
+                    + "BluetoothQualityReportJni:V "
                     + "bluetooth-a2dp:V soc_bta_av:V "
                     + "a2dp_vendor_lhdcv5:V a2dp_vendor_lhdcv5_encoder:V '*:S'";
     private static final int MAX_COMMAND_OUTPUT_CHARS = 4_000_000;
@@ -155,6 +162,11 @@ public final class FeedbackCollector {
                     "META-INF/xposed/scope.list"));
             zip.close();
             target.finish(context);
+            try {
+                DiagnosticEvents.stopSession(context, "feedback_collected");
+            } catch (Throwable ignored) {
+                // The feedback archive is already complete; cleanup must not turn success into failure.
+            }
             return target.displayPath;
         } catch (Throwable t) {
             target.abort(context);

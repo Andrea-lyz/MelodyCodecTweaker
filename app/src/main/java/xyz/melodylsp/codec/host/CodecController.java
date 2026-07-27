@@ -83,6 +83,7 @@ public final class CodecController {
     private static final long HIGH_QUALITY_RETRY_DELAY_MS = 900L;
     private static final long AAC_HIGH_QUALITY_WARMUP_DELAY_MS = 650L;
     private static final long REMEMBER_CONFIRM_RECHECK_DELAY_MS = 2_000L;
+    private static final long GOVERNOR_BITRATE_POLL_MS = 1_000L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
     private static volatile boolean couiPopupDiscoveryAttempted;
@@ -108,6 +109,9 @@ public final class CodecController {
     private final Map<String, Integer> lhdcPoliciesByMac = new HashMap<>();
     private BroadcastReceiver memorySnapshotReceiver;
     private volatile boolean nativePatchUnsupported;
+    private int lhdcGovernorBitrateKbps;
+    private boolean governorBitratePollScheduled;
+    private final Runnable governorBitratePoll = this::runGovernorBitratePoll;
 
     public interface SurfaceRescanRequester {
         void request(String reason);
@@ -385,14 +389,88 @@ public final class CodecController {
         String status = intent.getStringExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS);
         int patched = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, -1);
         int original = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, -1);
-        nativePatchUnsupported = "unsupported".equals(status)
+        int bitrateKbps = intent.getIntExtra(
+                CodecIpc.EXTRA_LHDC_GOVERNOR_BITRATE_KBPS, 0);
+        boolean bitrateChanged = lhdcGovernorBitrateKbps != bitrateKbps;
+        boolean nextUnsupported = "unsupported".equals(status)
                 && patched == 0
                 && original == 0;
-        MLog.event("native.patch.state.recv",
+        boolean stateChanged = bitrateChanged || nativePatchUnsupported != nextUnsupported;
+        lhdcGovernorBitrateKbps = Math.max(0, bitrateKbps);
+        nativePatchUnsupported = nextUnsupported;
+        Object[] telemetry = {
                 "status", status,
                 "patched", patched,
                 "original", original,
-                "unsupported", nativePatchUnsupported);
+                "bitrateKbps", lhdcGovernorBitrateKbps,
+                "unsupported", nativePatchUnsupported
+        };
+        if (stateChanged) MLog.event("native.patch.state.recv", telemetry);
+        else MLog.eventLogOnly("native.patch.state.recv", telemetry);
+        if (bitrateChanged) {
+            renderGovernorBitrateForActiveSubscriptions();
+        }
+        updateGovernorBitratePolling();
+    }
+
+    private void renderGovernorBitrateForActiveSubscriptions() {
+        for (Subscription sub : subscriptions.values()) {
+            if (!isSubscriptionActive(sub)
+                    || sub.prefs.qualityOption == null
+                    || sub.renderedLeAudioActive
+                    || isClassicRestorePending(sub.mac)
+                    || !PrefRef.isVisible(sub.prefs.qualityOption)) {
+                continue;
+            }
+            CodecSnapshot snapshot = snapshotFor(sub);
+            if (snapshot != null) renderQuality(snapshot, sub);
+        }
+    }
+
+    private void updateGovernorBitratePolling() {
+        if (hasVisibleLhdcBitrate()) {
+            if (!governorBitratePollScheduled) {
+                governorBitratePollScheduled = true;
+                mainHandler.postDelayed(governorBitratePoll, GOVERNOR_BITRATE_POLL_MS);
+            }
+            return;
+        }
+        if (governorBitratePollScheduled) {
+            mainHandler.removeCallbacks(governorBitratePoll);
+            governorBitratePollScheduled = false;
+        }
+        lhdcGovernorBitrateKbps = 0;
+    }
+
+    private void runGovernorBitratePoll() {
+        governorBitratePollScheduled = false;
+        if (!hasVisibleLhdcBitrate()) {
+            lhdcGovernorBitrateKbps = 0;
+            return;
+        }
+        queryNativePatchState();
+        updateGovernorBitratePolling();
+    }
+
+    private boolean hasVisibleLhdcBitrate() {
+        for (Subscription sub : subscriptions.values()) {
+            if (!isSubscriptionActive(sub)
+                    || sub.prefs.qualityOption == null
+                    || sub.renderedLeAudioActive
+                    || isClassicRestorePending(sub.mac)
+                    || !PrefRef.isVisible(sub.prefs.qualityOption)) {
+                continue;
+            }
+            CodecSnapshot snapshot = snapshotFor(sub);
+            if (snapshot != null && CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+                int policy = selectedLhdcPolicy(sub.mac, snapshot);
+                if (policy == LhdcQualityPolicy.QUALITY
+                        || policy == LhdcQualityPolicy.ADAPTIVE) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -505,6 +583,7 @@ public final class CodecController {
             MLog.event("subscription.cleanup", "removed", removed,
                     "remaining", subscriptions.size());
         }
+        updateGovernorBitratePolling();
     }
 
     private final class SubscriptionCleanupCallbacks
@@ -2666,6 +2745,7 @@ public final class CodecController {
         if (sub.prefs.rememberToggle != null) {
             PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
         }
+        updateGovernorBitratePolling();
     }
 
     private boolean shouldRenderLeAudioActive(Subscription sub) {
@@ -2753,15 +2833,27 @@ public final class CodecController {
             return;
         }
         long displayQuality = snapshot.activeCodecSpecific1;
+        int lhdcPolicy = LhdcQualityPolicy.ADAPTIVE;
         if (CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+            lhdcPolicy = selectedLhdcPolicy(sub.mac, snapshot);
             displayQuality = LhdcQualityPolicy.logicalSpecific1(
-                    displayQuality, selectedLhdcPolicy(sub.mac, snapshot));
+                    displayQuality, lhdcPolicy);
         }
-        // Show the stable user policy only. The governor's internal 1000/900/500/400 transitions
-        // remain diagnostic-only and never make this row flicker between transport states.
-        PrefRef.setSummary(q, CodecLabelTable.qualityLabel(
-                context, snapshot.activeCodecType, displayQuality));
+        String summary = CodecLabelTable.qualityLabel(
+                context, snapshot.activeCodecType, displayQuality);
+        if (CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+            summary = lhdcQualitySummary(summary, lhdcPolicy, lhdcGovernorBitrateKbps);
+        }
+        PrefRef.setSummary(q, summary);
         PrefRef.setVisible(q, true);
+    }
+
+    static String lhdcQualitySummary(String policyLabel, int policy, int bitrateKbps) {
+        if ((policy == LhdcQualityPolicy.QUALITY || policy == LhdcQualityPolicy.ADAPTIVE)
+                && bitrateKbps > 0) {
+            return policyLabel + "（当前 " + bitrateKbps + " kbps）";
+        }
+        return policyLabel;
     }
 
     private void renderSampleRate(CodecSnapshot snapshot, Subscription sub) {

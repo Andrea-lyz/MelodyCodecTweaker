@@ -22,6 +22,10 @@ public final class DiagnosticEventReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         if (intent == null || !DiagnosticEvents.ACTION.equals(intent.getAction())) return;
+        if (!DiagnosticEvents.isRecording(context)) {
+            DiagnosticEvents.setReceiverEnabled(context, false);
+            return;
+        }
         TrustedBroadcasts.SenderIdentity sender = TrustedBroadcasts.captureSender(this);
         String scope;
         int rateLimitUid;

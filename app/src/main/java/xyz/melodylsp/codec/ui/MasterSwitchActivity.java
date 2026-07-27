@@ -65,6 +65,7 @@ public final class MasterSwitchActivity extends Activity {
         super.onCreate(savedInstanceState);
         modulePrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
         diagPrefs = getSharedPreferences(DiagnosticEvents.PREFS, Context.MODE_PRIVATE);
+        DiagnosticEvents.reconcileReceiverState(this);
         applyLauncherIconState(modulePrefs.getBoolean(KEY_HIDE_LAUNCHER_ICON, false), false);
 
         if (Build.VERSION.SDK_INT >= 21) {
@@ -239,10 +240,17 @@ public final class MasterSwitchActivity extends Activity {
 
         String session = diagPrefs.getString(DiagnosticEvents.KEY_SESSION_ID, "");
         long started = diagPrefs.getLong(DiagnosticEvents.KEY_SESSION_STARTED, 0L);
-        sessionStatus.setText(session == null || session.isEmpty()
-                ? "当前没有独立复现记录。"
-                : "当前记录：" + session + "，开始于 "
-                        + DiagnosticEvents.formatTime(started));
+        long expires = diagPrefs.getLong(DiagnosticEvents.KEY_SESSION_EXPIRES, 0L);
+        boolean recording = DiagnosticEvents.isRecording(this);
+        if (session == null || session.isEmpty()) {
+            sessionStatus.setText("尚未开始问题记录。平时不会在后台持续采集诊断事件。");
+        } else if (recording) {
+            sessionStatus.setText("正在记录：" + session + "，自动结束于 "
+                    + DiagnosticEvents.formatTime(expires));
+        } else {
+            sessionStatus.setText("上次记录：" + session + "，开始于 "
+                    + DiagnosticEvents.formatTime(started) + "（已结束）");
+        }
 
         clearDynamicRows(packageList);
         addInfoRow(packageList, "模块版本",
@@ -419,9 +427,12 @@ public final class MasterSwitchActivity extends Activity {
 
     private void addStatusRow(String label, String key) {
         String status = DiagnosticEvents.status(diagPrefs, key);
-        String time = DiagnosticEvents.formatTime(DiagnosticEvents.time(diagPrefs, key));
+        long recordedAt = DiagnosticEvents.time(diagPrefs, key);
         String detail = DiagnosticEvents.detail(diagPrefs, key);
-        addInfoRow(statusList, label, status + "  " + time
+        String value = recordedAt <= 0L
+                ? "尚未采集（不代表模块未生效）"
+                : status + "  " + DiagnosticEvents.formatTime(recordedAt);
+        addInfoRow(statusList, label, value
                 + (detail == null || detail.isEmpty() ? "" : "\n" + detail),
                 colorForStatus(status));
     }
@@ -451,7 +462,9 @@ public final class MasterSwitchActivity extends Activity {
     }
 
     private static String tailLines(String text, int maxLines) {
-        if (text == null || text.trim().isEmpty()) return "还没有收到 Hook 事件。";
+        if (text == null || text.trim().isEmpty()) {
+            return "尚未采集到诊断事件；这不代表模块未生效。";
+        }
         String[] lines = text.split("\\n");
         int start = Math.max(0, lines.length - maxLines);
         StringBuilder sb = new StringBuilder();
