@@ -102,7 +102,7 @@ final class NativeLhdcMemoryPatch {
         return lastResult;
     }
 
-    /** Installs the fixed-bitrate setter capture. Safe to call repeatedly. */
+    /** Installs the fixed-bitrate encoder capture. Safe to call repeatedly. */
     static synchronized boolean installGovernor() {
         if (governorInstalled) return true;
         if (!ensureNativeLoaded()) {

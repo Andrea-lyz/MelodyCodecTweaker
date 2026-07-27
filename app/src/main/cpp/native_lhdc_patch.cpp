@@ -56,6 +56,7 @@ constexpr const char* kGovernorTag = "MelodyLhdcGov";
 #if defined(__aarch64__)
 constexpr const char* kBluetoothLibrary = "libbluetooth_jni.so";
 constexpr const char* kEncoderLibrary = "liblhdcv5BT_enc.so";
+constexpr const char* kEncodeSymbol = "lhdcv5BT_encode";
 constexpr const char* kFreeHandleSymbol = "lhdcv5BT_free_handle";
 constexpr const char* kSetTargetSymbol = "lhdcv5BT_set_target_bitrate_inx";
 #endif
@@ -72,9 +73,12 @@ constexpr uint32_t kDefaultQueueCapacity = 45;
 
 using SetTargetBitrateFn = int32_t (*)(void*, uint32_t);
 using FreeHandleFn = int32_t (*)(void*);
+using EncodeFn = int32_t (*)(
+        void*, void*, uint32_t, uint8_t*, uint32_t, uint32_t*, uint32_t*);
 
 std::atomic<SetTargetBitrateFn> g_set_target{nullptr};
 std::atomic<FreeHandleFn> g_free_handle{nullptr};
+std::atomic<EncodeFn> g_encode{nullptr};
 std::atomic<void*> g_active_encoder_handle{nullptr};
 std::atomic<int> g_policy{kPolicyAdaptive};
 std::atomic<uint32_t> g_policy_epoch{1};
@@ -285,16 +289,27 @@ void quality_governor_sample(void* handle, uint32_t queue) {
     }
 }
 
-extern "C" int32_t melody_lhdc_set_target_bitrate(void* handle, uint32_t rate) {
-    std::lock_guard<std::mutex> lock(g_governor_mutex);
-    void* previous = g_active_encoder_handle.exchange(handle, std::memory_order_acq_rel);
+extern "C" int32_t melody_lhdc_encode(
+        void* handle,
+        void* pcm,
+        uint32_t pcm_bytes,
+        uint8_t* output,
+        uint32_t output_bytes,
+        uint32_t* encoded_bytes,
+        uint32_t* encoded_frames) {
+    void* previous = g_active_encoder_handle.load(std::memory_order_acquire);
     if (handle != nullptr && handle != previous) {
-        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-                "evt=encoder.capture handle=%p initial=%d",
-                handle, bitrate_for_rate(rate));
+        if (g_active_encoder_handle.compare_exchange_strong(
+                previous, handle, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                    "evt=encoder.capture source=encode handle=%p", handle);
+        }
     }
-    SetTargetBitrateFn original = g_set_target.load(std::memory_order_acquire);
-    return original != nullptr ? original(handle, rate) : -1;
+    EncodeFn original = g_encode.load(std::memory_order_acquire);
+    return original != nullptr
+            ? original(handle, pcm, pcm_bytes, output, output_bytes,
+                    encoded_bytes, encoded_frames)
+            : -1;
 }
 
 extern "C" int32_t melody_lhdc_free_handle(void* handle) {
@@ -520,9 +535,12 @@ int hook_existing_encoder_pointer() {
 #else
     LoadedImage encoder;
     if (!find_loaded_image(kEncoderLibrary, &encoder)) return -3;
+    void* encode = resolve_elf64_export(encoder, kEncodeSymbol);
     void* free_handle = resolve_elf64_export(encoder, kFreeHandleSymbol);
     void* target = resolve_elf64_export(encoder, kSetTargetSymbol);
-    if (free_handle == nullptr || target == nullptr
+    if (encode == nullptr || free_handle == nullptr || target == nullptr
+            || !is_executable_library_address(
+                    reinterpret_cast<uintptr_t>(encode), encoder.path)
             || !is_executable_library_address(
                     reinterpret_cast<uintptr_t>(free_handle), encoder.path)
             || !is_executable_library_address(
@@ -533,9 +551,9 @@ int hook_existing_encoder_pointer() {
     // Fail closed unless the callback has exactly one writable owner in libbluetooth_jni's
     // file-backed data or its immediately adjacent linker-created anonymous .bss mapping.
     // No loader entry, relocation, GOT or executable page is modified.
-    void** candidate = nullptr;
+    void** encode_candidate = nullptr;
     void** free_candidate = nullptr;
-    int candidate_count = 0;
+    int encode_candidate_count = 0;
     int free_candidate_count = 0;
     FILE* maps = fopen("/proc/self/maps", "re");
     char line[512];
@@ -553,7 +571,8 @@ int hook_existing_encoder_pointer() {
             bluetooth_tail = static_cast<uintptr_t>(end);
             if (writable) {
                 scan_pointer_range(static_cast<uintptr_t>(start),
-                        static_cast<uintptr_t>(end), target, &candidate, &candidate_count);
+                        static_cast<uintptr_t>(end), encode,
+                        &encode_candidate, &encode_candidate_count);
                 scan_pointer_range(static_cast<uintptr_t>(start),
                         static_cast<uintptr_t>(end), free_handle,
                         &free_candidate, &free_candidate_count);
@@ -563,7 +582,8 @@ int hook_existing_encoder_pointer() {
                 && writable
                 && strcmp(path, "[anon:.bss]") == 0) {
             scan_pointer_range(static_cast<uintptr_t>(start),
-                    static_cast<uintptr_t>(end), target, &candidate, &candidate_count);
+                    static_cast<uintptr_t>(end), encode,
+                    &encode_candidate, &encode_candidate_count);
             scan_pointer_range(static_cast<uintptr_t>(start),
                     static_cast<uintptr_t>(end), free_handle,
                     &free_candidate, &free_candidate_count);
@@ -576,29 +596,30 @@ int hook_existing_encoder_pointer() {
     if (maps != nullptr) fclose(maps);
 
     int result = -5;
-    if (candidate_count == 1 && free_candidate_count == 1) {
-        // Publish both forward targets before exposing either wrapper to Bluetooth threads.
+    if (encode_candidate_count == 1 && free_candidate_count == 1) {
+        // Publish every forward target before exposing either wrapper to Bluetooth threads.
         g_set_target.store(reinterpret_cast<SetTargetBitrateFn>(target),
                 std::memory_order_release);
         g_free_handle.store(reinterpret_cast<FreeHandleFn>(free_handle),
                 std::memory_order_release);
-        if (replace_writable_pointer(candidate, target,
-                reinterpret_cast<void*>(&melody_lhdc_set_target_bitrate))) {
+        g_encode.store(reinterpret_cast<EncodeFn>(encode), std::memory_order_release);
+        if (replace_writable_pointer(encode_candidate, encode,
+                reinterpret_cast<void*>(&melody_lhdc_encode))) {
             if (replace_writable_pointer(free_candidate, free_handle,
                     reinterpret_cast<void*>(&melody_lhdc_free_handle))) {
                 result = 2;
-            } else if (!replace_writable_pointer(candidate,
-                    reinterpret_cast<void*>(&melody_lhdc_set_target_bitrate), target)) {
+            } else if (!replace_writable_pointer(encode_candidate,
+                    reinterpret_cast<void*>(&melody_lhdc_encode), encode)) {
                 result = -7;
             }
         }
-    } else if (candidate_count > 1 || free_candidate_count > 1) {
+    } else if (encode_candidate_count > 1 || free_candidate_count > 1) {
         result = -6;
     }
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=encoder.scan mode=fixed_setter setter_candidates=%d free_candidates=%d "
-            "result=%d target=%p free=%p",
-            candidate_count, free_candidate_count, result, target, free_handle);
+            "evt=encoder.scan mode=fixed_encode encode_candidates=%d free_candidates=%d "
+            "result=%d encode=%p target=%p free=%p",
+            encode_candidate_count, free_candidate_count, result, encode, target, free_handle);
     return result;
 #endif
 }
@@ -610,7 +631,7 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeInstallGovernor(
         JNIEnv*, jclass) {
     const int result = hook_existing_encoder_pointer();
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=hook.install mode=fixed_setter result=%d", result);
+            "evt=hook.install mode=fixed_encode result=%d", result);
     return result;
 }
 
