@@ -2,9 +2,7 @@
 #include <android/log.h>
 #include <atomic>
 #include <dlfcn.h>
-#include <elf.h>
 #include <jni.h>
-#include <link.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -52,10 +50,12 @@ bool restore_protection(void* page, size_t page_size, int original_protection) {
 namespace {
 
 constexpr const char* kGovernorTag = "MelodyLhdcGov";
+#if defined(__aarch64__)
 constexpr const char* kBluetoothLibrary = "libbluetooth_jni.so";
-[[maybe_unused]] constexpr const char* kEncoderLibrary = "liblhdcv5BT_enc.so";
+constexpr const char* kEncoderLibrary = "liblhdcv5BT_enc.so";
 constexpr const char* kAdjustSymbol = "lhdcv5BT_adjust_bitrate";
 constexpr const char* kSetTargetSymbol = "lhdcv5BT_set_target_bitrate_inx";
+#endif
 
 constexpr int kPolicyConnection = 6;
 constexpr int kPolicyQuality = 8;
@@ -67,11 +67,9 @@ constexpr uint32_t kRate900 = 7;
 constexpr uint32_t kRate1000 = 8;
 constexpr uint32_t kDefaultQueueCapacity = 45;
 
-using DlsymFn = void* (*)(void*, const char*);
 using AdjustBitrateFn = int32_t (*)(void*, uint32_t);
 using SetTargetBitrateFn = int32_t (*)(void*, uint32_t);
 
-std::atomic<DlsymFn> g_real_dlsym{nullptr};
 std::atomic<AdjustBitrateFn> g_real_adjust{nullptr};
 std::atomic<SetTargetBitrateFn> g_set_target{nullptr};
 std::atomic<int> g_policy{kPolicyAdaptive};
@@ -305,82 +303,13 @@ extern "C" int32_t melody_lhdc_adjust_bitrate(void* handle, uint32_t queue) {
     return original != nullptr ? original(handle, queue) : 0;
 }
 
-void capture_encoder_symbols(void* handle, DlsymFn resolver) {
-    if (handle == nullptr || resolver == nullptr) return;
-    if (g_set_target.load(std::memory_order_acquire) == nullptr) {
-        void* target = resolver(handle, kSetTargetSymbol);
-        if (target != nullptr) {
-            g_set_target.store(reinterpret_cast<SetTargetBitrateFn>(target),
-                    std::memory_order_release);
-        }
-    }
-}
-
-extern "C" void* melody_lhdc_dlsym(void* handle, const char* name) {
-    DlsymFn original = g_real_dlsym.load(std::memory_order_acquire);
-    if (original == nullptr) return nullptr;
-    void* resolved = original(handle, name);
-    if (name == nullptr) return resolved;
-    if (strcmp(name, kAdjustSymbol) == 0 && resolved != nullptr) {
-        g_real_adjust.store(reinterpret_cast<AdjustBitrateFn>(resolved),
-                std::memory_order_release);
-        capture_encoder_symbols(handle, original);
-        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-                "evt=encoder.capture adjust=%p target=%p",
-                resolved,
-                reinterpret_cast<void*>(g_set_target.load(std::memory_order_acquire)));
-        return reinterpret_cast<void*>(&melody_lhdc_adjust_bitrate);
-    }
-    if (strcmp(name, kSetTargetSymbol) == 0 && resolved != nullptr) {
-        g_set_target.store(reinterpret_cast<SetTargetBitrateFn>(resolved),
-                std::memory_order_release);
-    }
-    return resolved;
-}
-
-struct LoadedLibrary {
-    uintptr_t base = 0;
-    uintptr_t min_address = 0;
-    uintptr_t max_address = 0;
-    const ElfW(Phdr)* headers = nullptr;
-    ElfW(Half) header_count = 0;
-};
-
+#if defined(__aarch64__)
 bool ends_with(const char* value, const char* suffix) {
     if (value == nullptr || suffix == nullptr) return false;
     const size_t value_length = strlen(value);
     const size_t suffix_length = strlen(suffix);
     return value_length >= suffix_length
             && strcmp(value + value_length - suffix_length, suffix) == 0;
-}
-
-[[maybe_unused]] int find_loaded_library(dl_phdr_info* info, size_t, void* opaque) {
-    auto* out = static_cast<LoadedLibrary*>(opaque);
-    if (info == nullptr || out == nullptr || !ends_with(info->dlpi_name, kBluetoothLibrary)) {
-        return 0;
-    }
-    out->base = static_cast<uintptr_t>(info->dlpi_addr);
-    out->headers = info->dlpi_phdr;
-    out->header_count = info->dlpi_phnum;
-    uintptr_t minimum = UINTPTR_MAX;
-    uintptr_t maximum = 0;
-    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
-        const ElfW(Phdr)& header = info->dlpi_phdr[i];
-        if (header.p_type != PT_LOAD) continue;
-        const uintptr_t start = out->base + header.p_vaddr;
-        const uintptr_t end = start + header.p_memsz;
-        if (start < minimum) minimum = start;
-        if (end > maximum) maximum = end;
-    }
-    out->min_address = minimum;
-    out->max_address = maximum;
-    return 1;
-}
-
-uintptr_t loaded_pointer(const LoadedLibrary& library, ElfW(Addr) value) {
-    const uintptr_t raw = static_cast<uintptr_t>(value);
-    if (raw >= library.min_address && raw < library.max_address) return raw;
-    return library.base + raw;
 }
 
 int mapping_protection(uintptr_t address) {
@@ -403,170 +332,81 @@ int mapping_protection(uintptr_t address) {
     return protection;
 }
 
-bool replace_pointer(void** slot, void* expected, void* replacement) {
+bool replace_writable_pointer(void** slot, void* expected, void* replacement) {
     if (slot == nullptr || replacement == nullptr) return false;
     void* current = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     if (current == replacement) return true;
     if (expected != nullptr && current != expected) return false;
-    const long page_size_raw = sysconf(_SC_PAGESIZE);
-    if (page_size_raw <= 0) return false;
-    const size_t page_size = static_cast<size_t>(page_size_raw);
     const uintptr_t address = reinterpret_cast<uintptr_t>(slot);
-    void* page = reinterpret_cast<void*>(address & ~(page_size - 1U));
     const int original_protection = mapping_protection(address);
-    if ((original_protection & PROT_READ) == 0) return false;
-    bool changed_protection = (original_protection & PROT_WRITE) == 0;
-    if (changed_protection
-            && mprotect(page, page_size, original_protection | PROT_WRITE) != 0) {
+    if ((original_protection & (PROT_READ | PROT_WRITE)) != (PROT_READ | PROT_WRITE)) {
         return false;
     }
-    bool replaced = __atomic_compare_exchange_n(
+    return __atomic_compare_exchange_n(
             slot, &current, replacement, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
-    bool restored = !changed_protection
-            || mprotect(page, page_size, original_protection) == 0;
-    return replaced && restored;
 }
-
-[[maybe_unused]] int patch_relocations(
-        const LoadedLibrary& library,
-        const ElfW(Rela)* relocations,
-        size_t relocation_count,
-        const ElfW(Sym)* symbols,
-        const char* strings) {
-    if (relocations == nullptr || symbols == nullptr || strings == nullptr) return 0;
-    int patched = 0;
-    for (size_t i = 0; i < relocation_count; ++i) {
-        const ElfW(Rela)& relocation = relocations[i];
-#if defined(__LP64__)
-        const size_t symbol_index = ELF64_R_SYM(relocation.r_info);
-#else
-        const size_t symbol_index = ELF32_R_SYM(relocation.r_info);
 #endif
-        const char* name = strings + symbols[symbol_index].st_name;
-        if (strcmp(name, "dlsym") != 0) continue;
-        auto** slot = reinterpret_cast<void**>(loaded_pointer(library, relocation.r_offset));
-        void* original = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
-        if (original == reinterpret_cast<void*>(&melody_lhdc_dlsym)) {
-            ++patched;
-            continue;
-        }
-        DlsymFn empty = nullptr;
-        g_real_dlsym.compare_exchange_strong(
-                empty, reinterpret_cast<DlsymFn>(original), std::memory_order_acq_rel);
-        if (replace_pointer(slot, original, reinterpret_cast<void*>(&melody_lhdc_dlsym))) {
-            ++patched;
-        }
-    }
-    return patched;
-}
-
-int install_dlsym_hook() {
-#if !defined(__aarch64__)
-    return -2;
-#else
-    LoadedLibrary library;
-    dl_iterate_phdr(find_loaded_library, &library);
-    if (library.base == 0 || library.headers == nullptr) return -3;
-    const ElfW(Dyn)* dynamic = nullptr;
-    for (ElfW(Half) i = 0; i < library.header_count; ++i) {
-        if (library.headers[i].p_type == PT_DYNAMIC) {
-            dynamic = reinterpret_cast<const ElfW(Dyn)*>(
-                    library.base + library.headers[i].p_vaddr);
-            break;
-        }
-    }
-    if (dynamic == nullptr) return -4;
-
-    const ElfW(Sym)* symbols = nullptr;
-    const char* strings = nullptr;
-    const ElfW(Rela)* plt_relocations = nullptr;
-    size_t plt_size = 0;
-    const ElfW(Rela)* dynamic_relocations = nullptr;
-    size_t dynamic_size = 0;
-    for (const ElfW(Dyn)* entry = dynamic; entry->d_tag != DT_NULL; ++entry) {
-        switch (entry->d_tag) {
-            case DT_SYMTAB:
-                symbols = reinterpret_cast<const ElfW(Sym)*>(
-                        loaded_pointer(library, entry->d_un.d_ptr));
-                break;
-            case DT_STRTAB:
-                strings = reinterpret_cast<const char*>(
-                        loaded_pointer(library, entry->d_un.d_ptr));
-                break;
-            case DT_JMPREL:
-                plt_relocations = reinterpret_cast<const ElfW(Rela)*>(
-                        loaded_pointer(library, entry->d_un.d_ptr));
-                break;
-            case DT_PLTRELSZ:
-                plt_size = entry->d_un.d_val;
-                break;
-            case DT_RELA:
-                dynamic_relocations = reinterpret_cast<const ElfW(Rela)*>(
-                        loaded_pointer(library, entry->d_un.d_ptr));
-                break;
-            case DT_RELASZ:
-                dynamic_size = entry->d_un.d_val;
-                break;
-            default:
-                break;
-        }
-    }
-    if (symbols == nullptr || strings == nullptr) return -5;
-    int patched = patch_relocations(
-            library, plt_relocations, plt_size / sizeof(ElfW(Rela)), symbols, strings);
-    patched += patch_relocations(
-            library, dynamic_relocations, dynamic_size / sizeof(ElfW(Rela)), symbols, strings);
-    return patched > 0 ? patched : -6;
-#endif
-}
 
 int hook_existing_encoder_pointer() {
 #if !defined(__aarch64__)
-    return 0;
+    return -2;
 #else
-    DlsymFn resolver = g_real_dlsym.load(std::memory_order_acquire);
-    if (resolver == nullptr) resolver = &dlsym;
     void* encoder = dlopen(kEncoderLibrary, RTLD_NOW | RTLD_NOLOAD);
-    if (encoder == nullptr) return 0;
-    void* adjust = resolver(encoder, kAdjustSymbol);
-    void* target = resolver(encoder, kSetTargetSymbol);
-    if (adjust != nullptr) {
-        g_real_adjust.store(reinterpret_cast<AdjustBitrateFn>(adjust), std::memory_order_release);
+    if (encoder == nullptr) return -3;
+    void* adjust = dlsym(encoder, kAdjustSymbol);
+    void* target = dlsym(encoder, kSetTargetSymbol);
+    if (adjust == nullptr || target == nullptr) {
+        dlclose(encoder);
+        return -4;
     }
-    if (target != nullptr) {
-        g_set_target.store(reinterpret_cast<SetTargetBitrateFn>(target), std::memory_order_release);
-    }
-    int patched = 0;
-    if (adjust != nullptr) {
-        FILE* maps = fopen("/proc/self/maps", "re");
-        char line[512];
-        while (maps != nullptr && fgets(line, sizeof(line), maps) != nullptr) {
-            unsigned long long start = 0;
-            unsigned long long end = 0;
-            char perms[5] = {};
-            char path[384] = {};
-            if (sscanf(line, "%llx-%llx %4s %*s %*s %*s %383s",
-                    &start, &end, perms, path) != 4) continue;
-            if (perms[0] != 'r' || perms[1] != 'w' || !ends_with(path, kBluetoothLibrary)) {
-                continue;
-            }
-            uintptr_t begin = (static_cast<uintptr_t>(start) + sizeof(void*) - 1U)
-                    & ~(sizeof(void*) - 1U);
-            for (uintptr_t address = begin;
-                    address + sizeof(void*) <= static_cast<uintptr_t>(end);
-                    address += sizeof(void*)) {
-                auto** slot = reinterpret_cast<void**>(address);
-                if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) == adjust
-                        && replace_pointer(slot, adjust,
-                                reinterpret_cast<void*>(&melody_lhdc_adjust_bitrate))) {
-                    ++patched;
-                }
+
+    // Fail closed unless the already-resolved adjust callback has one unique writable owner.
+    // We never touch dlsym/PLT/GOT or any Bluetooth startup-time symbol resolution.
+    void** candidate = nullptr;
+    int candidate_count = 0;
+    FILE* maps = fopen("/proc/self/maps", "re");
+    char line[512];
+    while (maps != nullptr && fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        char perms[5] = {};
+        char path[384] = {};
+        if (sscanf(line, "%llx-%llx %4s %*s %*s %*s %383s",
+                &start, &end, perms, path) != 4) continue;
+        if (perms[0] != 'r' || perms[1] != 'w' || !ends_with(path, kBluetoothLibrary)) {
+            continue;
+        }
+        uintptr_t begin = (static_cast<uintptr_t>(start) + sizeof(void*) - 1U)
+                & ~(sizeof(void*) - 1U);
+        for (uintptr_t address = begin;
+                address + sizeof(void*) <= static_cast<uintptr_t>(end);
+                address += sizeof(void*)) {
+            auto** slot = reinterpret_cast<void**>(address);
+            if (__atomic_load_n(slot, __ATOMIC_ACQUIRE) == adjust) {
+                candidate = slot;
+                ++candidate_count;
             }
         }
-        if (maps != nullptr) fclose(maps);
+    }
+    if (maps != nullptr) fclose(maps);
+
+    int result = -5;
+    if (candidate_count == 1
+            && replace_writable_pointer(candidate, adjust,
+                    reinterpret_cast<void*>(&melody_lhdc_adjust_bitrate))) {
+        g_real_adjust.store(reinterpret_cast<AdjustBitrateFn>(adjust),
+                std::memory_order_release);
+        g_set_target.store(reinterpret_cast<SetTargetBitrateFn>(target),
+                std::memory_order_release);
+        result = 1;
+    } else if (candidate_count > 1) {
+        result = -6;
     }
     dlclose(encoder);
-    return patched;
+    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+            "evt=encoder.scan candidates=%d result=%d adjust=%p target=%p",
+            candidate_count, result, adjust, target);
+    return result;
 #endif
 }
 
@@ -575,13 +415,10 @@ int hook_existing_encoder_pointer() {
 extern "C" JNIEXPORT jint JNICALL
 Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeInstallGovernor(
         JNIEnv*, jclass) {
-    const int dlsym_hooks = install_dlsym_hook();
-    const int existing_hooks = hook_existing_encoder_pointer();
+    const int result = hook_existing_encoder_pointer();
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=hook.install dlsym=%d existing=%d", dlsym_hooks, existing_hooks);
-    if (dlsym_hooks >= 0) return dlsym_hooks + existing_hooks;
-    if (existing_hooks > 0) return existing_hooks;
-    return dlsym_hooks;
+            "evt=hook.install mode=resolved_pointer result=%d", result);
+    return result;
 }
 
 extern "C" JNIEXPORT void JNICALL

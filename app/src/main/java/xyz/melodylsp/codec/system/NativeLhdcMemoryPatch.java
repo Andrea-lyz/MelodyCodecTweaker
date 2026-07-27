@@ -63,7 +63,6 @@ final class NativeLhdcMemoryPatch {
     private static volatile boolean nativeLoadAttempted;
     private static volatile boolean nativeLoaded;
     private static volatile PatchResult lastResult;
-    private static volatile boolean governorInstallAttempted;
     private static volatile boolean governorInstalled;
 
     private NativeLhdcMemoryPatch() {
@@ -111,7 +110,6 @@ final class NativeLhdcMemoryPatch {
                     "detail", nativeLoadError);
             return false;
         }
-        governorInstallAttempted = true;
         int result;
         try {
             result = nativeInstallGovernor();
@@ -119,15 +117,16 @@ final class NativeLhdcMemoryPatch {
             MLog.w("lhdc governor native install failed", t);
             return false;
         }
-        governorInstalled = result >= 0;
+        governorInstalled = result > 0;
         MLog.event("lhdc.governor.install", "ok", governorInstalled, "result", result);
         return governorInstalled;
     }
 
     static boolean setGovernorPolicy(int policy) {
-        if (!governorInstalled && !installGovernor()) return false;
+        if (!ensureNativeLoaded()) return false;
         try {
             nativeSetGovernorPolicy(policy);
+            if (!governorInstalled) installGovernor();
             return true;
         } catch (Throwable t) {
             MLog.w("lhdc governor policy update failed", t);
@@ -136,7 +135,8 @@ final class NativeLhdcMemoryPatch {
     }
 
     static void reportRemoteChoppy(int level) {
-        if (level <= 0 || (!governorInstalled && !governorInstallAttempted)) return;
+        if (level <= 0) return;
+        if (!governorInstalled && !installGovernor()) return;
         try {
             nativeReportChoppy(level);
         } catch (Throwable t) {

@@ -4,6 +4,8 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.Handler;
+import android.os.Looper;
 
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
@@ -14,8 +16,13 @@ import xyz.melodylsp.codec.util.TrustedBroadcasts;
 /** A2DP codec endpoint running inside {@code com.android.bluetooth}. */
 public final class CodecBroadcastBridge {
 
+    private static final long[] GOVERNOR_INSTALL_RETRY_DELAYS_MS = {
+            200L, 500L, 1_000L, 2_500L, 5_000L
+    };
+
     private final Context context;
     private final CodecBridgeService service;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile boolean registered;
 
     public CodecBroadcastBridge(Context context, CodecBridgeService service) {
@@ -100,6 +107,7 @@ public final class CodecBroadcastBridge {
                         xyz.melodylsp.codec.bridge.LhdcQualityPolicy.ADAPTIVE);
                 String reason = intent.getStringExtra(CodecIpc.EXTRA_LHDC_POLICY_REASON);
                 boolean applied = NativeLhdcMemoryPatch.setGovernorPolicy(policy);
+                if (applied) scheduleGovernorInstallRetries();
                 MLog.event("lhdc.governor.policy",
                         "applied", applied,
                         "policy", policy,
@@ -109,6 +117,12 @@ public final class CodecBroadcastBridge {
         } catch (Throwable t) {
             MLog.e("codec bluetooth request failed", t);
             reply(requestId, mac, null, false, CodecRequest.RESULT_ERROR);
+        }
+    }
+
+    private void scheduleGovernorInstallRetries() {
+        for (long delayMs : GOVERNOR_INSTALL_RETRY_DELAYS_MS) {
+            mainHandler.postDelayed(NativeLhdcMemoryPatch::installGovernor, delayMs);
         }
     }
 
