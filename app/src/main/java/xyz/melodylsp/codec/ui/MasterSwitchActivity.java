@@ -21,6 +21,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CompoundButton;
+import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -47,9 +48,14 @@ public final class MasterSwitchActivity extends Activity {
     private static final int SUBTEXT = 0xFF687385;
     private static final int LINE = 0xFFE5EAF2;
     private static final int BLUE = 0xFF0A84FF;
+    private static final int BLUE_SOFT = 0xFFEAF3FF;
     private static final int GREEN = 0xFF1F9D63;
+    private static final int GREEN_SOFT = 0xFFE7F5EE;
     private static final int ORANGE = 0xFFD9822B;
+    private static final int ORANGE_SOFT = 0xFFFDF1DE;
     private static final int RED = 0xFFD64545;
+    private static final int RED_SOFT = 0xFFFCE3E3;
+    private static final int MUTED = 0xFF8B96AA;
 
     private SharedPreferences modulePrefs;
     private SharedPreferences diagPrefs;
@@ -60,7 +66,46 @@ public final class MasterSwitchActivity extends Activity {
     private TextView enabledStatus;
     private TextView sessionStatus;
     private Switch launcherSwitch;
+    private Button recordButton;
     private boolean memorySnapshotRefreshPending;
+
+    // BQR 实时环境 / 历史窗口 / Reason 列表 / 边界状态 用的 view holder。
+    private TextView bqrRetxValue;
+    private TextView bqrNorxValue;
+    private TextView bqrAfhUnusedValue;
+    private TextView bqrAfhTotalValue;
+    private TextView bqrActivity;
+    private LinearLayout bqrHistoryHolder;
+    private LinearLayout bqrReasonList;
+    private LinearLayout bqrBoundary1;
+    private LinearLayout bqrBoundary2;
+    private TextView bqrCeilingLabel;
+
+    // reason 关键字 → { 中文标签, 解释, 类别 }。类别影响颜色。
+    private static final String[][] REASON_TABLE = {
+            {"healthy_recovery_probe", "主动试探", "active",
+                    "队列空闲时，重置试探看能不能上探到 900 / 1000 kbps"},
+            {"probe_stable", "探针稳定", "stable",
+                    "链路连续 3 个健康窗口，解除上限，恢复高码率"},
+            {"probe_health_lost", "链路质量变差", "idle",
+                    "健康窗口归零，关闭探针，等下次重新评估"},
+            {"probe_stream_idle", "音乐暂停", "idle",
+                    "没有 A2DP 流，关闭探针避免空跑"},
+            {"probe_queue_congested", "队列积压", "queued",
+                    "蓝牙缓冲队列超过 90%，链路跟不上，先撤回"},
+            {"probe_choppy", "声音卡顿", "idle",
+                    "检测到外部卡顿事件，立刻撤下探针"},
+            {"boundary_locked", "升级门槛锁定", "locked",
+                    "连续失败，目标码率被锁定，下调至上一档"},
+            {"boundary_stable", "升级门槛解除", "stable",
+                    "升级后稳定运行，撤销该档位的锁定证据"},
+            {"quick_failure", "快速失败", "queued",
+                    "升级后立刻报错，准备升级证据"},
+            {"device_active", "设备激活", "stable",
+                    "耳机连接起来，重新评估当前码率天花板"},
+            {"device_reconnect", "设备重连", "stable",
+                    "耳机刚重连，重新评估当前码率天花板"},
+    };
     private final Handler refreshHandler = new Handler(Looper.getMainLooper());
     // Foreground-only heartbeat. Re-reads the latest diagnostic SharedPreferences
     // every 4s so KPIs and event rows stay live while the user is staring at
@@ -131,6 +176,8 @@ public final class MasterSwitchActivity extends Activity {
         root.addView(moduleSwitchCard(), topMargin(matchWrap(), dp(18)));
         root.addView(launcherCard(), topMargin(matchWrap(), dp(12)));
         root.addView(feedbackCard(), topMargin(matchWrap(), dp(12)));
+        root.addView(bqrRealtimeCard(), topMargin(matchWrap(), dp(12)));
+        root.addView(bqrHistoryCard(), topMargin(matchWrap(), dp(12)));
 
         packageList = section(root, "环境信息");
         statusList = section(root, "诊断状态");
@@ -145,6 +192,119 @@ public final class MasterSwitchActivity extends Activity {
         root.addView(eventCard, topMargin(matchWrap(), dp(12)));
 
         return scroll;
+    }
+
+    /** BQR 实时环境：4 个 KPI + 边界状态 + 最近 9 条 reason 摘要。 */
+    private View bqrRealtimeCard() {
+        LinearLayout card = card();
+        LinearLayout head = row();
+        card.addView(head, matchWrap());
+        TextView title = titleText("LHDC 链路 · BQR 实时环境");
+        head.addView(title, weightWrap());
+        bqrActivity = pillOf("活动", GREEN, GREEN_SOFT, true);
+        head.addView(bqrActivity, wrapWrap());
+
+        bqrRetxValue = bqrKpiRow(card, "retx");
+        bqrNorxValue = bqrKpiRow(card, "norx");
+        bqrAfhUnusedValue = bqrKpiRow(card, "afh_unused");
+        bqrAfhTotalValue = bqrKpiRow(card, "afh_total");
+
+        TextView ceilingTitle = titleText("边界状态");
+        LinearLayout.LayoutParams ceilingLp = new LinearLayout.LayoutParams(matchWrap());
+        ceilingLp.topMargin = dp(18);
+        card.addView(ceilingTitle, ceilingLp);
+        bqrCeilingLabel = bodyText("ceiling —", 12, SUBTEXT);
+        bqrCeilingLabel.setPadding(0, dp(4), 0, 0);
+        card.addView(bqrCeilingLabel, matchWrap());
+
+        bqrBoundary1 = boundaryRow(card, "500 → 900");
+        bqrBoundary2 = boundaryRow(card, "900 → 1000");
+
+        TextView reasonTitle = titleText("最近事件理由");
+        LinearLayout.LayoutParams reasonLp = new LinearLayout.LayoutParams(matchWrap());
+        reasonLp.topMargin = dp(18);
+        card.addView(reasonTitle, reasonLp);
+        bqrReasonList = new LinearLayout(this);
+        bqrReasonList.setOrientation(LinearLayout.VERTICAL);
+        card.addView(bqrReasonList, matchWrap());
+
+        TextView hint = bodyText(
+                "数据来自 LhdcLinkHealthController → evt=lhdc.link.bqr_summary 事件，"
+                        + "本卡片只解析现有 pref，不向宿主进程发起新采集。",
+                12, SUBTEXT);
+        hint.setPadding(0, dp(14), 0, 0);
+        card.addView(hint, matchWrap());
+        return card;
+    }
+
+    /** BQR 历史窗口：最近 24 条 BQR 摘要，按时间分桶。 */
+    private View bqrHistoryCard() {
+        LinearLayout card = card();
+        TextView title = titleText("LHDC 链路 · BQR 历史窗口");
+        card.addView(title, matchWrap());
+        TextView hint = bodyText("最近 24 条 BQR 摘要，按到达时间分桶（每桶 ≈ 1 条）。",
+                12, SUBTEXT);
+        hint.setPadding(0, dp(4), 0, 0);
+        card.addView(hint, matchWrap());
+
+        bqrHistoryHolder = new LinearLayout(this);
+        bqrHistoryHolder.setOrientation(LinearLayout.HORIZONTAL);
+        bqrHistoryHolder.setGravity(Gravity.BOTTOM | Gravity.START);
+        LinearLayout.LayoutParams barsLp = new LinearLayout.LayoutParams(matchWrap());
+        barsLp.topMargin = dp(14);
+        barsLp.height = dp(72);
+        card.addView(bqrHistoryHolder, barsLp);
+        TextView legend = bodyText("t=当下  …  t-23=最早临近", 11, MUTED);
+        legend.setPadding(0, dp(8), 0, 0);
+        card.addView(legend, matchWrap());
+        return card;
+    }
+
+    private TextView bqrKpiRow(LinearLayout parent, String label) {
+        LinearLayout row = row();
+        row.setPadding(0, dp(8), 0, 0);
+        parent.addView(row, matchWrap());
+        TextView name = bodyText(label, 13, SUBTEXT);
+        row.addView(name, weightWrap());
+        TextView value = bodyText("—", 16, TEXT, true);
+        row.addView(value, wrapWrap());
+        if ("retx".equals(label)) bqrRetxValue = value;
+        else if ("norx".equals(label)) bqrNorxValue = value;
+        else if ("afh_unused".equals(label)) bqrAfhUnusedValue = value;
+        else if ("afh_total".equals(label)) bqrAfhTotalValue = value;
+        return value;
+    }
+
+    private LinearLayout boundaryRow(LinearLayout parent, String name) {
+        LinearLayout row = row();
+        row.setPadding(0, dp(8), 0, 0);
+        parent.addView(row, matchWrap());
+        TextView label = bodyText(name, 13, SUBTEXT);
+        row.addView(label, weightWrap());
+        TextView status = bodyText("未知", 13, MUTED);
+        row.addView(status, wrapWrap());
+        return row;
+    }
+
+    private TextView pillOf(String text, int fg, int bg, boolean pulsing) {
+        TextView pill = new TextView(this);
+        pill.setText(text);
+        pill.setTextSize(11);
+        pill.setTextColor(fg);
+        pill.setPadding(dp(10), dp(4), dp(10), dp(4));
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(bg);
+        d.setCornerRadius(dp(10));
+        pill.setBackground(d);
+        if (pulsing) {
+            pill.setCompoundDrawablePadding(dp(6));
+            GradientDrawable dot = new GradientDrawable();
+            dot.setShape(GradientDrawable.OVAL);
+            dot.setSize(dp(6), dp(6));
+            dot.setColor(fg);
+            pill.setCompoundDrawablesWithIntrinsicBounds(dot, null, null, null);
+        }
+        return pill;
     }
 
     private View header() {
@@ -230,6 +390,7 @@ public final class MasterSwitchActivity extends Activity {
 
         Button record = button("开始记录问题", true);
         record.setOnClickListener(v -> startRecordSession());
+        recordButton = record;
         row1.addView(record, new LinearLayout.LayoutParams(0, dp(46), 1f));
 
         Button collect = button("生成反馈包", true);
@@ -289,6 +450,10 @@ public final class MasterSwitchActivity extends Activity {
             sessionStatus.setText("上次记录：" + session + "，开始于 "
                     + DiagnosticEvents.formatTime(started) + "（已结束）");
         }
+        if (recordButton != null) {
+            recordButton.setText(recording ? "停止记录" : "开始记录问题");
+            setButtonPrimary(recordButton, !recording);
+        }
 
         clearDynamicRows(packageList);
         addInfoRow(packageList, "模块版本",
@@ -326,6 +491,350 @@ public final class MasterSwitchActivity extends Activity {
 
         String events = diagPrefs.getString(DiagnosticEvents.KEY_EVENTS, "");
         recentEvents.setText(tailLines(events, 12));
+
+        refreshBqrAndReason();
+    }
+
+    /** 解析 BQR 实时 / 历史 / 边界 / Reason 列表。 仅消费 pref，不发起新采集。 */
+    private void refreshBqrAndReason() {
+        String jsonl = diagPrefs.getString(DiagnosticEvents.KEY_EVENTS_JSON, "");
+        BqrAccumulator acc = new BqrAccumulator();
+        if (jsonl != null && !jsonl.isEmpty()) {
+            // 反向扫描，让最新事件先被处理。
+            String[] lines = jsonl.split("\n");
+            for (int i = lines.length - 1; i >= 0; i--) {
+                acc.consume(lines[i]);
+            }
+        }
+
+        // —— 4 个 KPI —— //
+        int retx = acc.lastRetx;
+        int norx = acc.lastNorx;
+        int afhUnused = acc.lastAfhUnused;
+        int afhTotal = acc.lastAfhTotal;
+        if (acc.hasBqr) {
+            bqrRetxValue.setText(String.valueOf(retx));
+            bqrRetxValue.setTextColor(kpiColor(retx, 60));
+            bqrNorxValue.setText(String.valueOf(norx));
+            bqrNorxValue.setTextColor(kpiColor(norx, 60));
+            // AFH: "未用信道" 越高越好不能简单按阈值判，待指标成熟时再细化。
+            bqrAfhUnusedValue.setText(afhUnused + " / " + afhTotal);
+            bqrAfhUnusedValue.setTextColor(TEXT);
+            bqrAfhTotalValue.setText(afhTotal + " / 79");
+            bqrAfhTotalValue.setTextColor(afhTotal >= 30 ? GREEN : ORANGE);
+            bqrActivity.setText("活动");
+            bqrActivity.setTextColor(GREEN);
+            ((GradientDrawable) bqrActivity.getBackground()).setColor(GREEN_SOFT);
+        } else {
+            bqrRetxValue.setText("—");
+            bqrNorxValue.setText("—");
+            bqrAfhUnusedValue.setText("— / —");
+            bqrAfhTotalValue.setText("— / 79");
+            bqrActivity.setText("等待数据");
+            bqrActivity.setTextColor(MUTED);
+            ((GradientDrawable) bqrActivity.getBackground()).setColor(0xFFEFF1F5);
+        }
+
+        // —— 边界状态 —— //
+        renderBoundary(bqrBoundary1, 500, 900, acc.boundaryLocked500to900);
+        renderBoundary(bqrBoundary2, 900, 1000, acc.boundaryLocked900to1000);
+        bqrCeilingLabel.setText(
+                acc.lastCeilingKbps > 0
+                        ? "ceiling " + acc.lastCeilingKbps + " kbps"
+                        : "ceiling —");
+
+        // —— 历史窗口 —— //
+        renderHistoryBars(acc.retxHistory);
+
+        // —— Reason 列表 —— //
+        renderReasonList(acc);
+    }
+
+    private int kpiColor(int value, int warnAbove) {
+        if (value <= warnAbove / 2) return GREEN;
+        if (value <= warnAbove) return ORANGE;
+        return RED;
+    }
+
+    private void renderBoundary(LinearLayout row, int from, int to, boolean locked) {
+        TextView status = (TextView) row.getChildAt(1);
+        if (locked) {
+            status.setText("锁定");
+            status.setTextColor(RED);
+        } else {
+            status.setText("解锁");
+            status.setTextColor(GREEN);
+        }
+    }
+
+    private void renderHistoryBars(int[] values) {
+        if (bqrHistoryHolder == null) return;
+        bqrHistoryHolder.removeAllViews();
+        int peak = 1;
+        for (int v : values) if (v > peak) peak = v;
+        int parentHeight = dp(72);
+        for (int i = 0; i < values.length; i++) {
+            int v = values[i];
+            int heightPx = Math.max(2, (int) (parentHeight * (v / (float) peak)));
+            FrameLayout cell = new FrameLayout(this);
+            LinearLayout.LayoutParams cellLp = new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.MATCH_PARENT, 1f);
+            cellLp.leftMargin = i == 0 ? 0 : dp(2);
+            cell.setLayoutParams(cellLp);
+
+            View bar = new View(this);
+            GradientDrawable bg = new GradientDrawable();
+            bg.setCornerRadius(dp(2));
+            if (v <= 0) {
+                bg.setColor(0xFFE5EAF2);
+            } else if (v > peak * 0.75) {
+                bg.setColor(RED);
+            } else if (v > peak * 0.5) {
+                bg.setColor(ORANGE);
+            } else {
+                bg.setColor(GREEN);
+            }
+            bar.setBackground(bg);
+            FrameLayout.LayoutParams inner = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, heightPx);
+            inner.gravity = Gravity.BOTTOM;
+            cell.addView(bar, inner);
+            bqrHistoryHolder.addView(cell);
+        }
+    }
+
+    private void renderReasonList(BqrAccumulator acc) {
+        if (bqrReasonList == null) return;
+        bqrReasonList.removeAllViews();
+        long now = System.currentTimeMillis();
+        for (String[] entry : REASON_TABLE) {
+            String key = entry[0];
+            String label = entry[1];
+            String tier = entry[2];
+            String desc = entry[3];
+            int count = acc.reasonCount.getOrDefault(key, 0);
+            long lastTime = acc.reasonLast.getOrDefault(key, 0L);
+
+            LinearLayout row = card();
+            row.setPadding(dp(12), dp(10), dp(12), dp(10));
+            LinearLayout.LayoutParams rp = new LinearLayout.LayoutParams(matchWrap());
+            rp.topMargin = dp(8);
+            row.setLayoutParams(rp);
+
+            LinearLayout head = row();
+            head.setGravity(Gravity.CENTER_VERTICAL);
+            row.addView(head, matchWrap());
+            TextView keyChip = bodyText(key, 11, textColorForTier(tier));
+            keyChip.setPadding(dp(8), dp(3), dp(8), dp(3));
+            GradientDrawable keyBg = new GradientDrawable();
+            keyBg.setColor(bgColorForTier(tier));
+            keyBg.setCornerRadius(dp(8));
+            keyChip.setBackground(keyBg);
+            head.addView(keyChip, wrapWrap());
+            TextView labelText = bodyText(label, 13, TEXT, true);
+            LinearLayout.LayoutParams labelLp = new LinearLayout.LayoutParams(
+                    0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+            labelLp.leftMargin = dp(8);
+            head.addView(labelText, labelLp);
+
+            TextView descText = bodyText(desc, 12, SUBTEXT);
+            descText.setPadding(0, dp(6), 0, 0);
+            row.addView(descText, matchWrap());
+
+            String when;
+            if (lastTime <= 0L) {
+                when = "暂无记录";
+            } else {
+                long diff = Math.max(0, now - lastTime);
+                if (diff < 60_000L) when = "刚刚";
+                else if (diff < 3_600_000L) when = (diff / 60_000L) + " 分钟前";
+                else if (diff < 86_400_000L) when = (diff / 3_600_000L) + " 小时前";
+                else when = (diff / 86_400_000L) + " 天前";
+            }
+            TextView whenText = bodyText(
+                    when + (count > 0 ? "  ·  本次会话 " + count + " 次" : ""),
+                    11, MUTED);
+            whenText.setPadding(0, dp(4), 0, 0);
+            row.addView(whenText, matchWrap());
+            bqrReasonList.addView(row);
+        }
+    }
+
+    private int textColorForTier(String tier) {
+        if ("stable".equals(tier)) return GREEN;
+        if ("idle".equals(tier)) return MUTED;
+        if ("queued".equals(tier)) return ORANGE;
+        if ("locked".equals(tier)) return RED;
+        if ("active".equals(tier)) return BLUE;
+        return TEXT;
+    }
+
+    private int bgColorForTier(String tier) {
+        if ("stable".equals(tier)) return GREEN_SOFT;
+        if ("idle".equals(tier)) return 0xFFEFF1F5;
+        if ("queued".equals(tier)) return ORANGE_SOFT;
+        if ("locked".equals(tier)) return RED_SOFT;
+        if ("active".equals(tier)) return BLUE_SOFT;
+        return 0xFFEFF1F5;
+    }
+
+    /** 解析 JSONL 时累计 BQR / reason / 边界状态。 */
+    private static final class BqrAccumulator {
+        boolean hasBqr;
+        int lastRetx;
+        int lastNorx;
+        int lastAfhUnused;
+        int lastAfhTotal;
+        int lastCeilingKbps;
+        boolean boundaryLocked500to900;
+        boolean boundaryLocked900to1000;
+        final int[] retxHistory = new int[24];
+        int historyCount;
+        final java.util.HashMap<String, Integer> reasonCount = new java.util.HashMap<>();
+        final java.util.HashMap<String, Long> reasonLast = new java.util.HashMap<>();
+
+        void consume(String line) {
+            if (line == null || line.isEmpty()) return;
+            String trimmed = line.trim();
+            if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return;
+            String event = jsonStringField(trimmed, "event");
+            String message = jsonStringField(trimmed, "message");
+            long time = jsonLongField(trimmed, "time");
+
+            if (event == null && message == null) return;
+            if (event == null) event = "";
+            if (message == null) message = "";
+
+            // 1. BQR 实时环境
+            if (event.endsWith("lhdc.link.bqr_summary") || message.contains("lhdc.link.bqr_summary")) {
+                int retx = parseIntField(message, "retx");
+                int norx = parseIntField(message, "norx");
+                int afhUnused = parseIntField(message, "afh_unused");
+                int afhTotal = parseIntField(message, "afh_total");
+                int ceil = parseIntField(message, "ceiling");
+                if (!hasBqr) {
+                    lastRetx = retx;
+                    lastNorx = norx;
+                    lastAfhUnused = afhUnused;
+                    lastAfhTotal = afhTotal;
+                    lastCeilingKbps = ceil;
+                    hasBqr = true;
+                }
+                if (historyCount < retxHistory.length) {
+                    retxHistory[retxHistory.length - 1 - historyCount] = retx;
+                    historyCount++;
+                }
+            }
+
+            // 2. 边界状态：governor_event 会带 from / to / event
+            if (event.endsWith("lhdc.link.governor_event") || message.contains("lhdc.link.governor_event")) {
+                int from = parseIntField(message, "from");
+                int to = parseIntField(message, "to");
+                String gevent = parseStringField(message, "event");
+                if (from == 500 && to == 900) {
+                    boundaryLocked500to900 = "boundary_locked".equals(gevent)
+                            || "quick_failure".equals(gevent);
+                } else if (from == 900 && to == 1000) {
+                    boundaryLocked900to1000 = "boundary_locked".equals(gevent)
+                            || "quick_failure".equals(gevent);
+                }
+            }
+
+            // 3. Reason 计数：扫描消息里所有 reason 关键字
+            for (String[] entry : REASON_TABLE) {
+                String key = entry[0];
+                if (message.contains("reason=" + key) || message.contains("event=" + key)
+                        || event.contains(key)) {
+                    if (message.contains("reason=" + key) || event.contains(key)) {
+                        reasonCount.put(key, reasonCount.getOrDefault(key, 0) + 1);
+                        if (time > 0) {
+                            long prev = reasonLast.getOrDefault(key, 0L);
+                            if (time > prev) reasonLast.put(key, time);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static int parseIntField(String msg, String key) {
+            String v = parseStringField(msg, key);
+            if (v == null) return 0;
+            try {
+                return Integer.parseInt(v);
+            } catch (NumberFormatException e) {
+                return 0;
+            }
+        }
+
+        private static String parseStringField(String msg, String key) {
+            String target = key + "=";
+            int idx = msg.indexOf(target);
+            if (idx < 0) return null;
+            int start = idx + target.length();
+            int end = msg.length();
+            for (int i = start; i < msg.length(); i++) {
+                char c = msg.charAt(i);
+                if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                    end = i;
+                    break;
+                }
+            }
+            return msg.substring(start, end);
+        }
+
+        private static String jsonStringField(String json, String name) {
+            String needle = "\"" + name + "\":";
+            int idx = json.indexOf(needle);
+            if (idx < 0) return null;
+            int start = idx + needle.length();
+            while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == '\t')) start++;
+            if (start >= json.length() || json.charAt(start) != '"') return null;
+            start++;
+            StringBuilder sb = new StringBuilder();
+            for (int i = start; i < json.length(); i++) {
+                char c = json.charAt(i);
+                if (c == '\\' && i + 1 < json.length()) {
+                    char n = json.charAt(i + 1);
+                    if (n == 'n') sb.append('\n');
+                    else if (n == 't') sb.append('\t');
+                    else if (n == 'r') sb.append('\r');
+                    else sb.append(n);
+                    i++;
+                    continue;
+                }
+                if (c == '"') return sb.toString();
+                sb.append(c);
+            }
+            return null;
+        }
+
+        private static long jsonLongField(String json, String name) {
+            String v = jsonStringField(json, name);
+            if (v == null) {
+                // 数字字段没有引号
+                String needle = "\"" + name + "\":";
+                int idx = json.indexOf(needle);
+                if (idx < 0) return 0L;
+                int start = idx + needle.length();
+                while (start < json.length() && (json.charAt(start) == ' ' || json.charAt(start) == '\t')) start++;
+                int end = start;
+                while (end < json.length()) {
+                    char c = json.charAt(end);
+                    if (c == ',' || c == '}' || c == ' ' || c == '\n' || c == '\r' || c == '\t') break;
+                    end++;
+                }
+                try {
+                    return Long.parseLong(json.substring(start, end));
+                } catch (NumberFormatException e) {
+                    return 0L;
+                }
+            }
+            try {
+                return Long.parseLong(v);
+            } catch (NumberFormatException e) {
+                return 0L;
+            }
+        }
     }
 
     private void requestRememberedSnapshot() {
@@ -551,6 +1060,15 @@ public final class MasterSwitchActivity extends Activity {
         return b;
     }
 
+    /** 重新套用 button() 的 primary/ghost 配色（不重建 View）。 */
+    private void setButtonPrimary(Button b, boolean primary) {
+        b.setTextColor(primary ? Color.WHITE : BLUE);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setCornerRadius(dp(14));
+        bg.setColor(primary ? BLUE : BLUE_SOFT);
+        b.setBackground(bg);
+    }
+
     private LinearLayout row() {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
@@ -570,6 +1088,10 @@ public final class MasterSwitchActivity extends Activity {
 
     private TextView bodyText(String value, int sp, int color) {
         return text(value, sp, color, false);
+    }
+
+    private TextView bodyText(String value, int sp, int color, boolean bold) {
+        return text(value, sp, color, bold);
     }
 
     private TextView text(String value, int sp, int color, boolean bold) {
