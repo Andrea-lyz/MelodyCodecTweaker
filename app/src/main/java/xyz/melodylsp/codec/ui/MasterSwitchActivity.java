@@ -517,9 +517,10 @@ public final class MasterSwitchActivity extends Activity {
             bqrRetxValue.setTextColor(kpiColor(retx, 60));
             bqrNorxValue.setText(String.valueOf(norx));
             bqrNorxValue.setTextColor(kpiColor(norx, 60));
-            // AFH: "未用信道" 越高越好不能简单按阈值判，待指标成熟时再细化。
-            bqrAfhUnusedValue.setText(afhUnused + " / " + afhTotal);
-            bqrAfhUnusedValue.setTextColor(TEXT);
+            // 未用 AFH 信道：越少越好（说明被占用越少）。
+            bqrAfhUnusedValue.setText(afhUnused + " / 79");
+            bqrAfhUnusedValue.setTextColor(afhUnused <= 22 ? GREEN : (afhUnused <= 49 ? ORANGE : RED));
+            // 可用 AFH：越多越好。
             bqrAfhTotalValue.setText(afhTotal + " / 79");
             bqrAfhTotalValue.setTextColor(afhTotal >= 30 ? GREEN : ORANGE);
             bqrActivity.setText("活动");
@@ -585,11 +586,12 @@ public final class MasterSwitchActivity extends Activity {
             View bar = new View(this);
             GradientDrawable bg = new GradientDrawable();
             bg.setCornerRadius(dp(2));
+            // unusedAfh：未用信道越多 = 越拥塞 = 越红。
             if (v <= 0) {
                 bg.setColor(0xFFE5EAF2);
-            } else if (v > peak * 0.75) {
+            } else if (v > peak * 0.66) {
                 bg.setColor(RED);
-            } else if (v > peak * 0.5) {
+            } else if (v > peak * 0.33) {
                 bg.setColor(ORANGE);
             } else {
                 bg.setColor(GREEN);
@@ -705,13 +707,18 @@ public final class MasterSwitchActivity extends Activity {
             if (event == null) event = "";
             if (message == null) message = "";
 
-            // 1. BQR 实时环境
+            // 1. BQR 实时环境：MLog.event("lhdc.link.bqr_summary", telemetry)
+            //    telemetry 字段：mac, unusedAfh, usableAfh, unidealAfh,
+            //                    retransmissions, retransmissionsPerSec,
+            //                    noRx, noRxPerSec, ceilingKbps, ...
             if (event.endsWith("lhdc.link.bqr_summary") || message.contains("lhdc.link.bqr_summary")) {
-                int retx = parseIntField(message, "retx");
-                int norx = parseIntField(message, "norx");
-                int afhUnused = parseIntField(message, "afh_unused");
-                int afhTotal = parseIntField(message, "afh_total");
-                int ceil = parseIntField(message, "ceiling");
+                int retx = parseIntField(message, "retransmissionsPerSec");
+                if (retx == 0) retx = parseIntField(message, "retransmissions");
+                int norx = parseIntField(message, "noRxPerSec");
+                if (norx == 0) norx = parseIntField(message, "noRx");
+                int afhUnused = parseIntField(message, "unusedAfh");
+                int afhTotal = parseIntField(message, "usableAfh");
+                int ceil = parseIntField(message, "ceilingKbps");
                 if (!hasBqr) {
                     lastRetx = retx;
                     lastNorx = norx;
@@ -719,38 +726,50 @@ public final class MasterSwitchActivity extends Activity {
                     lastAfhTotal = afhTotal;
                     lastCeilingKbps = ceil;
                     hasBqr = true;
+                } else {
+                    lastRetx = retx;
+                    lastNorx = norx;
+                    lastAfhUnused = afhUnused;
+                    lastAfhTotal = afhTotal;
+                    lastCeilingKbps = ceil;
                 }
+                // history 用 unusedAfh 当桶值，反映"信道拥挤度"的变化趋势，
+                // 比瞬时 retransmissions 更稳定也更易区分。
                 if (historyCount < retxHistory.length) {
-                    retxHistory[retxHistory.length - 1 - historyCount] = retx;
+                    retxHistory[retxHistory.length - 1 - historyCount] = afhUnused;
                     historyCount++;
+                } else {
+                    System.arraycopy(retxHistory, 1, retxHistory, 0, retxHistory.length - 1);
+                    retxHistory[retxHistory.length - 1] = afhUnused;
                 }
             }
 
-            // 2. 边界状态：governor_event 会带 from / to / event
+            // 2. 边界状态：MLog.event("lhdc.link.governor_event",
+            //                       type, fromKbps, toKbps, ceilingKbps, ...)
             if (event.endsWith("lhdc.link.governor_event") || message.contains("lhdc.link.governor_event")) {
-                int from = parseIntField(message, "from");
-                int to = parseIntField(message, "to");
-                String gevent = parseStringField(message, "event");
+                int from = parseIntField(message, "fromKbps");
+                int to = parseIntField(message, "toKbps");
+                String gevent = parseStringField(message, "type");
+                if (gevent == null) gevent = parseStringField(message, "event");
+                boolean locked = "boundary_locked".equals(gevent)
+                        || "quick_failure".equals(gevent);
                 if (from == 500 && to == 900) {
-                    boundaryLocked500to900 = "boundary_locked".equals(gevent)
-                            || "quick_failure".equals(gevent);
+                    boundaryLocked500to900 = locked;
                 } else if (from == 900 && to == 1000) {
-                    boundaryLocked900to1000 = "boundary_locked".equals(gevent)
-                            || "quick_failure".equals(gevent);
+                    boundaryLocked900to1000 = locked;
                 }
             }
 
-            // 3. Reason 计数：扫描消息里所有 reason 关键字
-            for (String[] entry : REASON_TABLE) {
-                String key = entry[0];
-                if (message.contains("reason=" + key) || message.contains("event=" + key)
-                        || event.contains(key)) {
-                    if (message.contains("reason=" + key) || event.contains(key)) {
-                        reasonCount.put(key, reasonCount.getOrDefault(key, 0) + 1);
-                        if (time > 0) {
-                            long prev = reasonLast.getOrDefault(key, 0L);
-                            if (time > prev) reasonLast.put(key, time);
-                        }
+            // 3. Reason 计数：MLog.event("lhdc.link.probe_ceiling",
+            //                          ceilingKbps, reason, ...)
+            //    只在 probe_ceiling 这一类事件里计数，不误算 bqr_summary。
+            if (event.endsWith("lhdc.link.probe_ceiling") || message.contains("lhdc.link.probe_ceiling")) {
+                String reason = parseStringField(message, "reason");
+                if (reason != null && !reason.isEmpty()) {
+                    reasonCount.put(reason, reasonCount.getOrDefault(reason, 0) + 1);
+                    if (time > 0) {
+                        long prev = reasonLast.getOrDefault(reason, 0L);
+                        if (time > prev) reasonLast.put(reason, time);
                     }
                 }
             }
@@ -760,7 +779,10 @@ public final class MasterSwitchActivity extends Activity {
             String v = parseStringField(msg, key);
             if (v == null) return 0;
             try {
-                return Integer.parseInt(v);
+                // 兼容 "12.5" 这类 rateText("%.1f") 输出，只取整数部分。
+                int dot = v.indexOf('.');
+                String head = dot >= 0 ? v.substring(0, dot) : v;
+                return Integer.parseInt(head);
             } catch (NumberFormatException e) {
                 return 0;
             }
