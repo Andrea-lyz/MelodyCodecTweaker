@@ -14,6 +14,8 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -59,6 +61,19 @@ public final class MasterSwitchActivity extends Activity {
     private TextView sessionStatus;
     private Switch launcherSwitch;
     private boolean memorySnapshotRefreshPending;
+    private final Handler refreshHandler = new Handler(Looper.getMainLooper());
+    // Foreground-only heartbeat. Re-reads the latest diagnostic SharedPreferences
+    // every 4s so KPIs and event rows stay live while the user is staring at
+    // the page. Cancelled in onPause() so we stop touching the prefs and stop
+    // driving pref-change observers once the Activity is no longer visible.
+    private static final long REFRESH_INTERVAL_MS = 4_000L;
+    private final Runnable refreshTick = new Runnable() {
+        @Override public void run() {
+            if (isFinishing() || isDestroyed()) return;
+            refresh();
+            refreshHandler.postDelayed(this, REFRESH_INTERVAL_MS);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -82,8 +97,24 @@ public final class MasterSwitchActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        requestRememberedSnapshot();
         refresh();
+        // Start the foreground heartbeat. Cancellable in onPause() so the
+        // diagnostic view never keeps touching SharedPreferences or driving
+        // pref observers while the page is in the background.
+        refreshHandler.removeCallbacks(refreshTick);
+        refreshHandler.postDelayed(refreshTick, REFRESH_INTERVAL_MS);
+    }
+
+    @Override
+    protected void onPause() {
+        refreshHandler.removeCallbacks(refreshTick);
+        super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        refreshHandler.removeCallbacks(refreshTick);
+        super.onDestroy();
     }
 
     private View buildContent() {
@@ -207,7 +238,7 @@ public final class MasterSwitchActivity extends Activity {
         collectLp.leftMargin = dp(10);
         row1.addView(collect, collectLp);
 
-        Button refresh = button("刷新状态", false);
+        Button refresh = button("重抓 Melody 记忆快照", false);
         refresh.setOnClickListener(v -> {
             requestRememberedSnapshot();
             refresh();
@@ -216,6 +247,13 @@ public final class MasterSwitchActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(44));
         refreshLp.topMargin = dp(10);
         card.addView(refresh, refreshLp);
+        TextView refreshHint = bodyText(
+                "诊断页在前台时会自动每 4 秒刷新一次上面的状态与事件；"
+                        + "这个按钮仅用于主动向 Melody 进程请求一次记忆快照。",
+                12,
+                SUBTEXT);
+        refreshHint.setPadding(0, dp(8), 0, 0);
+        card.addView(refreshHint, matchWrap());
         return card;
     }
 
