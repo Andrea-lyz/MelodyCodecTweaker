@@ -16,13 +16,17 @@ final class LhdcLinkHealthController {
     static final int EVENT_UPGRADE_STABLE = 2;
 
     static final long QUICK_FAILURE_HISTORY_MS = 5 * 60_000L;
-    static final int[] REQUIRED_HEALTHY_WINDOWS = {3, 5, 10};
-    static final long[] REQUIRED_QUIET_MS = {30_000L, 60_000L, 120_000L};
+    static final int[] REQUIRED_HEALTHY_WINDOWS = {3, 4, 5};
+    static final long[] REQUIRED_QUIET_MS = {15_000L, 30_000L, 45_000L};
     static final long MIN_BQR_INTERVAL_MS = 3_000L;
     static final long MAX_BQR_INTERVAL_MS = 15_000L;
-    static final int MAX_UNUSED_AFH_CHANNELS = 39;
-    static final double MAX_RETRANSMISSIONS_PER_SECOND = 25.0;
-    static final double MAX_NO_RX_PER_SECOND = 25.0;
+    static final int MAX_UNUSED_AFH_CHANNELS = 49;
+    static final double MAX_RETRANSMISSIONS_PER_SECOND = 60.0;
+    static final double MAX_NO_RX_PER_SECOND = 60.0;
+    static final int MIN_PROBE_STABLE_WINDOWS = 3;
+    static final long MIN_PROBE_COOLDOWN_MS = 10_000L;
+    static final long MIN_RECONNECT_GAP_MS = 5_000L;
+    static final long LOCK_DECAY_MS = 10 * 60_000L;
 
     interface Listener {
         void onProbeCeilingChanged(String mac, int ceilingKbps, String reason);
@@ -121,6 +125,10 @@ final class LhdcLinkHealthController {
         long lastCongestionMs;
         long lowQueueSinceMs;
         int lastPublishedCeiling = -1;
+        long lastProbeOpenedMs;
+        int probeStableBqrWindows;
+        long lastRecoveryActionMs;
+        long lastSeenStreamingMs;
     }
 
     private final Map<String, DeviceState> devices = new HashMap<>();
@@ -133,12 +141,39 @@ final class LhdcLinkHealthController {
 
     synchronized void activate(String mac, long nowMs) {
         if (mac == null || mac.isEmpty()) return;
-        boolean changed = !mac.equals(activeMac);
+        boolean sameMac = mac.equals(activeMac);
         activeMac = mac;
         DeviceState state = stateFor(mac);
-        if (changed) state.lastPublishedCeiling = -1;
+        // Treat every A2DP re-attach of the active device — even when it is
+        // the same MAC within the Bluetooth process lifetime — as the start
+        // of a fresh LHDC learning window once a meaningful streaming gap
+        // has passed. The previous session's locks only reflect a session
+        // that is no longer in progress. Switching to a different MAC does
+        // NOT clear the per-MAC learning for the device we are leaving.
+        boolean stale = sameMac
+                && state.lastSeenStreamingMs != 0L
+                && nowMs - state.lastSeenStreamingMs >= MIN_RECONNECT_GAP_MS;
+        if (stale) {
+            resetLearnedBoundary(state);
+        }
+        state.lastRecoveryActionMs = nowMs;
+        state.lastSeenStreamingMs = nowMs;
+        // Always announce the current ceiling once on activate so listeners
+        // get a fresh snapshot of the device we just attached to.
+        if (!sameMac) state.lastPublishedCeiling = -1;
         maybeOpenRecoveryProbe(mac, state, nowMs);
         publishCeiling(mac, state, "device_active");
+    }
+
+    private static void resetLearnedBoundary(DeviceState state) {
+        clearBoundary(state.to900);
+        clearBoundary(state.to1000);
+        state.lastCongestionMs = 0L;
+        state.lowQueueSinceMs = 0L;
+        state.lastProbeOpenedMs = 0L;
+        state.probeStableBqrWindows = 0;
+        state.lastRecoveryActionMs = 0L;
+        state.lastPublishedCeiling = -1;
     }
 
     synchronized String activeMac() {
@@ -165,12 +200,35 @@ final class LhdcLinkHealthController {
                     && state.retransmissionsPerSecond <= MAX_RETRANSMISSIONS_PER_SECOND
                     && state.noRxPerSecond <= MAX_NO_RX_PER_SECOND;
             state.healthyBqrWindows = healthy ? state.healthyBqrWindows + 1 : 0;
+            applyEvidenceTierDecay(state, nowMs);
+            BoundaryState inFlight = state.to900.probeInFlight ? state.to900
+                    : state.to1000.probeInFlight ? state.to1000 : null;
+            if (inFlight != null) {
+                if (healthy) {
+                    state.probeStableBqrWindows++;
+                } else {
+                    state.probeStableBqrWindows = 0;
+                }
+                if (state.probeStableBqrWindows >= MIN_PROBE_STABLE_WINDOWS
+                        && cancelRecoveryProbes(state, false)) {
+                    state.lastProbeOpenedMs = 0L;
+                    publishCeiling(mac, state, "probe_stable");
+                } else if (state.probeStableBqrWindows == 0
+                        && cancelRecoveryProbes(state, false)) {
+                    publishCeiling(mac, state, "probe_health_lost");
+                }
+            } else if (state.healthyBqrWindows == 0
+                    && cancelRecoveryProbes(state, false)) {
+                publishCeiling(mac, state, "probe_health_lost");
+            }
         } else {
             state.retransmissionsPerSecond = Double.NaN;
             state.noRxPerSecond = Double.NaN;
             state.healthyBqrWindows = 0;
+            state.probeStableBqrWindows = 0;
             state.lowQueueSinceMs = 0L;
         }
+        if (streaming) state.lastSeenStreamingMs = nowMs;
         if (mac.equals(activeMac)) {
             if (!streaming) {
                 state.lowQueueSinceMs = 0L;
@@ -178,9 +236,6 @@ final class LhdcLinkHealthController {
                     publishCeiling(mac, state, "probe_stream_idle");
                 }
                 return;
-            }
-            if (state.healthyBqrWindows == 0 && cancelRecoveryProbes(state, false)) {
-                publishCeiling(mac, state, "probe_health_lost");
             }
             maybeOpenRecoveryProbe(mac, state, nowMs);
         }
@@ -222,6 +277,7 @@ final class LhdcLinkHealthController {
         BoundaryState boundary = boundaryFor(state, fromKbps, toKbps);
         if (boundary == null) return;
         if (event == EVENT_QUICK_FAILURE) {
+            state.lastRecoveryActionMs = nowMs;
             noteCongestion(state, nowMs);
             if (boundary.recoveryAttempt) {
                 boundary.probeInFlight = false;
@@ -287,9 +343,44 @@ final class LhdcLinkHealthController {
                 && nowMs - state.lastCongestionMs < quietMs)) {
             return;
         }
+        if (state.lastProbeOpenedMs != 0L
+                && nowMs - state.lastProbeOpenedMs < MIN_PROBE_COOLDOWN_MS) {
+            return;
+        }
         boundary.probeInFlight = true;
         boundary.recoveryAttempt = true;
+        state.lastProbeOpenedMs = nowMs;
+        state.probeStableBqrWindows = 0;
         publishCeiling(mac, state, "healthy_recovery_probe");
+    }
+
+    private static void applyEvidenceTierDecay(DeviceState state, long nowMs) {
+        if (state.lastRecoveryActionMs == 0L) return;
+        long elapsed = nowMs - state.lastRecoveryActionMs;
+        if (elapsed < LOCK_DECAY_MS) return;
+        int steps = (int) (elapsed / LOCK_DECAY_MS);
+        if (steps <= 0) return;
+        state.lastRecoveryActionMs = nowMs;
+        decayBoundary(state.to900, steps);
+        decayBoundary(state.to1000, steps);
+    }
+
+    private static void decayBoundary(BoundaryState boundary, int steps) {
+        if (!boundary.locked) return;
+        int target = boundary.evidenceTier - steps;
+        if (target > 0) {
+            boundary.evidenceTier = target;
+            return;
+        }
+        // Reaching tier 0 means we have given up the prior evidence and
+        // start over with the base threshold; unlock so the controller can
+        // re-evaluate the boundary against fresh data.
+        boundary.evidenceTier = 0;
+        boundary.locked = false;
+        boundary.quickFailureCount = 0;
+        boundary.firstQuickFailureMs = 0L;
+        boundary.probeInFlight = false;
+        boundary.recoveryAttempt = false;
     }
 
     private void publishCeiling(String mac, DeviceState state, String reason) {
