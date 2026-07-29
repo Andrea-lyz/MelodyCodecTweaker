@@ -16,18 +16,31 @@ import xyz.melodylsp.codec.util.TrustedBroadcasts;
 /** A2DP codec endpoint running inside {@code com.android.bluetooth}. */
 public final class CodecBroadcastBridge {
 
+    interface GovernorPolicyListener {
+        void onPolicyChanged(String mac, int policy, String reason);
+    }
+
     private static final long[] GOVERNOR_INSTALL_RETRY_DELAYS_MS = {
             200L, 500L, 1_000L, 2_500L, 5_000L
     };
 
     private final Context context;
     private final CodecBridgeService service;
+    private final GovernorPolicyListener governorPolicyListener;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile boolean registered;
 
     public CodecBroadcastBridge(Context context, CodecBridgeService service) {
+        this(context, service, null);
+    }
+
+    CodecBroadcastBridge(
+            Context context,
+            CodecBridgeService service,
+            GovernorPolicyListener governorPolicyListener) {
         this.context = context.getApplicationContext();
         this.service = service;
+        this.governorPolicyListener = governorPolicyListener;
     }
 
     public synchronized void register() {
@@ -108,6 +121,9 @@ public final class CodecBroadcastBridge {
                 String reason = intent.getStringExtra(CodecIpc.EXTRA_LHDC_POLICY_REASON);
                 boolean applied = NativeLhdcMemoryPatch.setGovernorPolicy(policy);
                 if (applied) scheduleGovernorInstallRetries();
+                if (applied && governorPolicyListener != null) {
+                    governorPolicyListener.onPolicyChanged(mac, policy, reason);
+                }
                 MLog.event("lhdc.governor.policy",
                         "applied", applied,
                         "policy", policy,

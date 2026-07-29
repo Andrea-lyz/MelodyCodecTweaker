@@ -183,6 +183,16 @@ final class NativeLhdcMemoryPatch {
         }
     }
 
+    static long currentGovernorSessionEpoch() {
+        if (!governorInstalled || !nativeLoaded) return 0L;
+        try {
+            return nativeGetGovernorSessionEpoch();
+        } catch (Throwable t) {
+            MLog.w("lhdc governor session epoch read failed", t);
+            return 0L;
+        }
+    }
+
     static void reportQueueLength(int length) {
         if (length < 0 || !shouldSampleQueue()) return;
         try {
@@ -200,8 +210,9 @@ final class NativeLhdcMemoryPatch {
             int event = (int) (packed & 0xffL);
             int fromKbps = bitrateForNativeRate((int) ((packed >>> 8) & 0xffL));
             int toKbps = bitrateForNativeRate((int) ((packed >>> 16) & 0xffL));
+            long detailMs = packed >>> 24;
             if (fromKbps == 0 || toKbps == 0) return null;
-            return new GovernorEvent(event, fromKbps, toKbps);
+            return new GovernorEvent(event, fromKbps, toKbps, detailMs);
         } catch (Throwable t) {
             MLog.w("lhdc governor event read failed", t);
             return null;
@@ -220,11 +231,13 @@ final class NativeLhdcMemoryPatch {
         final int type;
         final int fromKbps;
         final int toKbps;
+        final long detailMs;
 
-        GovernorEvent(int type, int fromKbps, int toKbps) {
+        GovernorEvent(int type, int fromKbps, int toKbps, long detailMs) {
             this.type = type;
             this.fromKbps = fromKbps;
             this.toKbps = toKbps;
+            this.detailMs = detailMs;
         }
     }
 
@@ -640,6 +653,8 @@ final class NativeLhdcMemoryPatch {
     private static native int nativeGetGovernorBitrateKbps();
 
     private static native boolean nativeIsGovernorStreaming();
+
+    private static native long nativeGetGovernorSessionEpoch();
 
     private static native void nativeReportQueueLength(int length);
 

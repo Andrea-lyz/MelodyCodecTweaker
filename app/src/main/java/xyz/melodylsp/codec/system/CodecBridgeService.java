@@ -132,7 +132,7 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
     }
 
     /** Called from the {@code codecConfigUpdated} hook. */
-    void notifyCodecChanged(Object[] args) {
+    CodecSnapshot notifyCodecChanged(Object[] args) {
         // Best-effort: derive a snapshot from the args if possible. We pass through an empty
         // snapshot if the args do not contain (BluetoothDevice, BluetoothCodecStatus).
         BluetoothDevice device = null;
@@ -147,13 +147,13 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
                 }
             }
         }
-        if (device == null || status == null) return;
+        if (device == null || status == null) return null;
         CodecSnapshot snapshot;
         try {
             snapshot = decode(device.getAddress(), status);
         } catch (Throwable t) {
             MLog.w("notifyCodecChanged decode failed", t);
-            return;
+            return null;
         }
         int n = listeners.beginBroadcast();
         try {
@@ -166,6 +166,7 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
         } finally {
             listeners.finishBroadcast();
         }
+        return snapshot;
     }
 
     private CodecSnapshot decode(String mac, Object status) throws Exception {

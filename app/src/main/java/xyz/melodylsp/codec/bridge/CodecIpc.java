@@ -26,6 +26,10 @@ public final class CodecIpc {
             "xyz.melodylsp.codec.action.GAME_MODE_STATE";
     public static final String ACTION_SET_LHDC_POLICY =
             "xyz.melodylsp.codec.action.SET_LHDC_POLICY";
+    public static final String ACTION_LHDC_DIAGNOSTIC_LIVE_CONTROL =
+            "xyz.melodylsp.codec.action.LHDC_DIAGNOSTIC_LIVE_CONTROL";
+    public static final String ACTION_LHDC_DIAGNOSTIC_LIVE_SAMPLE =
+            "xyz.melodylsp.codec.action.LHDC_DIAGNOSTIC_LIVE_SAMPLE";
 
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_REQUEST_ID = "request_id";
@@ -69,6 +73,8 @@ public final class CodecIpc {
     public static final String EXTRA_GAME_MODE_TTL_MS = "game_mode_ttl_ms";
     public static final String EXTRA_LHDC_POLICY = "lhdc_policy";
     public static final String EXTRA_LHDC_POLICY_REASON = "lhdc_policy_reason";
+    public static final String EXTRA_DIAGNOSTIC_LIVE_ENABLED = "diagnostic_live_enabled";
+    public static final String EXTRA_DIAGNOSTIC_LIVE_PAYLOAD = "diagnostic_live_payload";
 
     public static final String TOKEN = "mlcdc-codec-v1";
 

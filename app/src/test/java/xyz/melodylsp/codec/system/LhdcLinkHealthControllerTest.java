@@ -54,32 +54,31 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
-    public void recoveryRequiresThreeHealthyBqrWindowsAndQuietQueue() {
+    public void recoveryRequiresFreshHealthyBqrAndQuietQueue() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = lockedTo500(recorder);
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
         controller.onQueueSample(MAC, 0, 45, 10_100L);
         controller.onBqrSample(MAC, healthyBqr(), 16_000L);
         controller.onBqrSample(MAC, healthyBqr(), 22_000L);
-        // A busy queue sample just before the third healthy window closes
-        // the quiet window so the probe cannot open.
         controller.onQueueSample(MAC, 30, 45, 27_500L);
         controller.onBqrSample(MAC, healthyBqr(), 28_000L);
-        assertEquals(500, controller.snapshot(MAC, 40_000L).ceilingKbps);
+        assertEquals(500, controller.snapshot(MAC, 28_000L).ceilingKbps);
 
-        // Re-arm a low queue well past the quiet window and the probe opens.
-        controller.onQueueSample(MAC, 0, 45, 50_100L);
-        controller.onQueueSample(MAC, 0, 45, 70_100L);
-        LhdcLinkHealthController.Snapshot snapshot =
-                controller.snapshot(MAC, 70_100L);
+        controller.onQueueSample(MAC, 0, 45, 28_100L);
+        controller.onBqrSample(MAC, healthyBqr(), 34_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 40_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 46_000L);
+        LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 46_000L);
         assertEquals(900, snapshot.ceilingKbps);
-        assertFalse(snapshot.boundary500To900Locked);
+        assertEquals("probing", snapshot.probePhase);
+        assertEquals("waiting_native_upgrade", snapshot.blockedReason);
         assertEquals("900:healthy_recovery_probe",
                 recorder.events.get(recorder.events.size() - 1));
     }
 
     @Test
-    public void currentDeviceBqrValuesDoNotPassHealthyGate() {
+    public void currentBadEnvironmentDoesNotPassHealthyGate() {
         LhdcLinkHealthController controller = lockedTo500(null);
         controller.onBqrSample(MAC, unhealthyCurrentEnvironment(), 10_000L);
         controller.onQueueSample(MAC, 0, 45, 10_100L);
@@ -87,29 +86,33 @@ public final class LhdcLinkHealthControllerTest {
             controller.onBqrSample(MAC, unhealthyCurrentEnvironment(),
                     10_000L + i * 6_000L);
         }
-        controller.onQueueSample(MAC, 0, 45, 50_000L);
-        LhdcLinkHealthController.Snapshot snapshot =
-                controller.snapshot(MAC, 50_000L);
+        controller.onQueueSample(MAC, 0, 45, 40_100L);
+        LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 40_100L);
         assertEquals(500, snapshot.ceilingKbps);
         assertEquals(0, snapshot.healthyBqrWindows);
         assertEquals(20, snapshot.usableAfhChannels);
         assertTrue(snapshot.retransmissionsPerSecond > 60.0);
         assertTrue(snapshot.noRxPerSecond > 60.0);
+        assertEquals("waiting_healthy_bqr", snapshot.blockedReason);
     }
 
     @Test
-    public void failedRecoveryProbeEscalatesRequiredHealthEvidence() {
+    public void failedRecoveryProbeEscalatesEvidenceAndCarriesNativeBackoff() {
         LhdcLinkHealthController controller = lockedTo500(null);
         long probeAt = openHealthyProbe(controller);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_APPLIED,
+                500, 900, 0L, probeAt + 200L);
 
         controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
-                500, 900, probeAt + 2_000L);
+                500, 900, 30_000L, probeAt + 2_000L);
         LhdcLinkHealthController.Snapshot snapshot =
                 controller.snapshot(MAC, probeAt + 2_000L);
         assertEquals(500, snapshot.ceilingKbps);
         assertTrue(snapshot.boundary500To900Locked);
         assertEquals(4, snapshot.requiredHealthyBqrWindows);
         assertEquals(30_000L, snapshot.requiredQuietMs);
+        assertEquals(30_000L, snapshot.nativeBackoffRemainingMs);
+        assertEquals("native_backoff", snapshot.blockedReason);
     }
 
     @Test
@@ -123,32 +126,47 @@ public final class LhdcLinkHealthControllerTest {
                 controller.snapshot(MAC, probeAt + 6_000L);
         assertEquals(500, snapshot.ceilingKbps);
         assertEquals(0, snapshot.healthyBqrWindows);
-        assertEquals(3, snapshot.requiredHealthyBqrWindows);
-        assertEquals(15_000L, snapshot.requiredQuietMs);
+        assertEquals("stream_idle", snapshot.blockedReason);
+    }
+
+    @Test
+    public void nativeUpgradeAppliedMovesProbeIntoVerification() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_APPLIED,
+                500, 900, 0L, probeAt + 200L);
+        LhdcLinkHealthController.Snapshot snapshot =
+                controller.snapshot(MAC, probeAt + 200L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertEquals("verifying", snapshot.probePhase);
+        assertEquals("verifying_native_upgrade", snapshot.blockedReason);
     }
 
     @Test
     public void stableRecoveryClearsBoundaryLearning() {
         LhdcLinkHealthController controller = lockedTo500(null);
         long probeAt = openHealthyProbe(controller);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_APPLIED,
+                500, 900, 0L, probeAt + 200L);
 
         controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_STABLE,
-                500, 900, probeAt + 60_000L);
+                500, 900, 0L, probeAt + 60_000L);
         LhdcLinkHealthController.Snapshot snapshot =
                 controller.snapshot(MAC, probeAt + 60_000L);
         assertEquals(1000, snapshot.ceilingKbps);
         assertFalse(snapshot.boundary500To900Locked);
-        assertEquals(0, snapshot.requiredHealthyBqrWindows);
-        assertEquals(0L, snapshot.requiredQuietMs);
+        assertEquals("stable", snapshot.probePhase);
+        assertEquals("none", snapshot.blockedReason);
     }
 
     @Test
-    public void ordinaryReconnectRestoresPerMacCeiling() {
+    public void ordinaryDeviceSwitchRestoresPerMacCeiling() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = lockedTo500(recorder);
-        controller.activate("AA:BB:CC:DD:EE:02", 3_000L);
-        assertEquals(1000,
-                controller.snapshot("AA:BB:CC:DD:EE:02", 3_000L).ceilingKbps);
+        String other = "AA:BB:CC:DD:EE:02";
+        controller.activate(other, 3_000L);
+        assertEquals(1000, controller.snapshot(other, 3_000L).ceilingKbps);
 
         controller.activate(MAC, 4_000L);
         assertEquals(500, controller.snapshot(MAC, 4_000L).ceilingKbps);
@@ -156,112 +174,244 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
-    public void reconnectClearsPersistedLocksForSameMac() {
-        Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = lockedTo500(recorder);
-        assertEquals(500, controller.snapshot(MAC, 2_000L).ceilingKbps);
-
-        // Same MAC re-attaches after a >5s streaming gap (e.g. Bluetooth
-        // process stayed up but the link dropped and came back). The lock
-        // should NOT survive the re-attach.
+    public void repeatedActivateForEveryBqrIsIdempotent() {
+        LhdcLinkHealthController controller = lockedTo500(null);
         controller.activate(MAC, 10_000L);
-        LhdcLinkHealthController.Snapshot snapshot =
-                controller.snapshot(MAC, 10_000L);
-        assertEquals(1000, snapshot.ceilingKbps);
-        assertFalse(snapshot.boundary500To900Locked);
-        assertEquals("1000:device_active",
-                recorder.events.get(recorder.events.size() - 1));
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);
+        controller.onQueueSample(MAC, 0, 45, 10_100L);
+        controller.activate(MAC, 16_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 16_000L);
+        controller.activate(MAC, 22_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 22_000L);
+        controller.activate(MAC, 28_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 28_000L);
+
+        LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 28_000L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertEquals("probing", snapshot.probePhase);
     }
 
     @Test
-    public void backToBackActivateOnSameMacPreservesLock() {
-        Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = lockedTo500(recorder);
-        // Within the MIN_RECONNECT_GAP window, re-attaching the same MAC
-        // does not reset the lock — short A2DP bounces should not flush
-        // the learning state.
-        controller.activate(MAC, 4_000L);
-        LhdcLinkHealthController.Snapshot snapshot =
-                controller.snapshot(MAC, 4_000L);
+    public void sameMacGapDoesNotEraseLearnedLock() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        controller.activate(MAC, 60_000L);
+        LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 60_000L);
         assertEquals(500, snapshot.ceilingKbps);
         assertTrue(snapshot.boundary500To900Locked);
     }
 
     @Test
-    public void reconnectRecoversImmediatelyWithBqrSamples() {
+    public void explicitSessionExitClearsLearnedLockBeforeReconnect() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = lockedTo500(recorder);
-        controller.activate(MAC, 10_000L);
-        assertEquals(1000, controller.snapshot(MAC, 10_000L).ceilingKbps);
 
-        // A couple of healthy BQR samples right after re-attach should be
-        // sufficient to keep the boundary unlocked.
-        controller.onBqrSample(MAC, healthyBqr(), 20_000L);
-        controller.onQueueSample(MAC, 0, 45, 20_100L);
-        controller.onBqrSample(MAC, healthyBqr(), 26_000L);
-        LhdcLinkHealthController.Snapshot snapshot =
-                controller.snapshot(MAC, 26_000L);
-        assertEquals(1000, snapshot.ceilingKbps);
-        assertFalse(snapshot.boundary500To900Locked);
+        assertTrue(controller.resetDevice(MAC, 3_000L, "a2dp_disconnected"));
+        assertEquals(null, controller.activeMac());
+        LhdcLinkHealthController.Snapshot reset = controller.snapshot(MAC, 3_000L);
+        assertEquals(1000, reset.ceilingKbps);
+        assertFalse(reset.boundary500To900Locked);
+        assertEquals("1000:a2dp_disconnected",
+                recorder.events.get(recorder.events.size() - 1));
+
+        controller.activate(MAC, 4_000L);
+        LhdcLinkHealthController.Snapshot reconnected = controller.snapshot(MAC, 4_000L);
+        assertEquals(1000, reconnected.ceilingKbps);
+        assertFalse(reconnected.boundary500To900Locked);
     }
 
     @Test
-    public void probeCooldownPreventsBackToBackProbes() {
-        Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = lockedTo500(recorder);
-        long firstProbeAt = openHealthyProbe(controller);
-        assertEquals(900, controller.snapshot(MAC, firstProbeAt).ceilingKbps);
-
-        // Cancel the probe right away by toggling the device to idle. The
-        // cooldown should now prevent another probe from opening for at least
-        // 10 seconds, even when the queue is quiet.
-        controller.onBqrSample(MAC, healthyBqr(), firstProbeAt + 6_000L, false);
-        assertEquals(500, controller.snapshot(MAC, firstProbeAt + 6_000L).ceilingKbps);
-
-        // Re-establish health quickly. Without the cooldown, the next healthy
-        // BQR after going streaming would immediately reopen a probe.
-        controller.onBqrSample(MAC, healthyBqr(), firstProbeAt + 7_000L, true);
-        controller.onQueueSample(MAC, 0, 45, firstProbeAt + 7_100L);
-        assertEquals(500,
-                controller.snapshot(MAC, firstProbeAt + 7_100L).ceilingKbps);
-
-        // After the cooldown elapses, the next healthy samples + quiet queue
-        // should reopen the probe.
-        controller.onBqrSample(MAC, healthyBqr(), firstProbeAt + 16_000L, true);
-        controller.onQueueSample(MAC, 0, 45, firstProbeAt + 16_100L);
-        controller.onBqrSample(MAC, healthyBqr(), firstProbeAt + 22_000L, true);
-        controller.onBqrSample(MAC, healthyBqr(), firstProbeAt + 28_000L, true);
-        controller.onQueueSample(MAC, 0, 45, firstProbeAt + 31_000L);
-        assertEquals(900,
-                controller.snapshot(MAC, firstProbeAt + 31_000L).ceilingKbps);
-    }
-
-    @Test
-    public void lockDecaysAfterTenMinutesOfHealth() {
-        Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = lockedTo500(recorder);
-
-        // Escalate evidenceTier by failing a recovery probe.
+    public void nativeStreamGenerationResetsEvidenceButPreservesLearnedLock() {
+        LhdcLinkHealthController controller = lockedTo500(null);
         long probeAt = openHealthyProbe(controller);
-        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
-                500, 900, probeAt + 2_000L);
-        LhdcLinkHealthController.Snapshot afterFail =
-                controller.snapshot(MAC, probeAt + 2_000L);
-        assertEquals(4, afterFail.requiredHealthyBqrWindows);
-        assertEquals(30_000L, afterFail.requiredQuietMs);
+        assertEquals(900, controller.snapshot(MAC, probeAt).ceilingKbps);
 
-        // The decay check runs whenever a BQR arrives inside the valid
-        // 3-15s interval. Land two samples straddling the 10-minute boundary
-        // so the second one sees >LOCK_DECAY_MS of health.
-        long anchor = probeAt + 2_000L + 10 * 60_000L;
-        controller.onBqrSample(MAC, healthyBqr(), anchor);
-        controller.onBqrSample(MAC, healthyBqr(), anchor + 6_000L);
+        controller.onStreamSessionChanged(MAC, 7L, probeAt + 1_000L);
         LhdcLinkHealthController.Snapshot snapshot =
-                controller.snapshot(MAC, anchor + 6_000L);
-        assertEquals(1000, snapshot.ceilingKbps);
+                controller.snapshot(MAC, probeAt + 1_000L);
+        assertEquals(500, snapshot.ceilingKbps);
+        assertTrue(snapshot.boundary500To900Locked);
+        assertEquals(0, snapshot.healthyBqrWindows);
+        assertEquals(7L, snapshot.streamSessionId);
+        assertEquals("stream_idle", snapshot.blockedReason);
+    }
+
+    @Test
+    public void threeHealthyProbeWindowsDoNotMistakeCeilingForStableUpgrade() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onBqrSample(MAC, healthyBqr(), probeAt + 6_000L);
+        controller.onBqrSample(MAC, healthyBqr(), probeAt + 12_000L);
+        controller.onBqrSample(MAC, healthyBqr(), probeAt + 18_000L);
+
+        LhdcLinkHealthController.Snapshot snapshot =
+                controller.snapshot(MAC, probeAt + 18_000L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertEquals("probing", snapshot.probePhase);
         assertFalse(snapshot.boundary500To900Locked);
-        assertEquals(0, snapshot.requiredHealthyBqrWindows);
-        assertEquals(0L, snapshot.requiredQuietMs);
+    }
+
+    @Test
+    public void walkingLogBorderlineSampleDoesNotRevokeProbe() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+
+        // 159 / 6s = 26.5/s and 154 / 6s = 25.7/s: the real walking trace sample
+        // that previously revoked a probe after only five to six seconds.
+        controller.onBqrSample(MAC, borderlineWalkingBqr(), probeAt + 6_000L);
+        LhdcLinkHealthController.Snapshot snapshot =
+                controller.snapshot(MAC, probeAt + 6_000L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertEquals("probing", snapshot.probePhase);
+        assertEquals(0, snapshot.probeBadBqrWindows);
+    }
+
+    @Test
+    public void sustainedMildBadBqrWaitsForNativeWindowBeforeRevokingProbe() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onBqrSample(MAC, mildlyBadProbeBqr(), probeAt + 6_000L);
+        controller.onBqrSample(MAC, mildlyBadProbeBqr(), probeAt + 12_000L);
+        assertEquals(900, controller.snapshot(MAC, probeAt + 12_000L).ceilingKbps);
+
+        controller.onQueueSample(MAC, 0, 45, probeAt + 15_100L);
+        LhdcLinkHealthController.Snapshot snapshot =
+                controller.snapshot(MAC, probeAt + 15_100L);
+        assertEquals(500, snapshot.ceilingKbps);
+        assertEquals("locked", snapshot.probePhase);
+    }
+
+    @Test
+    public void missingBqrWindowDoesNotLookLikeCongestionOrRevokeProbe() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onBqrSample(MAC, healthyBqr(), probeAt + 30_000L);
+
+        LhdcLinkHealthController.Snapshot snapshot =
+                controller.snapshot(MAC, probeAt + 30_000L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertEquals("probing", snapshot.probePhase);
+    }
+
+    @Test
+    public void severeBqrRevokesProbeImmediately() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onBqrSample(MAC, severeBqr(), probeAt + 6_000L);
+        assertEquals(500, controller.snapshot(MAC, probeAt + 6_000L).ceilingKbps);
+    }
+
+    @Test
+    public void queueCriticalRequiresHoldButQueueFullAndChoppyAreImmediate() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onQueueSample(MAC, 41, 45, probeAt + 100L);
+        controller.onQueueSample(MAC, 41, 45, probeAt + 300L);
+        assertEquals(900, controller.snapshot(MAC, probeAt + 300L).ceilingKbps);
+        controller.onQueueSample(MAC, 41, 45, probeAt + 500L);
+        assertEquals(500, controller.snapshot(MAC, probeAt + 500L).ceilingKbps);
+
+        // Re-open using a fresh controller to prove the two emergency paths independently.
+        controller = lockedTo500(null);
+        probeAt = openHealthyProbe(controller);
+        controller.onQueueSample(MAC, 45, 45, probeAt + 100L);
+        assertEquals(500, controller.snapshot(MAC, probeAt + 100L).ceilingKbps);
+
+        controller = lockedTo500(null);
+        probeAt = openHealthyProbe(controller);
+        controller.onCongestion(MAC, probeAt + 100L);
+        assertEquals(500, controller.snapshot(MAC, probeAt + 100L).ceilingKbps);
+    }
+
+    @Test
+    public void nativeBackoffPreventsCeilingOnlyRetry() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_APPLIED,
+                500, 900, 0L, probeAt + 100L);
+        long failedAt = probeAt + 2_000L;
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 60_000L, failedAt);
+        controller.onQueueSample(MAC, 0, 45, failedAt + 100L);
+        for (long at = failedAt + 6_000L; at < failedAt + 60_000L; at += 6_000L) {
+            controller.onBqrSample(MAC, healthyBqr(), at);
+            controller.onQueueSample(MAC, 0, 45, at + 100L);
+        }
+        assertEquals(500,
+                controller.snapshot(MAC, failedAt + 59_000L).ceilingKbps);
+
+        controller.onBqrSample(MAC, healthyBqr(), failedAt + 60_000L);
+        controller.onQueueSample(MAC, 0, 45, failedAt + 60_100L);
+        assertEquals(900,
+                controller.snapshot(MAC, failedAt + 60_100L).ceilingKbps);
+    }
+
+    @Test
+    public void badEnvironmentCannotDecayOrUnlockBoundaryAfterTenMinutes() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_APPLIED,
+                500, 900, 0L, probeAt + 100L);
+        long failedAt = probeAt + 2_000L;
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 30_000L, failedAt);
+        for (int i = 1; i <= 105; i++) {
+            long at = failedAt + i * 6_000L;
+            controller.onQueueSample(MAC, 0, 45, at - 100L);
+            controller.onBqrSample(MAC, unhealthyCurrentEnvironment(), at);
+        }
+        LhdcLinkHealthController.Snapshot snapshot =
+                controller.snapshot(MAC, failedAt + 105 * 6_000L);
+        assertEquals(500, snapshot.ceilingKbps);
+        assertTrue(snapshot.boundary500To900Locked);
+        assertEquals(4, snapshot.requiredHealthyBqrWindows);
+    }
+
+    @Test
+    public void healthyDecayRelaxesTierButNeverBypassesProbe() {
+        LhdcLinkHealthController controller = lockedTo500(null);
+        long probeAt = openHealthyProbe(controller);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_APPLIED,
+                500, 900, 0L, probeAt + 100L);
+        long failedAt = probeAt + 2_000L;
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 1_000_000L, failedAt);
+        controller.onQueueSample(MAC, 0, 45, failedAt + 100L);
+        for (int i = 1; i <= 102; i++) {
+            long at = failedAt + i * 6_000L;
+            controller.onBqrSample(MAC, healthyBqr(), at);
+            controller.onQueueSample(MAC, 0, 45, at + 100L);
+        }
+        LhdcLinkHealthController.Snapshot snapshot =
+                controller.snapshot(MAC, failedAt + 102 * 6_000L + 100L);
+        assertEquals(500, snapshot.ceilingKbps);
+        assertTrue(snapshot.boundary500To900Locked);
+        assertEquals(3, snapshot.requiredHealthyBqrWindows);
+        assertEquals("native_backoff", snapshot.blockedReason);
+    }
+
+    @Test
+    public void boundaryStateChangeIsPublishedWhenEffectiveCeilingIsUnchanged() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 1_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 2_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                900, 1000, 3_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                900, 1000, 4_000L);
+
+        long probeAt = openHealthyProbe(controller);
+        assertEquals(900, controller.snapshot(MAC, probeAt).ceilingKbps);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_UPGRADE_STABLE,
+                500, 900, probeAt + 1_000L);
+
+        assertFalse(controller.snapshot(MAC, probeAt + 1_000L).boundary500To900Locked);
+        assertTrue(controller.snapshot(MAC, probeAt + 1_000L).boundary900To1000Locked);
+        assertEquals("900:boundary_stable",
+                recorder.stateEvents.get(recorder.stateEvents.size() - 1));
     }
 
     private static LhdcLinkHealthController lockedTo500(Recorder recorder) {
@@ -279,19 +429,28 @@ public final class LhdcLinkHealthControllerTest {
         controller.onQueueSample(MAC, 0, 45, 10_100L);
         controller.onBqrSample(MAC, healthyBqr(), 16_000L);
         controller.onBqrSample(MAC, healthyBqr(), 22_000L);
-        // Busy sample resets the quiet clock, then low samples straddle the
-        // 15s quiet window so the third healthy window eventually opens the
-        // probe.
-        controller.onQueueSample(MAC, 30, 45, 27_500L);
         controller.onBqrSample(MAC, healthyBqr(), 28_000L);
-        controller.onQueueSample(MAC, 0, 45, 70_101L);
-        controller.onQueueSample(MAC, 0, 45, 90_101L);
-        return 90_101L;
+        return 28_000L;
     }
 
     private static LhdcLinkHealthController.BqrSample healthyBqr() {
         return new LhdcLinkHealthController.BqrSample(
                 30, 0, 90, 60, 2, -45, 10, 0, 0);
+    }
+
+    private static LhdcLinkHealthController.BqrSample borderlineWalkingBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                50, 0, 159, 154, 2, -50, 8, 0, 0);
+    }
+
+    private static LhdcLinkHealthController.BqrSample mildlyBadProbeBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                60, 0, 600, 600, 4, -55, 4, 0, 0);
+    }
+
+    private static LhdcLinkHealthController.BqrSample severeBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                70, 0, 900, 900, 20, -75, 0, 0, 0);
     }
 
     private static LhdcLinkHealthController.BqrSample unhealthyCurrentEnvironment() {
@@ -301,10 +460,16 @@ public final class LhdcLinkHealthControllerTest {
 
     private static final class Recorder implements LhdcLinkHealthController.Listener {
         final List<String> events = new ArrayList<>();
+        final List<String> stateEvents = new ArrayList<>();
 
         @Override
         public void onProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
             events.add(ceilingKbps + ":" + reason);
+        }
+
+        @Override
+        public void onProbeStateChanged(String mac, int ceilingKbps, String reason) {
+            stateEvents.add(ceilingKbps + ":" + reason);
         }
     }
 }

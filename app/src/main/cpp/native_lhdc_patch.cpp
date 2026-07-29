@@ -82,6 +82,7 @@ constexpr uint64_t kUpgradeBackoffStepsMs[] = {
 };
 constexpr uint32_t kGovernorEventQuickFailure = 1;
 constexpr uint32_t kGovernorEventUpgradeStable = 2;
+constexpr uint32_t kGovernorEventUpgradeApplied = 3;
 
 using SetTargetBitrateFn = int32_t (*)(void*, uint32_t);
 using GetBitrateFn = int32_t (*)(void*, uint32_t*);
@@ -101,6 +102,7 @@ std::atomic<uint64_t> g_choppy_sequence{0};
 std::atomic<int> g_choppy_level{0};
 std::atomic<uint32_t> g_probe_ceiling_rate{kRate1000};
 std::atomic<uint64_t> g_governor_event{0};
+std::atomic<uint64_t> g_stream_session_epoch{0};
 
 struct UpgradeBoundaryRuntime {
     uint32_t failure_count = 0;
@@ -143,14 +145,17 @@ int bitrate_for_rate(uint32_t rate) {
     }
 }
 
-uint64_t pack_governor_event(uint32_t event, uint32_t from, uint32_t to) {
+uint64_t pack_governor_event(
+        uint32_t event, uint32_t from, uint32_t to, uint64_t detail_ms) {
     return static_cast<uint64_t>(event & 0xffU)
             | (static_cast<uint64_t>(from & 0xffU) << 8U)
-            | (static_cast<uint64_t>(to & 0xffU) << 16U);
+            | (static_cast<uint64_t>(to & 0xffU) << 16U)
+            | ((detail_ms & 0xffffffffffULL) << 24U);
 }
 
-void publish_governor_event(uint32_t event, uint32_t from, uint32_t to) {
-    g_governor_event.store(pack_governor_event(event, from, to),
+void publish_governor_event(
+        uint32_t event, uint32_t from, uint32_t to, uint64_t detail_ms = 0) {
+    g_governor_event.store(pack_governor_event(event, from, to, detail_ms),
             std::memory_order_release);
 }
 
@@ -190,8 +195,13 @@ void reset_encoder_state(void* handle, uint32_t epoch, uint64_t now) {
     g_boundary_500_to_900 = {};
     g_boundary_900_to_1000 = {};
     g_governor_event.store(0, std::memory_order_release);
+    const uint64_t session_epoch =
+            g_stream_session_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     g_choppy_window_start_ms = now;
     g_choppy_count = 0;
+    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+            "evt=stream.session epoch=%llu",
+            static_cast<unsigned long long>(session_epoch));
 }
 
 bool record_upgrade_failure(uint64_t now, const char* reason) {
@@ -212,7 +222,7 @@ bool record_upgrade_failure(uint64_t now, const char* reason) {
     ++boundary->failure_count;
     boundary->backoff_until_ms = now + delay_ms;
     publish_governor_event(kGovernorEventQuickFailure,
-            g_last_upgrade_from, g_last_upgrade_to);
+            g_last_upgrade_from, g_last_upgrade_to, delay_ms);
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
             "evt=upgrade.backoff boundary=%d-%d failures=%u delay_ms=%llu",
             bitrate_for_rate(g_last_upgrade_from), bitrate_for_rate(g_last_upgrade_to),
@@ -237,6 +247,9 @@ bool set_rate(uint32_t target, const char* reason, uint32_t queue, uint64_t now,
         g_last_upgrade_ms = now;
         g_last_upgrade_from = previous;
         g_last_upgrade_to = target;
+        // Tell Java that set_target_bitrate_inx actually succeeded. Opening a probe ceiling is
+        // only permission to try; this event is the transition into verification.
+        publish_governor_event(kGovernorEventUpgradeApplied, previous, target);
     } else {
         bool keep_pending_choppy = false;
         if (target < previous) {
@@ -815,6 +828,12 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeIsGovernorStreaming(
     const uint64_t now = monotonic_ms();
     return last_encode_ms != 0 && now >= last_encode_ms
             && now - last_encode_ms <= kStreamingRecentMs ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetGovernorSessionEpoch(
+        JNIEnv*, jclass) {
+    return static_cast<jlong>(g_stream_session_epoch.load(std::memory_order_acquire));
 }
 
 extern "C" JNIEXPORT void JNICALL

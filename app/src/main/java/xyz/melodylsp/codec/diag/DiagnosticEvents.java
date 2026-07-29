@@ -141,6 +141,15 @@ public final class DiagnosticEvents {
                 .getLong(KEY_RECORDING_UNTIL, 0L);
     }
 
+    /** Re-sends the current deadline without extending it, for bounded delivery retries. */
+    public static boolean refreshRecordingState(Context context) {
+        if (context == null) return false;
+        long until = recordingUntil(context);
+        if (!isRecordingUntil(until, System.currentTimeMillis())) return false;
+        notifyRecordingState(context, until);
+        return true;
+    }
+
     static boolean isRecordingUntil(long until, long now) {
         return until > 0L && until > now;
     }
@@ -256,13 +265,31 @@ public final class DiagnosticEvents {
                 .putString("last.level", level(priority))
                 .putString("last.message", message)
                 .putLong("last.time", time);
-        classify(editor, message, priority, time);
+        classify(editor, safeScope, message, priority, time);
         mirrorMemory(sp, editor, message, time);
         editor.apply();
     }
 
     public static String status(SharedPreferences sp, String key) {
-        return sp.getString("status." + key, "尚未采集");
+        String status = sp.getString("status." + key, null);
+        return status != null && !status.isEmpty() ? status : defaultStatus(key);
+    }
+
+    static String defaultStatus(String key) {
+        if ("last.warning".equals(key) || "last.error".equals(key)) {
+            return "未发现";
+        }
+        if ("inject.detail".equals(key)
+                || "inject.onespace".equals(key)
+                || "scope.wirelesssettings".equals(key)
+                || "bridge.le.ws".equals(key)
+                || "codec.write".equals(key)
+                || "remember.write".equals(key)
+                || "remember.replay".equals(key)
+                || "game.mode".equals(key)) {
+            return "本次未触发";
+        }
+        return "等待状态";
     }
 
     public static String detail(SharedPreferences sp, String key) {
@@ -339,9 +366,20 @@ public final class DiagnosticEvents {
 
     private static void classify(
             SharedPreferences.Editor editor,
+            String scope,
             String message,
             int priority,
             long time) {
+        if (message.contains("evt=diag.scope.snapshot")) {
+            if ("melody".equals(scope) || message.contains("scope=melody")) {
+                mark(editor, "scope.host", "loaded", message, time);
+            } else if ("bluetooth".equals(scope) || message.contains("scope=bluetooth")) {
+                mark(editor, "scope.bluetooth", "loaded", message, time);
+            } else if ("wirelesssettings".equals(scope)
+                    || message.contains("scope=wirelesssettings")) {
+                mark(editor, "scope.wirelesssettings", "loaded", message, time);
+            }
+        }
         if (message.contains("evt=scope.host.start")
                 || message.contains("evt=scope.host.context.ready")) {
             mark(editor, "scope.host", "loaded", message, time);

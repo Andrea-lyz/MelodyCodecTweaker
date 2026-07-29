@@ -8,7 +8,9 @@ import android.content.SharedPreferences;
 import android.util.Log;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 import io.github.libxposed.api.XposedInterface;
@@ -30,10 +32,14 @@ public final class MLog {
     private static volatile Context diagnosticContext;
     private static volatile String diagnosticScope = "unknown";
     private static volatile long diagnosticRecordingUntilMs;
+    private static volatile long diagnosticSnapshotPublishedUntilMs;
     private static volatile BroadcastReceiver diagnosticControlReceiver;
     private static final Object PENDING_LOCK = new Object();
     private static final List<PendingDiagnostic> pendingDiagnostics = new ArrayList<>();
     private static final int MAX_PENDING_DIAGNOSTICS = 128;
+    private static final Map<String, PendingDiagnostic> stickyDiagnostics =
+            new LinkedHashMap<>();
+    private static final int MAX_STICKY_DIAGNOSTICS = 64;
     private static final Pattern BLUETOOTH_ADDRESS = Pattern.compile(
             "(?i)([0-9a-f]{2}):(?:[0-9a-f]{2}:){4}([0-9a-f]{2})");
 
@@ -57,6 +63,7 @@ public final class MLog {
         registerDiagnosticControlReceiver(appContext);
         if (isDiagnosticRecordingActive(System.currentTimeMillis())) {
             flushPendingDiagnostics(appContext, diagnosticScope);
+            maybePublishDiagnosticSnapshot(appContext, diagnosticScope);
         } else {
             clearPendingDiagnostics();
         }
@@ -65,6 +72,7 @@ public final class MLog {
     public static void configureDiagnosticRecordingUntil(long untilMs) {
         diagnosticRecordingUntilMs = Math.max(0L, untilMs);
         if (!isDiagnosticRecordingActive(System.currentTimeMillis())) {
+            diagnosticSnapshotPublishedUntilMs = 0L;
             clearPendingDiagnostics();
         }
     }
@@ -107,8 +115,10 @@ public final class MLog {
                 }
                 configureDiagnosticRecordingUntil(intent.getLongExtra(
                         DiagnosticEvents.EXTRA_RECORDING_UNTIL, 0L));
+                boolean active = isDiagnosticRecordingActive(System.currentTimeMillis());
+                if (active) maybePublishDiagnosticSnapshot(receiverContext, diagnosticScope);
                 eventLogOnly("diag.recording.control",
-                        "active", isDiagnosticRecordingActive(System.currentTimeMillis()),
+                        "active", active,
                         "scope", diagnosticScope);
             }
         };
@@ -176,7 +186,7 @@ public final class MLog {
         for (int i = 0; i + 1 < kvPairs.length; i += 2) {
             sb.append(' ').append(kvPairs[i]).append('=').append(kvPairs[i + 1]);
         }
-        emit(Log.INFO, sb.toString(), null, persistDiagnostic);
+        emit(Log.INFO, sb.toString(), null, persistDiagnostic, name);
     }
 
     /** Returns a single-token throwable summary suitable for structured event values. */
@@ -199,6 +209,15 @@ public final class MLog {
 
     private static void emit(
             int priority, String message, Throwable t, boolean persistDiagnostic) {
+        emit(priority, message, t, persistDiagnostic, null);
+    }
+
+    private static void emit(
+            int priority,
+            String message,
+            Throwable t,
+            boolean persistDiagnostic,
+            String stickyEventName) {
         long time = System.currentTimeMillis();
         String prefixed = prefix() + redactBluetoothAddresses(message);
         String safeStack = t != null
@@ -219,6 +238,9 @@ public final class MLog {
             }
         }
         String diagnosticMessage = t == null ? prefixed : prefixed + '\n' + safeStack;
+        if (stickyEventName != null && isStickyDiagnosticEvent(stickyEventName)) {
+            rememberStickyDiagnostic(stickyEventName, priority, diagnosticMessage, time);
+        }
         if (persistDiagnostic && isDiagnosticRecordingActive(time)) {
             Context context = diagnosticContext;
             if (context != null) {
@@ -259,6 +281,81 @@ public final class MLog {
         for (PendingDiagnostic pending : copy) {
             DiagnosticEvents.send(context, scope, pending.priority, pending.message, pending.time);
         }
+    }
+
+    private static void sendDiagnosticScopeSnapshot(Context context, String scope) {
+        if (context == null) return;
+        String safeScope = scope != null && !scope.isEmpty() ? scope : "unknown";
+        DiagnosticEvents.send(
+                context,
+                safeScope,
+                Log.INFO,
+                prefix() + "evt=diag.scope.snapshot scope=" + safeScope,
+                System.currentTimeMillis());
+    }
+
+    private static void maybePublishDiagnosticSnapshot(Context context, String scope) {
+        if (context == null) return;
+        long now = System.currentTimeMillis();
+        long until = diagnosticRecordingUntilMs;
+        if (!shouldPublishDiagnosticSnapshot(until, diagnosticSnapshotPublishedUntilMs, now)) {
+            return;
+        }
+        synchronized (PENDING_LOCK) {
+            if (!shouldPublishDiagnosticSnapshot(
+                    until, diagnosticSnapshotPublishedUntilMs, System.currentTimeMillis())) {
+                return;
+            }
+            diagnosticSnapshotPublishedUntilMs = until;
+        }
+        sendDiagnosticScopeSnapshot(context, scope);
+        flushStickyDiagnostics(context, scope);
+    }
+
+    static boolean shouldPublishDiagnosticSnapshot(long until, long publishedUntil, long now) {
+        return isRecordingActive(until, now) && until != publishedUntil;
+    }
+
+    private static void rememberStickyDiagnostic(
+            String eventName, int priority, String message, long time) {
+        synchronized (PENDING_LOCK) {
+            stickyDiagnostics.remove(eventName);
+            stickyDiagnostics.put(eventName, new PendingDiagnostic(priority, message, time));
+            while (stickyDiagnostics.size() > MAX_STICKY_DIAGNOSTICS) {
+                String oldest = stickyDiagnostics.keySet().iterator().next();
+                stickyDiagnostics.remove(oldest);
+            }
+        }
+    }
+
+    private static void flushStickyDiagnostics(Context context, String scope) {
+        if (context == null) return;
+        List<PendingDiagnostic> copy;
+        synchronized (PENDING_LOCK) {
+            copy = new ArrayList<>(stickyDiagnostics.values());
+        }
+        long now = System.currentTimeMillis();
+        for (PendingDiagnostic pending : copy) {
+            // The cached event describes state that is still true now. Refresh its timestamp so
+            // a long-running process is not rejected by the diagnostic anti-replay window.
+            DiagnosticEvents.send(context, scope, pending.priority, pending.message, now);
+        }
+    }
+
+    static boolean isStickyDiagnosticEvent(String name) {
+        if (name == null || name.isEmpty()) return false;
+        return name.startsWith("scope.")
+                || name.startsWith("dexkit.")
+                || name.endsWith(".hooked")
+                || name.endsWith(".injected")
+                || name.endsWith(".registered")
+                || "controller.ready".equals(name)
+                || "activity.scan.registered".equals(name)
+                || "bt.a2dp.resolved".equals(name)
+                || "codec.updated.hooks".equals(name)
+                || "cdm.hooks".equals(name)
+                || "lhdc.memory_patch".equals(name)
+                || "lhdc.link.bqr_hooks".equals(name);
     }
 
     private static void clearPendingDiagnostics() {

@@ -13,6 +13,22 @@ import xyz.melodylsp.codec.storage.PreferenceStore;
 public final class ConnectionStateReplayerTest {
 
     @Test
+    public void normalConnectedReplayKeepsCompatibilityDelay() {
+        assertEquals(1_500L, ConnectionStateReplayer.REPLAY_DELAY_MS);
+    }
+
+    @Test
+    public void activeDeviceReadyAcceleratesPendingReplay() {
+        assertEquals(100L, ConnectionStateReplayer.replayDelayAfterActiveReady(
+                ConnectionStateReplayer.REPLAY_DELAY_MS));
+    }
+
+    @Test
+    public void activeDeviceReadyDoesNotDelayAlreadyFasterReplay() {
+        assertEquals(50L, ConnectionStateReplayer.replayDelayAfterActiveReady(50L));
+    }
+
+    @Test
     public void explicitCapabilityMissRejectsRememberedVendorCodec() {
         CodecSnapshot live = snapshot(
                 CodecLabelTable.CODEC_SBC,

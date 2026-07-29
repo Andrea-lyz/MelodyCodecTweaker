@@ -23,4 +23,23 @@ public final class MLogTest {
         assertFalse(MLog.isRecordingActive(999L, 1_000L));
         assertTrue(MLog.isRecordingActive(1_001L, 1_000L));
     }
+
+    @Test
+    public void startupAndInjectionEventsAreStickyButTelemetryIsNot() {
+        assertTrue(MLog.isStickyDiagnosticEvent("scope.host.context.ready"));
+        assertTrue(MLog.isStickyDiagnosticEvent("controller.ready"));
+        assertTrue(MLog.isStickyDiagnosticEvent("hires_anchored.injected"));
+        assertTrue(MLog.isStickyDiagnosticEvent("codec.bt.receiver.registered"));
+        assertTrue(MLog.isStickyDiagnosticEvent("lhdc.link.bqr_hooks"));
+        assertFalse(MLog.isStickyDiagnosticEvent("lhdc.link.bqr_summary"));
+        assertFalse(MLog.isStickyDiagnosticEvent("codec.bt.reply"));
+    }
+
+    @Test
+    public void snapshotPublishesOncePerActiveRecordingDeadline() {
+        assertTrue(MLog.shouldPublishDiagnosticSnapshot(20_000L, 0L, 10_000L));
+        assertFalse(MLog.shouldPublishDiagnosticSnapshot(20_000L, 20_000L, 10_000L));
+        assertFalse(MLog.shouldPublishDiagnosticSnapshot(10_000L, 0L, 10_000L));
+        assertTrue(MLog.shouldPublishDiagnosticSnapshot(30_000L, 20_000L, 10_000L));
+    }
 }

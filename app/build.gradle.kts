@@ -25,6 +25,10 @@ android {
         buildConfig = true
     }
 
+    sourceSets {
+        getByName("main").assets.srcDir("../docs/design")
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

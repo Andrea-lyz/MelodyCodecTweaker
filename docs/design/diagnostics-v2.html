@@ -2,20 +2,21 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <title>诊断页 v2 · 方案预览</title>
+  <title>OPlus Headset Audio Helper · 诊断</title>
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <style>
     /* ─────────────────────────────────────────────────────────────
        设计目标
-       1. 完全静态：HTML 只读取 JavaScriptInterface 注入的 pref 快照，
-          不向宿主进程广播、不主动写 pref、不在后台轮询触发日志。
-       2. 实时环境 = 最近一次 BQR；历史窗口 = events.jsonl 滑动聚合，
-          仅在前台且 events 已存在时刷新，离开页面后停止心跳。
+       1. HTML 通过 JavaScriptInterface 读取诊断快照；只有用户操作开关或按钮时
+          才请求宿主写入，不在后台轮询或触发日志。
+       2. 实时环境 = 最近一次 BQR；历史窗口 = 当前 Activity 前台会话的内存样本。
+          页面在前台时订阅已有 BQR 数据，离开页面后立即退订并停止心跳。
        3. 与 LhdcLinkHealthController 的 reason 列表对齐：
-          healthy_recovery_probe / probe_stable / probe_health_lost /
-          probe_stream_idle / probe_queue_congested / probe_choppy /
+          healthy_recovery_probe / native_upgrade_applied /
+          probe_bqr_severe / probe_bqr_sustained_bad / probe_queue_full /
+          probe_queue_congested / probe_stream_idle / probe_choppy /
           boundary_locked / boundary_stable / quick_failure /
-          device_active / device_reconnect
+          stream_session / device_active
        4. 与 MasterSwitchActivity.refresh() 字段一一对应：
           - 模块总开关 (KEY_ENABLED)
           - 隐藏桌面图标 (KEY_HIDE_LAUNCHER_ICON)
@@ -28,7 +29,7 @@
           - 环境信息 5 项（模块版本 / 系统 / 三个宿主包版本）
           - 记忆信息（当前 Melody 真实记忆 + 上次记忆恢复链路）
           - 最近事件 12 行
-          - LHDC BQR 实时环境 4 个 KPI + 边界状态 + 9 个 reason
+          - LHDC BQR 实时环境 4 个 KPI + 边界状态 + 13 个 reason
           - LHDC BQR 历史窗口 sparkline
        ───────────────────────────────────────────────────────────── */
     :root {
@@ -155,6 +156,7 @@
     .btn.primary:hover { box-shadow: 0 8px 16px rgba(10,132,255,.25); }
     .btn.ghost { background: var(--blue-soft); color: var(--blue); }
     .btn:active { transform: translateY(1px); }
+    .btn:disabled { opacity: .55; cursor: default; box-shadow: none; }
 
     /* grid of small KPIs */
     .kpis { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
@@ -230,19 +232,27 @@
       background: linear-gradient(90deg, var(--green), var(--blue));
     }
     .env-row .bar > i.warn { background: linear-gradient(90deg, var(--orange), var(--red)); }
+    .env-row .bar > i.blocked { background: var(--muted); opacity: .45; }
+    .env-row .bar > i.testing { background: linear-gradient(90deg, var(--blue), #72b7ff); }
     .env-row .val { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--subtext); }
 
-    /* history sparkline */
+    /* history trend chart */
     .history {
-      display: flex; align-items: flex-end; gap: 3px;
-      height: 64px; padding: 8px 0;
+      height: 86px; padding: 8px 0 4px;
     }
-    .history .bar {
-      flex: 1; min-width: 4px; border-radius: 3px 3px 0 0;
-      background: var(--blue); opacity: .75;
+    .history svg {
+      display: block; width: 100%; height: 100%; overflow: visible;
     }
-    .history .bar.warn { background: var(--orange); }
-    .history .bar.bad  { background: var(--red); }
+    .history .grid-line {
+      stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke;
+    }
+    .history .series {
+      fill: none; stroke-width: 2; vector-effect: non-scaling-stroke;
+      stroke-linecap: round; stroke-linejoin: round;
+    }
+    .history .series.retx  { stroke: var(--blue); }
+    .history .series.norx  { stroke: var(--orange); }
+    .history .series.queue { stroke: var(--red); }
     .history-legend { display: flex; gap: 16px; font-size: 12px; color: var(--subtext); margin-top: 6px; flex-wrap: wrap; }
     .history-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
 
@@ -265,44 +275,51 @@
       display: inline-flex; gap: 4px; align-items: center;
       padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
       background: var(--blue-soft); color: var(--blue);
-      margin-right: 6px; margin-top: 4px;
+      max-width: 100%; overflow-wrap: anywhere; word-break: break-word;
     }
     .reason.locked { background: var(--red-soft); color: var(--red); }
     .reason.stable { background: var(--green-soft); color: var(--green); }
     .reason.queued { background: var(--orange-soft); color: var(--orange); }
     .reason.idle   { background: rgba(0,0,0,.04); color: var(--muted); }
 
-    /* reason timeline (last 24h) — each row explains one reason in plain
-       language + shows the most recent occurrence as a relative time and
-       a small count. The visual entry point stays the same `reason` chip
-       so advanced users still see the raw keyword. */
+    /* Reason timeline for the current Bluetooth-process run. Only reasons
+       that actually occurred are rendered; each row keeps the raw keyword,
+       a plain-language explanation, the latest time and an in-memory count. */
     .reason-list { display: grid; gap: 8px; margin-top: 4px; }
     .reason-row {
-      display: grid;
-      grid-template-columns: minmax(160px, 1.2fr) 1fr auto;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 12px;
+      display: flex; flex-direction: column; align-items: stretch;
+      gap: 7px;
+      padding: 12px 14px;
       border-radius: 12px;
       border: 1px solid var(--line);
       background: rgba(0,0,0,.015);
     }
     .reason-row .head {
-      display: flex; align-items: center; gap: 8px;
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
     }
     .reason-row .head .name {
       font-weight: 600; font-size: 13px; letter-spacing: .01em;
     }
     .reason-row .desc {
-      color: var(--subtext); font-size: 13px;
+      color: var(--subtext); font-size: 13px; line-height: 1.55;
     }
     .reason-row .when {
+      display: flex; align-items: baseline; justify-content: flex-end; gap: 8px;
       font-variant-numeric: tabular-nums;
       font-size: 12px; color: var(--muted);
-      text-align: right; white-space: nowrap;
+      text-align: right;
     }
     .reason-row .when strong {
-      display: block; color: var(--text); font-size: 13px;
+      color: var(--text); font-size: 13px;
+    }
+    @media (min-width: 720px) {
+      .reason-row {
+        display: grid;
+        grid-template-columns: minmax(180px, 1.1fr) minmax(240px, 2fr) auto;
+        align-items: center;
+      }
+      .reason-row .when { display: block; white-space: nowrap; }
+      .reason-row .when strong { display: block; }
     }
 
     /* footer note */
@@ -310,6 +327,10 @@
       margin-top: 18px; padding: 12px 14px;
       background: rgba(0,0,0,.02); border-radius: 12px;
       color: var(--subtext); font-size: 12px;
+      min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+    }
+    .footnote code {
+      white-space: normal; overflow-wrap: anywhere; word-break: break-word;
     }
 
     /* tabs (for BQR / history switch) */
@@ -323,6 +344,10 @@
       background: var(--blue-soft); color: var(--blue);
       border-color: transparent; font-weight: 600;
     }
+    @media (max-width: 480px) {
+      #history .section-head { flex-direction: column; align-items: stretch; }
+      #history .tabs { width: 100%; }
+    }
 
     /* tiny visualizations */
     .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s ease-in-out infinite; }
@@ -331,10 +356,13 @@
       50%      { opacity: .35; transform: scale(.85); }
     }
     .row-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+    .page.loading { opacity: 0; }
+    .page { transition: opacity .12s ease; }
   </style>
 </head>
 <body>
-<div class="page">
+<div class="page loading" id="diagnostics-page">
 
   <!-- ═══════════════ Header ═══════════════ -->
   <header class="header">
@@ -350,7 +378,7 @@
     <div class="switch-row">
       <div class="label">
         <strong>模块总开关</strong>
-        <p>已启用。重启无线耳机 App 后会注入音质控制项。</p>
+        <p id="module-status-text">正在读取模块状态…</p>
       </div>
       <label class="switch">
         <input type="checkbox" checked data-enabled>
@@ -379,28 +407,29 @@
     <p class="hint">遇到问题时先点开始记录，复现一次，再生成反馈包。反馈包会包含时间线、结构化事件、状态快照和可用日志。</p>
 
     <!-- 正在记录中：显示会话 ID、倒计时，并提供"停止记录"按钮 -->
-    <div class="session" data-state="recording">
+    <div class="session" data-state="recording" id="recording-session">
       <span class="pill ok"><span class="dot"></span>正在记录</span>
-      <code>20260728-220912</code>
-      <span class="timer">剩余 24:13</span>
+      <code id="recording-id">—</code>
+      <span class="timer" id="recording-timer">—</span>
     </div>
 
     <!-- 未开始记录时显示这一段，由 JS 根据 isRecording 切换 -->
-    <div class="session" data-state="idle" hidden>
+    <div class="session" data-state="idle" id="idle-session" hidden>
       <span class="pill idle"><span class="dot"></span>未在记录</span>
       <code>—</code>
       <span class="timer">诊断 receiver 已禁用，平时不会在后台采集</span>
     </div>
 
     <div class="actions">
-      <button class="btn primary" data-record-btn>停止记录</button>
-      <button class="btn ghost">生成反馈包</button>
-      <button class="btn ghost" style="flex: 1 1 100%;">重抓 Melody 记忆快照</button>
+      <button class="btn primary" data-record-btn id="record-button">开始记录问题</button>
+      <button class="btn ghost" id="feedback-button">生成反馈包</button>
+      <button class="btn ghost" id="memory-button" style="flex: 1 1 100%;">重抓 Melody 记忆快照</button>
     </div>
     <div class="footnote">
       诊断页在前台时会自动每 4 秒刷新一次上面的状态与事件；离开页面或划卡退出立即停止，避免耗电。
       "重抓 Melody 记忆快照" 仅在你需要确认 Melody 私有 SharedPreferences 的最新值时按一下，
-      不会自动触发后台采集。
+       不会自动触发后台采集。BQR 卡片使用仅前台有效的实时订阅，转发蓝牙栈已经产生的样本，
+       与“开始记录问题”互不依赖。
     </div>
   </section>
 
@@ -408,27 +437,27 @@
   <section class="card" id="bqr">
     <div class="section-head">
       <h3>LHDC 链路 · BQR 实时环境</h3>
-      <span class="pill ok"><span class="pulse"></span>活动</span>
+      <span class="pill idle" id="bqr-activity"><span class="pulse"></span>等待数据</span>
     </div>
 
     <div class="bqr-grid">
       <div class="kpi good">
-        <div class="v">12</div>
+        <div class="v" id="bqr-retx">—</div>
         <div class="l">重传 / 秒</div>
         <div class="u">健康上限 ≤ 60</div>
       </div>
       <div class="kpi good">
-        <div class="v">3</div>
+        <div class="v" id="bqr-norx">—</div>
         <div class="l">No-Rx / 秒</div>
         <div class="u">健康上限 ≤ 60</div>
       </div>
       <div class="kpi">
-        <div class="v">22 / 79</div>
+        <div class="v" id="bqr-unused-afh">— / 79</div>
         <div class="l">未用 AFH 信道</div>
         <div class="u">健康上限 ≤ 49</div>
       </div>
       <div class="kpi">
-        <div class="v">57 / 79</div>
+        <div class="v" id="bqr-usable-afh">— / 79</div>
         <div class="l">可用 AFH</div>
         <div class="u">健康 ≥ 30</div>
       </div>
@@ -436,102 +465,30 @@
 
     <div class="section-head" style="margin-top:18px">
       <h3>边界状态</h3>
-      <span class="pill info">ceiling 1000 kbps</span>
+      <span class="pill info" id="bqr-ceiling">当前上限 —</span>
     </div>
 
     <div class="env-row">
       <div class="name">500 → 900</div>
-      <div class="bar"><i style="width:100%"></i></div>
-      <span class="val">解锁</span>
+      <div class="bar"><i id="boundary-500-900-bar" style="width:0%"></i></div>
+      <span class="val" id="boundary-500-900-value">未知</span>
     </div>
     <div class="env-row">
       <div class="name">900 → 1000</div>
-      <div class="bar"><i style="width:100%"></i></div>
-      <span class="val">解锁</span>
+      <div class="bar"><i id="boundary-900-1000-bar" style="width:0%"></i></div>
+      <span class="val" id="boundary-900-1000-value">未知</span>
     </div>
 
     <div class="section-head" style="margin-top:18px">
       <h3>最近事件理由</h3>
     </div>
-    <div class="reason-list">
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason stable">probe_stable</span>
-          <span class="name">探针稳定</span>
-        </div>
-        <div class="desc">链路连续 3 个健康窗口，解除上限，恢复高码率</div>
-        <div class="when"><strong>刚刚</strong>本次会话 5 次</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason">healthy_recovery_probe</span>
-          <span class="name">主动试探</span>
-        </div>
-        <div class="desc">队列空了，重置试探看能不能上探到 900 / 1000 kbps</div>
-        <div class="when"><strong>2 分钟前</strong>12 分钟前还出现过</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason queued">probe_queue_congested</span>
-          <span class="name">队列积压</span>
-        </div>
-        <div class="desc">蓝牙缓冲队列超过 90%，链路跟不上，先撤回</div>
-        <div class="when"><strong>—</strong>暂无记录</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason idle">probe_stream_idle</span>
-          <span class="name">音乐暂停</span>
-        </div>
-        <div class="desc">没有 A2DP 流，关闭探针避免空跑</div>
-        <div class="when"><strong>—</strong>暂无记录</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason idle">probe_choppy</span>
-          <span class="name">声音卡顿</span>
-        </div>
-        <div class="desc">检测到外部卡顿事件，立刻撤下探针</div>
-        <div class="when"><strong>—</strong>暂无记录</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason idle">probe_health_lost</span>
-          <span class="name">链路质量变差</span>
-        </div>
-        <div class="desc">健康窗口归零，关闭探针，等下次重新评估</div>
-        <div class="when"><strong>—</strong>暂无记录</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason locked">boundary_locked</span>
-          <span class="name">升级门槛锁定</span>
-        </div>
-        <div class="desc">连续失败，目标码率被锁定，下调至上一档</div>
-        <div class="when"><strong>—</strong>暂无记录</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason stable">boundary_stable</span>
-          <span class="name">升级门槛解除</span>
-        </div>
-        <div class="desc">升级后稳定运行，撤销该档位的锁定证据</div>
-        <div class="when"><strong>—</strong>暂无记录</div>
-      </div>
-      <div class="reason-row">
-        <div class="head">
-          <span class="reason queued">quick_failure</span>
-          <span class="name">快速失败</span>
-        </div>
-        <div class="desc">升级后立刻报错，准备升级证据</div>
-        <div class="when"><strong>—</strong>暂无记录</div>
-      </div>
+    <div class="reason-list" id="reason-list">
+      <div class="empty">等待前台 BQR 数据…</div>
     </div>
 
     <p class="footnote" style="margin-top:18px">
       数据来自 <code>LhdcLinkHealthController</code> 经 <code>SystemHookInstaller.handleBluetoothQualityReport</code>
-      发出的 <code>evt=lhdc.link.bqr_summary</code> 事件，写入 <code>status.lhdc.link.bqr</code> / <code>detail.lhdc.link.bqr</code>。
-      HTML 只解析已有 pref，不向 <code>com.android.bluetooth</code> 或 <code>com.oplus.melody</code> 触发新采集。
+      转发的已有 BQR 样本。页面进入前台才订阅，离开页面立即退订；不会启动新的蓝牙采集，也不依赖问题记录会话。
     </p>
   </section>
 
@@ -540,25 +497,25 @@
     <div class="section-head">
       <h3>LHDC 链路 · BQR 历史窗口</h3>
       <div class="tabs">
-        <button class="active">5 分钟</button>
-        <button>30 分钟</button>
-        <button>全程</button>
+        <button class="active" data-history-window="300000">5 分钟</button>
+        <button data-history-window="1800000">30 分钟</button>
+        <button data-history-window="0">全程</button>
       </div>
     </div>
 
     <div class="history" id="history-bars">
-      <!-- generated by JS from pref.events_jsonl -->
+      <!-- generated by JS from the current foreground Activity's in-memory BQR samples -->
     </div>
     <div class="history-legend">
       <span><span class="swatch" style="background:var(--blue)"></span>重传 / 秒</span>
       <span><span class="swatch" style="background:var(--orange)"></span>No-Rx / 秒</span>
       <span><span class="swatch" style="background:var(--red)"></span>队列占用 %</span>
-      <span style="margin-left:auto">采样: 36 / 平均 8.3 / 峰值 27</span>
+      <span style="margin-left:auto" id="history-summary">采样: 0</span>
     </div>
 
     <p class="footnote">
-      聚合规则：从 <code>events_jsonl</code> 解析最近 5 分钟内的 <code>lhdc.link.bqr*</code> 事件，按 10s 桶分箱，
-      取各桶内 max(retx/s, no_rx/s, queue%) 作为柱状图高度。前台时聚合，离开页面时停止，不重写 pref。
+      聚合规则：从本次页面前台收到的实时样本按时间窗口分箱，
+      每个桶分别聚合重传、No-Rx 与队列占用峰值，再绘制成三条趋势线。离开页面后停止接收，不写入诊断 pref。
     </p>
   </section>
 
@@ -567,7 +524,7 @@
     <h2>诊断状态</h2>
     <p class="hint">每次模块 hook 生效时会更新最近一次事件。颜色：<span class="pill ok">ok</span> <span class="pill warn">pending</span> <span class="pill err">attention</span></p>
 
-    <div class="status-grid">
+    <div class="status-grid" id="status-grid">
       <div class="row">
         <div>
           <div class="lbl">无线耳机作用域</div>
@@ -698,7 +655,7 @@
   <!-- ═══════════════ 环境信息 ═══════════════ -->
   <section class="card">
     <h2>环境信息</h2>
-    <div class="status-grid">
+    <div class="status-grid" id="environment-grid">
       <div class="row">
         <div class="lbl">模块版本</div>
         <code>2.1.0 (22)</code>
@@ -727,9 +684,9 @@
     <h2>记忆信息</h2>
     <div class="section-head">
       <h3>当前 Melody 真实记忆</h3>
-      <span class="pill ok"><span class="dot"></span>已记忆</span>
+      <span class="pill idle" id="memory-state"><span class="dot"></span>等待快照</span>
     </div>
-    <div class="status-grid">
+    <div class="status-grid" id="memory-remembered">
       <div class="row">
         <div class="lbl">AA:BB:CC:DD:EE:01</div>
         <code>LDAC / 1000 kbps / 96 kHz<br>更新时间: 07-28 22:14:55<br>raw: codec=10 specific1=0x80000000 rate=0x80</code>
@@ -737,7 +694,7 @@
     </div>
 
     <div class="section-head" style="margin-top:14px"><h3>上次记忆恢复链路</h3></div>
-    <div class="status-grid">
+    <div class="status-grid" id="memory-replay">
       <div class="row">
         <code>07-28 22:14:51 evt=replay.bootstrap.scan devices=2
 07-28 22:14:53 evt=replay.schedule mac=AA:BB:CC:DD:EE:01 delay=900ms
@@ -766,123 +723,478 @@
 </div>
 
 <script>
-/* ────────────────────────────────────────────────────────────
-   snapshot 形状（来自 Java 端 JavaScriptInterface）：
-   window.__DIAG__ = {
-     enabled: true,
-     hideLauncherIcon: false,
-     recording: {
-       id: "20260728-220912" | "",
-       startedAt: 1722192152000,
-       expiresAt: 1722193952000,
-       endedAt: 0
-     },
-     session: { host, bluetooth, wirelessSettings, melodyVersion },
-     status: {
-       "scope.host": { status: "loaded", detail: "...", time: 1722192152000 },
-       ...
-     },
-     events: "...",
-     eventsJsonl: "...",
-     reasonCounts: { probe_stable: 5, ... },
-     lastReasonAt: { probe_stable: 1722192152000, ... },
-     snapshotTakenAt: 1722192152000
-   }
-   ──────────────────────────────────────────────────────────── */
-
+  const bridge = window.MelodyDiagBridge;
   const HISTORY_BUCKETS = 24;
-  const historyEl = document.getElementById('history-bars');
-  const mockHistory = [
-    7, 9, 12, 8, 6, 5, 4, 7, 11, 14, 18, 16, 12, 10,
-    9, 8, 7, 6, 5, 5, 6, 7, 8, 9
+  const REASONS = [
+    ['healthy_recovery_probe', '主动试探', 'active', '健康窗口与低队列达标，开放下一档码率上限'],
+    ['native_upgrade_applied', '实际升档', 'active', 'native 已成功写入更高的目标码率，进入稳定性验证'],
+    ['probe_bqr_severe', '环境严重恶化', 'locked', 'BQR 出现严重重传、No-Rx 或 AFH 信道不足，立即撤回'],
+    ['probe_bqr_sustained_bad', '环境持续恶化', 'queued', '连续多个 BQR 窗口变差，完成迟滞判断后撤回'],
+    ['probe_queue_full', '队列打满', 'locked', '蓝牙缓冲队列达到硬上限，立即保护降档'],
+    ['probe_queue_congested', '队列积压', 'queued', '队列占用超过 90% 并持续 300ms，撤回当前探测'],
+    ['probe_stream_idle', '音乐暂停', 'idle', '当前没有 A2DP 音频流，关闭临时探测'],
+    ['probe_choppy', '声音卡顿', 'locked', '收到耳机侧卡顿回报，立即保护链路'],
+    ['boundary_locked', '升级门槛锁定', 'locked', '同一升级边界连续失败，暂时停留在上一档'],
+    ['boundary_stable', '升级门槛解除', 'stable', '实际升档后稳定运行，清除该边界的失败证据'],
+    ['quick_failure', '快速失败', 'queued', '升档后很快发生拥塞，进入对应 native 退避'],
+    ['stream_session', '播放会话更新', 'stable', 'native 捕获到新的编码器代际，临时证据已重置'],
+    ['device_active', '设备激活', 'stable', '当前活动耳机切换，加载该设备的链路学习状态']
   ];
-  function renderHistory(values) {
-    if (!historyEl) return;
-    historyEl.innerHTML = '';
-    const peak = Math.max.apply(null, values.concat([1]));
-    values.forEach((v, i) => {
-      const b = document.createElement('div');
-      b.className = 'bar' + (v > peak * 0.75 ? ' warn' : v > peak ? ' bad' : '');
-      b.style.height = (v / peak * 100).toFixed(1) + '%';
-      b.title = 't-' + (HISTORY_BUCKETS - i) + ' · ' + v + '/s';
-      historyEl.appendChild(b);
-    });
+  let lastSnapshot = null;
+  let historyWindowMs = 300000;
+  let timer = null;
+
+  function byId(id) { return document.getElementById(id); }
+  function number(value, fallback) {
+    if (value === null || value === undefined || value === '') {
+      return fallback === undefined ? 0 : fallback;
+    }
+    const n = Number(value);
+    return Number.isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
   }
-  renderHistory(mockHistory);
-
-  /* ──────────────────────────────────────────────────────────
-     把 snapshot 里的字段灌进对应 DOM 节点。
-     applySnapshot(null) 表示 mock 状态，进入即用 fallback。
-     ────────────────────────────────────────────────────────── */
-  const FALLBACK = {
-    enabled: true,
-    hideLauncherIcon: false,
-    recording: { id: '20260728-220912', startedAt: 0, expiresAt: 0 },
-    reasonCounts: { probe_stable: 5, healthy_recovery_probe: 1 }
-  };
-
+  function fmtRate(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '—';
+    return n.toFixed(1).replace(/\.0$/, '');
+  }
   function fmtRelative(time) {
     if (!time) return '—';
-    const diff = Math.max(0, Date.now() - time);
-    const min = Math.round(diff / 60000);
+    const diff = Math.max(0, Date.now() - Number(time));
+    const min = Math.floor(diff / 60000);
     if (min < 1) return '刚刚';
     if (min < 60) return min + ' 分钟前';
-    const h = Math.round(min / 60);
+    const h = Math.floor(min / 60);
     if (h < 24) return h + ' 小时前';
-    return Math.round(h / 24) + ' 天前';
+    return Math.floor(h / 24) + ' 天前';
+  }
+  function fmtClock(time) {
+    if (!time) return '—';
+    const d = new Date(Number(time));
+    const two = v => String(v).padStart(2, '0');
+    return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' '
+      + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+  function setPill(element, state, text, pulse) {
+    if (!element) return;
+    element.className = 'pill ' + state;
+    element.textContent = '';
+    const dot = document.createElement('span');
+    dot.className = pulse ? 'pulse' : 'dot';
+    element.appendChild(dot);
+    element.appendChild(document.createTextNode(text));
+  }
+  function statusTier(status) {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (status === '未发现'
+        || ['ok','ready','loaded','hooked','injected','registered','patched','active'].includes(normalized)) return 'ok';
+    if (['attention','error','failed'].includes(normalized)) return 'err';
+    if (['pending','warning'].includes(normalized)) return 'warn';
+    return 'idle';
   }
 
-  function applySnapshot(snap) {
-    const s = snap || FALLBACK;
-    // 模块总开关
-    const enabled = !!s.enabled;
-    const enabledSwitch = document.querySelector('input[data-enabled]');
-    if (enabledSwitch) enabledSwitch.checked = enabled;
-    // 桌面图标隐藏
-    const hide = !!s.hideLauncherIcon;
-    const hideSwitch = document.querySelector('input[data-hide-launcher]');
-    if (hideSwitch) hideSwitch.checked = hide;
-    // 反馈工具会话态
+  function displayStatus(item) {
+    const status = String(item && item.status || '').trim();
+    if (status) return status;
+    const key = String(item && item.key || '');
+    if (key === 'last.warning' || key === 'last.error') return '未发现';
+    return '尚未采集';
+  }
+
+  function statusSubtext(item, status) {
+    if (item && item.time) return fmtClock(item.time);
+    if (status === '未发现') {
+      return item && item.key === 'last.error'
+        ? '本次诊断未记录到错误'
+        : '本次诊断未记录到警告';
+    }
+    if (status === '本次未触发') return '本次会话未触发对应路径';
+    if (status === '等待状态') return '等待对应作用域上报状态';
+    return '尚未采集（不代表模块未生效）';
+  }
+  function setKpi(id, value, tier) {
+    const el = byId(id);
+    if (!el) return;
+    el.textContent = value;
+    const card = el.parentElement;
+    if (card) card.className = 'kpi ' + tier;
+  }
+  function clear(element) {
+    if (!element) return;
+    while (element.firstChild) element.removeChild(element.firstChild);
+  }
+  function empty(container, text) {
+    clear(container);
+    const el = document.createElement('div');
+    el.className = 'empty';
+    el.textContent = text;
+    container.appendChild(el);
+  }
+
+  function renderRecording(s) {
     const rec = s.recording || {};
-    const recording = !!(rec.id && (!rec.expiresAt || rec.expiresAt > Date.now()));
-    document.querySelectorAll('.session').forEach(el => {
-      const target = el.dataset.state;
-      const showRec = (target === 'recording') === recording;
-      el.hidden = !showRec;
-    });
-    const btn = document.querySelector('button[data-record-btn]');
-    if (btn) {
-      btn.textContent = recording ? '停止记录' : '开始记录问题';
-      btn.classList.toggle('ghost', !recording);
+    const active = !!rec.active;
+    byId('recording-session').hidden = !active;
+    byId('idle-session').hidden = active;
+    byId('recording-id').textContent = rec.id || '—';
+    if (active) {
+      const remain = Math.max(0, number(rec.expiresAt) - Date.now());
+      const min = Math.floor(remain / 60000);
+      const sec = Math.floor((remain % 60000) / 1000);
+      byId('recording-timer').textContent = '剩余 ' + min + ':' + String(sec).padStart(2, '0');
+    } else {
+      const idleTimer = byId('idle-session').querySelector('.timer');
+      idleTimer.textContent = rec.id
+        ? '上次记录 ' + fmtRelative(rec.startedAt)
+        : '诊断 receiver 已禁用，平时不会在后台采集';
     }
+    const record = byId('record-button');
+    record.textContent = active ? '停止记录' : '开始记录问题';
+    const feedback = byId('feedback-button');
+    feedback.disabled = !!s.feedbackBusy;
+    feedback.textContent = s.feedbackBusy ? '正在打包…' : '生成反馈包';
   }
 
-  /* ──────────────────────────────────────────────────────────
-     前台心跳：document.visibilityState 监听，离开页面就停。
-     拉取走 bridge.refresh() 单向注入，不会触发新采集。
-     ────────────────────────────────────────────────────────── */
-  const bridge = window.MelodyDiagBridge;
-  let lastSnapshot = null;
-  function refresh() {
-    if (bridge && typeof bridge.refresh === 'function') {
-      const data = bridge.refresh();
-      if (data) lastSnapshot = data;
-    }
-    applySnapshot(lastSnapshot);
+  function renderBoundary(prefix, state) {
+    const bar = byId(prefix + '-bar');
+    const value = byId(prefix + '-value');
+    if (!bar || !value) return;
+    const states = {
+      unknown:   ['未知', 'var(--muted)', ''],
+      locked:    ['已锁定', 'var(--red)', 'warn'],
+      blocked:   ['等待低档恢复', 'var(--muted)', 'blocked'],
+      probing:   ['试探中', 'var(--blue)', 'testing'],
+      verifying: ['验证中', 'var(--blue)', 'testing'],
+      available: ['可尝试', 'var(--green)', '']
+    };
+    const current = states[state] || states.unknown;
+    bar.style.width = state === 'unknown' ? '0%' : '100%';
+    bar.className = current[2];
+    value.textContent = current[0];
+    value.style.color = current[1];
   }
-  let timer = null;
+
+  function renderBqr(bqr) {
+    const data = bqr || {};
+    const latest = data.latest && typeof data.latest === 'object' ? data.latest : null;
+    const activity = byId('bqr-activity');
+    if (!latest) {
+      setPill(activity, 'idle', '等待数据', false);
+      setKpi('bqr-retx', '—', 'idle');
+      setKpi('bqr-norx', '—', 'idle');
+      setKpi('bqr-unused-afh', '— / 79', 'idle');
+      setKpi('bqr-usable-afh', '— / 79', 'idle');
+      byId('bqr-ceiling').textContent = '当前上限 —';
+      renderBoundary('boundary-500-900', 'unknown');
+      renderBoundary('boundary-900-1000', 'unknown');
+    } else {
+      const age = Math.max(0, Date.now() - number(latest.time));
+      const streaming = !!latest.streaming;
+      setPill(activity,
+        age > 20000 ? 'warn' : (streaming ? 'ok' : 'idle'),
+        age > 20000 ? '等待新样本' : (streaming ? '活动' : '已暂停'),
+        age <= 20000 && streaming);
+      const retx = number(latest.retransmissionsPerSec, NaN);
+      const norx = number(latest.noRxPerSec, NaN);
+      const unused = number(latest.unusedAfh, 0);
+      const usable = number(latest.usableAfh, 0);
+      setKpi('bqr-retx', fmtRate(retx), !Number.isFinite(retx) ? 'idle' : retx <= 30 ? 'good' : retx <= 60 ? 'warn' : 'bad');
+      setKpi('bqr-norx', fmtRate(norx), !Number.isFinite(norx) ? 'idle' : norx <= 30 ? 'good' : norx <= 60 ? 'warn' : 'bad');
+      setKpi('bqr-unused-afh', unused + ' / 79', unused <= 22 ? 'good' : unused <= 49 ? 'warn' : 'bad');
+      setKpi('bqr-usable-afh', usable + ' / 79', usable >= 30 ? 'good' : usable >= 20 ? 'warn' : 'bad');
+      const ceiling = number(latest.ceilingKbps);
+      const phase = latest.probePhase || 'stable';
+      const phaseLabel = {
+        locked: '已受限',
+        probing: '正在试探',
+        verifying: '正在验证',
+        stable: '状态稳定'
+      }[phase] || '状态更新中';
+      byId('bqr-ceiling').textContent = '当前上限 ' + ceiling + ' kbps · ' + phaseLabel;
+
+      const lowerLocked = !!latest.lock500to900;
+      const upperLocked = !!latest.lock900to1000;
+      const probeState = phase === 'verifying' ? 'verifying' : 'probing';
+      const lowerTesting = (phase === 'probing' || phase === 'verifying') && ceiling === 900;
+      const upperTesting = (phase === 'probing' || phase === 'verifying') && ceiling === 1000;
+      renderBoundary('boundary-500-900', lowerLocked
+        ? 'locked' : lowerTesting ? probeState : 'available');
+      renderBoundary('boundary-900-1000', upperLocked
+        ? 'locked' : (lowerLocked || lowerTesting) ? 'blocked'
+          : upperTesting ? probeState : 'available');
+    }
+    renderReasons(data.reasonCounts || {}, data.reasonTimes || {});
+    renderHistory(data.history || []);
+  }
+
+  function renderReasons(counts, times) {
+    const holder = byId('reason-list');
+    clear(holder);
+    const occurred = REASONS
+      .filter(entry => number(counts[entry[0]], 0) > 0 || number(times[entry[0]], 0) > 0)
+      .sort((a, b) => number(times[b[0]], 0) - number(times[a[0]], 0));
+    if (!occurred.length) {
+      empty(holder, '本次蓝牙运行尚未出现拥塞治理事件');
+      return;
+    }
+    occurred.forEach(entry => {
+      const [key, label, tier, desc] = entry;
+      const row = document.createElement('div');
+      row.className = 'reason-row';
+      const head = document.createElement('div');
+      head.className = 'head';
+      const chip = document.createElement('span');
+      chip.className = 'reason ' + tier;
+      chip.textContent = key;
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = label;
+      head.append(chip, name);
+      const detail = document.createElement('div');
+      detail.className = 'desc';
+      detail.textContent = desc;
+      const when = document.createElement('div');
+      when.className = 'when';
+      const strong = document.createElement('strong');
+      strong.textContent = fmtRelative(times[key]);
+      when.appendChild(strong);
+      when.appendChild(document.createTextNode(counts[key]
+        ? '本次运行 ' + counts[key] + ' 次' : '已发生'));
+      row.append(head, detail, when);
+      holder.appendChild(row);
+    });
+  }
+
+  function renderHistory(history) {
+    const now = Date.now();
+    const filtered = (Array.isArray(history) ? history : []).filter(sample =>
+      !historyWindowMs || now - number(sample.time) <= historyWindowMs);
+    const buckets = Array.from({length: HISTORY_BUCKETS}, () => ({
+      retx: 0, norx: 0, queue: 0, count: 0
+    }));
+    if (filtered.length) {
+      const first = historyWindowMs
+        ? now - historyWindowMs
+        : Math.min.apply(null, filtered.map(v => number(v.time)));
+      const span = Math.max(1, now - first);
+      filtered.forEach(sample => {
+        const idx = Math.max(0, Math.min(HISTORY_BUCKETS - 1,
+          Math.floor((number(sample.time) - first) / span * HISTORY_BUCKETS)));
+        const cap = Math.max(1, number(sample.queueCapacity, 45));
+        const queue = Math.max(0, number(sample.queue, 0)) / cap * 100;
+        buckets[idx].count++;
+        buckets[idx].retx = Math.max(buckets[idx].retx,
+          Math.max(0, number(sample.retransmissionsPerSec, 0)));
+        buckets[idx].norx = Math.max(buckets[idx].norx,
+          Math.max(0, number(sample.noRxPerSec, 0)));
+        buckets[idx].queue = Math.max(buckets[idx].queue, queue);
+      });
+    }
+    const holder = byId('history-bars');
+    clear(holder);
+    const scalePeak = Math.max(100, ...buckets.flatMap(bucket =>
+      [bucket.retx, bucket.norx, bucket.queue]));
+    const activeBuckets = buckets
+      .map((bucket, index) => Object.assign({index}, bucket))
+      .filter(bucket => bucket.count > 0);
+    const svgNs = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNs, 'svg');
+    svg.setAttribute('viewBox', '0 0 100 60');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    [4, 30, 56].forEach(y => {
+      const line = document.createElementNS(svgNs, 'line');
+      line.setAttribute('x1', '0');
+      line.setAttribute('x2', '100');
+      line.setAttribute('y1', String(y));
+      line.setAttribute('y2', String(y));
+      line.setAttribute('class', 'grid-line');
+      svg.appendChild(line);
+    });
+    [['retx', 'retx'], ['norx', 'norx'], ['queue', 'queue']].forEach(series => {
+      if (!activeBuckets.length) return;
+      const points = activeBuckets.map(bucket => {
+        const x = activeBuckets.length === 1
+          ? 50 : bucket.index / (HISTORY_BUCKETS - 1) * 100;
+        const y = 56 - Math.min(1, bucket[series[1]] / scalePeak) * 52;
+        return [x, y];
+      });
+      if (points.length === 1) {
+        points.unshift([Math.max(0, points[0][0] - 2), points[0][1]]);
+        points.push([Math.min(100, points[1][0] + 2), points[1][1]]);
+      }
+      const polyline = document.createElementNS(svgNs, 'polyline');
+      polyline.setAttribute('class', 'series ' + series[0]);
+      polyline.setAttribute('points', points.map(point =>
+        point[0].toFixed(2) + ',' + point[1].toFixed(2)).join(' '));
+      svg.appendChild(polyline);
+    });
+    holder.appendChild(svg);
+    const retxAvg = filtered.length
+      ? filtered.reduce((sum, v) => sum + number(v.retransmissionsPerSec), 0) / filtered.length
+      : 0;
+    const norxAvg = filtered.length
+      ? filtered.reduce((sum, v) => sum + number(v.noRxPerSec), 0) / filtered.length
+      : 0;
+    const queuePeak = buckets.reduce((peak, bucket) => Math.max(peak, bucket.queue), 0);
+    byId('history-summary').textContent = '采样: ' + filtered.length
+      + ' / 重传均值 ' + retxAvg.toFixed(1)
+      + ' / No-Rx 均值 ' + norxAvg.toFixed(1)
+      + ' / 队列峰值 ' + queuePeak.toFixed(1) + '%';
+  }
+
+  function renderStatuses(rows) {
+    const holder = byId('status-grid');
+    clear(holder);
+    (rows || []).forEach(item => {
+      const status = displayStatus(item);
+      const row = document.createElement('div');
+      row.className = 'row';
+      const content = document.createElement('div');
+      const label = document.createElement('div');
+      label.className = 'lbl';
+      label.textContent = item.label || item.key || '—';
+      const sub = document.createElement('div');
+      sub.className = 'sub';
+      sub.textContent = statusSubtext(item, status);
+      content.append(label, sub);
+      if (item.detail) {
+        const code = document.createElement('code');
+        code.textContent = item.detail;
+        content.appendChild(code);
+      }
+      const pill = document.createElement('span');
+      setPill(pill, statusTier(status), status, false);
+      row.append(content, pill);
+      holder.appendChild(row);
+    });
+  }
+
+  function appendInfoRow(holder, labelText, value) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('div');
+    label.className = 'lbl';
+    label.textContent = labelText;
+    const code = document.createElement('code');
+    code.textContent = value || '—';
+    row.append(label, code);
+    holder.appendChild(row);
+  }
+  function renderEnvironment(env) {
+    const holder = byId('environment-grid');
+    clear(holder);
+    appendInfoRow(holder, '模块版本', env.module);
+    appendInfoRow(holder, '系统', env.system);
+    appendInfoRow(holder, '无线耳机 (com.oplus.melody)', env.melody);
+    appendInfoRow(holder, '蓝牙 (com.android.bluetooth)', env.bluetooth);
+    appendInfoRow(holder, '无线设置 (com.oplus.wirelesssettings)', env.wirelessSettings);
+  }
+  function renderMemory(memory) {
+    const data = memory || {};
+    const remembered = byId('memory-remembered');
+    const replay = byId('memory-replay');
+    clear(remembered);
+    clear(replay);
+    appendInfoRow(remembered, '当前 Melody 真实记忆', data.remembered);
+    appendInfoRow(replay, '上次记忆恢复链路', data.replay);
+    const hasMemory = data.remembered && !data.remembered.startsWith('尚未');
+    setPill(byId('memory-state'), hasMemory ? 'ok' : 'idle', hasMemory ? '已读取' : '等待快照', false);
+  }
+  function renderEvents(events) {
+    const holder = byId('events');
+    clear(holder);
+    if (!events || !events.length) {
+      empty(holder, '尚未采集到诊断事件；这不代表模块未生效。');
+      return;
+    }
+    events.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'event';
+      const time = document.createElement('time');
+      time.textContent = item.time || '—';
+      const level = document.createElement('span');
+      level.className = 'lvl ' + (item.level || 'I');
+      level.textContent = item.level || 'I';
+      const message = document.createElement('span');
+      message.className = 'msg';
+      message.textContent = item.message || '';
+      row.append(time, level, message);
+      holder.appendChild(row);
+    });
+  }
+
+  function applySnapshot(s) {
+    if (!s || typeof s !== 'object') return;
+    // Fail open: a single card renderer must never leave the whole page invisible.
+    byId('diagnostics-page').classList.remove('loading');
+    lastSnapshot = s;
+    const enabledSwitch = document.querySelector('input[data-enabled]');
+    const hideSwitch = document.querySelector('input[data-hide-launcher]');
+    enabledSwitch.checked = !!s.enabled;
+    hideSwitch.checked = !!s.hideLauncherIcon;
+    byId('module-status-text').textContent = s.enabled
+      ? '已启用。重启无线耳机 App 后会注入音质控制项。'
+      : '已停用。重启无线耳机 App 后宿主页会恢复原状。';
+    renderRecording(s);
+    renderBqr(s.bqr);
+    renderStatuses(s.statuses || []);
+    renderEnvironment(s.environment || {});
+    renderMemory(s.memory || {});
+    renderEvents(s.events || []);
+  }
+
+  function applyJson(raw) {
+    if (!raw) return;
+    try { applySnapshot(typeof raw === 'string' ? JSON.parse(raw) : raw); }
+    catch (_) {
+      byId('diagnostics-page').classList.remove('loading');
+      /* keep the previous good frame */
+    }
+  }
+  function refresh() {
+    if (!bridge || typeof bridge.refresh !== 'function') return;
+    applyJson(bridge.refresh());
+  }
   function start() {
+    if (!bridge) {
+      byId('diagnostics-page').classList.remove('loading');
+      return;
+    }
     if (timer) return;
     refresh();
     timer = setInterval(refresh, 4000);
   }
   function stop() {
-    if (timer) { clearInterval(timer); timer = null; }
+    if (timer) clearInterval(timer);
+    timer = null;
   }
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') start();
-    else stop();
+
+  document.querySelector('input[data-enabled]').addEventListener('change', event => {
+    if (bridge && bridge.setEnabled) bridge.setEnabled(!!event.target.checked);
   });
+  document.querySelector('input[data-hide-launcher]').addEventListener('change', event => {
+    if (bridge && bridge.setHideLauncherIcon) bridge.setHideLauncherIcon(!!event.target.checked);
+  });
+  byId('record-button').addEventListener('click', () => {
+    if (bridge && bridge.toggleRecording) bridge.toggleRecording();
+  });
+  byId('feedback-button').addEventListener('click', () => {
+    if (bridge && bridge.generateFeedback) bridge.generateFeedback();
+  });
+  byId('memory-button').addEventListener('click', () => {
+    if (bridge && bridge.requestMemorySnapshot) bridge.requestMemorySnapshot();
+  });
+  document.querySelectorAll('[data-history-window]').forEach(button => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('[data-history-window]').forEach(v => v.classList.remove('active'));
+      button.classList.add('active');
+      historyWindowMs = number(button.dataset.historyWindow, 300000);
+      renderHistory(lastSnapshot && lastSnapshot.bqr ? lastSnapshot.bqr.history : []);
+    });
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') start(); else stop();
+  });
+  window.MelodyDiagnostics = { start, stop, applyJson };
   if (document.visibilityState === 'visible') start();
 </script>
 </body>

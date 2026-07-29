@@ -2,8 +2,12 @@ package xyz.melodylsp.codec.system;
 
 import android.app.Application;
 import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothProfile;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
 import android.os.Binder;
 import android.os.Handler;
 import android.os.Looper;
@@ -14,15 +18,23 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import org.json.JSONObject;
 
 import dalvik.system.DexFile;
 
 import xyz.melodylsp.codec.MelodyCodecLspEntry;
+import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecIpc;
+import xyz.melodylsp.codec.bridge.CodecSnapshot;
+import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
+import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.leaudio.BluetoothLeAudioBridge;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
@@ -51,10 +63,13 @@ public final class SystemHookInstaller {
     private static final String CLASS_OPLUS_SMART_AUDIO =
             "com.oplus.bluetooth.feature.smartaudio.OplusBluetoothSmartAudioInterface";
     private static final String MELODY_PKG = "com.oplus.melody";
+    private static final String ACTION_A2DP_CONNECTION_STATE_CHANGED =
+            "android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED";
     private static final long GAME_MODE_SBC_FALLBACK_TTL_MS = 180_000L;
     private static final long LHDC_QUEUE_SAMPLE_INTERVAL_MS = 200L;
     private static final long LHDC_QUEUE_IDLE_INTERVAL_MS = 1_000L;
     private static final long BQR_DIAGNOSTIC_INTERVAL_MS = 60_000L;
+    private static final long BQR_LIVE_SUBSCRIPTION_TTL_MS = 12_000L;
     private static final int LHDC_QUEUE_CAPACITY = 45;
     private static final long[] NATIVE_PATCH_RETRY_DELAYS_MS = {
             0L, 350L, 1_500L, 5_000L, 12_000L
@@ -83,19 +98,33 @@ public final class SystemHookInstaller {
     private String activeLhdcMac;
     private String lastBqrDiagnosticState;
     private long lastBqrDiagnosticMs;
+    private BroadcastReceiver lhdcDiagnosticLiveControlReceiver;
+    private BroadcastReceiver lhdcSessionReceiver;
+    private long lhdcDiagnosticLiveUntilMs;
+    private String lastLhdcDiagnosticLivePayload;
+    private final Object lhdcDiagnosticReasonLock = new Object();
+    private final Map<String, Integer> lhdcDiagnosticReasonCounts = new HashMap<>();
+    private final Map<String, Long> lhdcDiagnosticReasonTimes = new HashMap<>();
 
     public SystemHookInstaller(
             MelodyCodecLspEntry module, ClassLoader classLoader, String sourceDir) {
         this.module = module;
         this.classLoader = classLoader;
         this.sourceDir = sourceDir;
-        this.linkHealthController = new LhdcLinkHealthController((mac, ceilingKbps, reason) -> {
-            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
-            MLog.event("lhdc.link.probe_ceiling",
-                    "mac", redactMac(mac),
-                    "ceilingKbps", ceilingKbps,
-                    "reason", reason);
-        });
+        this.linkHealthController = new LhdcLinkHealthController(
+                new LhdcLinkHealthController.Listener() {
+                    @Override
+                    public void onProbeCeilingChanged(
+                            String mac, int ceilingKbps, String reason) {
+                        handleProbeCeilingChanged(mac, ceilingKbps, reason);
+                    }
+
+                    @Override
+                    public void onProbeStateChanged(
+                            String mac, int ceilingKbps, String reason) {
+                        handleProbeStateChanged(mac, ceilingKbps, reason);
+                    }
+                });
     }
 
     public void install() {
@@ -212,6 +241,8 @@ public final class SystemHookInstaller {
                 Object app = chain.getThisObject();
                 if (app instanceof Context) {
                     appContext = ((Context) app).getApplicationContext();
+                    registerLhdcDiagnosticLiveControlReceiver(appContext);
+                    registerLhdcSessionReceiver(appContext);
                     NativeLhdcMemoryPatch.configureModuleContext(appContext);
                     NativeLhdcMemoryPatch.installGovernor();
                     MLog.setDiagnosticContext(appContext, "bluetooth");
@@ -225,6 +256,217 @@ public final class SystemHookInstaller {
         } catch (Throwable t) {
             MLog.w("hook bluetooth Application.onCreate for LE Audio failed", t);
         }
+    }
+
+    private synchronized void registerLhdcDiagnosticLiveControlReceiver(Context context) {
+        if (context == null || lhdcDiagnosticLiveControlReceiver != null) return;
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context receiverContext, Intent intent) {
+                if (intent == null
+                        || !CodecIpc.ACTION_LHDC_DIAGNOSTIC_LIVE_CONTROL.equals(
+                        intent.getAction())
+                        || !CodecIpc.TOKEN.equals(
+                        intent.getStringExtra(CodecIpc.EXTRA_TOKEN))) {
+                    return;
+                }
+                if (TrustedBroadcasts.supportsSenderIdentity()
+                        && !TrustedBroadcasts.isTrustedSender(
+                        receiverContext,
+                        TrustedBroadcasts.captureSender(this),
+                        BuildConfig.APPLICATION_ID)) {
+                    return;
+                }
+                boolean enabled = intent.getBooleanExtra(
+                        CodecIpc.EXTRA_DIAGNOSTIC_LIVE_ENABLED, false);
+                boolean wasActive = SystemClock.elapsedRealtime()
+                        < lhdcDiagnosticLiveUntilMs;
+                lhdcDiagnosticLiveUntilMs = enabled
+                        ? SystemClock.elapsedRealtime() + BQR_LIVE_SUBSCRIPTION_TTL_MS
+                        : 0L;
+                if (enabled != wasActive) {
+                    MLog.eventLogOnly("lhdc.link.live_control", "enabled", enabled);
+                }
+                if (enabled && !wasActive && lastLhdcDiagnosticLivePayload != null) {
+                    sendLhdcDiagnosticLivePayload(lastLhdcDiagnosticLivePayload);
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(
+                CodecIpc.ACTION_LHDC_DIAGNOSTIC_LIVE_CONTROL);
+        if (TrustedBroadcasts.registerExportedReceiver(
+                context,
+                receiver,
+                filter,
+                BuildConfig.APPLICATION_ID + ".permission.DIAGNOSTIC_REQUEST",
+                mainHandler)) {
+            lhdcDiagnosticLiveControlReceiver = receiver;
+        } else {
+            MLog.w("LHDC foreground diagnostic control receiver unavailable");
+        }
+    }
+
+    private synchronized void registerLhdcSessionReceiver(Context context) {
+        if (context == null || lhdcSessionReceiver != null) return;
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context receiverContext, Intent intent) {
+                if (intent == null) return;
+                String action = intent.getAction();
+                boolean disconnected = BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)
+                        || (ACTION_A2DP_CONNECTION_STATE_CHANGED.equals(action)
+                        && intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1)
+                        == BluetoothProfile.STATE_DISCONNECTED);
+                if (!disconnected) return;
+                BluetoothDevice device;
+                try {
+                    device = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+                } catch (Throwable ignored) {
+                    return;
+                }
+                if (device == null) return;
+                resetLhdcLinkState(
+                        device.getAddress(),
+                        BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(action)
+                                ? "acl_disconnected" : "a2dp_disconnected");
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_A2DP_CONNECTION_STATE_CHANGED);
+        filter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                context.registerReceiver(
+                        receiver, filter, null, mainHandler, Context.RECEIVER_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, filter, null, mainHandler);
+            }
+            lhdcSessionReceiver = receiver;
+            MLog.event("lhdc.link.session_receiver.registered");
+        } catch (Throwable t) {
+            MLog.w("LHDC session reset receiver unavailable", t);
+        }
+    }
+
+    private void handleProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
+        NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+        MLog.event("lhdc.link.probe_ceiling",
+                "mac", redactMac(mac),
+                "ceilingKbps", ceilingKbps,
+                "reason", reason);
+        sendLhdcDiagnosticLiveState(
+                mac,
+                linkHealthController.snapshot(mac, SystemClock.elapsedRealtime()),
+                reason,
+                "reason");
+    }
+
+    private void handleProbeStateChanged(String mac, int ceilingKbps, String reason) {
+        MLog.event("lhdc.link.probe_state",
+                "mac", redactMac(mac),
+                "ceilingKbps", ceilingKbps,
+                "reason", reason);
+        sendLhdcDiagnosticLiveState(
+                mac,
+                linkHealthController.snapshot(mac, SystemClock.elapsedRealtime()),
+                reason,
+                "reason");
+    }
+
+    private void sendLhdcDiagnosticLiveState(
+            String mac,
+            LhdcLinkHealthController.Snapshot snapshot,
+            String reason,
+            String kind) {
+        if (snapshot == null) return;
+        try {
+            JSONObject payload = new JSONObject();
+            long capturedAtMs = System.currentTimeMillis();
+            if (reason != null && !reason.isEmpty()) {
+                noteLhdcDiagnosticReason(reason, capturedAtMs);
+            }
+            payload.put("time", capturedAtMs);
+            payload.put("kind", kind == null ? "state" : kind);
+            payload.put("mac", redactMac(mac));
+            payload.put("streaming", NativeLhdcMemoryPatch.isGovernorStreaming());
+            payload.put("actualBitrateKbps",
+                    NativeLhdcMemoryPatch.currentGovernorBitrateKbps());
+            payload.put("retransmissionsPerSec",
+                    finiteOrNull(snapshot.retransmissionsPerSecond));
+            payload.put("noRxPerSec", finiteOrNull(snapshot.noRxPerSecond));
+            payload.put("unusedAfh", Math.max(0, 79 - snapshot.usableAfhChannels));
+            payload.put("usableAfh", snapshot.usableAfhChannels);
+            payload.put("healthyWindows", snapshot.healthyBqrWindows);
+            payload.put("ceilingKbps", snapshot.ceilingKbps);
+            payload.put("lock500to900", snapshot.boundary500To900Locked);
+            payload.put("lock900to1000", snapshot.boundary900To1000Locked);
+            payload.put("requiredHealthyWindows", snapshot.requiredHealthyBqrWindows);
+            payload.put("requiredQuietMs", snapshot.requiredQuietMs);
+            payload.put("queue", snapshot.currentQueueLength);
+            payload.put("queueCapacity", snapshot.queueCapacity);
+            payload.put("lowQueueDurationMs", snapshot.lowQueueDurationMs);
+            payload.put("lastCongestionAgoMs", snapshot.lastCongestionAgoMs);
+            payload.put("probePhase", snapshot.probePhase);
+            payload.put("probeElapsedMs", snapshot.probeElapsedMs);
+            payload.put("probeBadWindows", snapshot.probeBadBqrWindows);
+            payload.put("recoveryWaitRemainingMs", snapshot.recoveryWaitRemainingMs);
+            payload.put("nativeBackoffRemainingMs", snapshot.nativeBackoffRemainingMs);
+            payload.put("blockedReason", snapshot.blockedReason);
+            payload.put("streamSessionId", snapshot.streamSessionId);
+            appendLhdcDiagnosticReasonHistory(payload);
+            if (reason != null && !reason.isEmpty()) payload.put("reason", reason);
+            publishLhdcDiagnosticLivePayload(payload.toString());
+        } catch (Throwable t) {
+            MLog.w("LHDC live diagnostic payload failed", t);
+        }
+    }
+
+    private void publishLhdcDiagnosticLivePayload(String payload) {
+        if (payload == null || payload.isEmpty()) return;
+        lastLhdcDiagnosticLivePayload = payload;
+        sendLhdcDiagnosticLivePayload(payload);
+    }
+
+    private void sendLhdcDiagnosticLivePayload(String payload) {
+        Context context = appContext;
+        if (context == null
+                || payload == null
+                || SystemClock.elapsedRealtime() >= lhdcDiagnosticLiveUntilMs) {
+            return;
+        }
+        Intent intent = new Intent(CodecIpc.ACTION_LHDC_DIAGNOSTIC_LIVE_SAMPLE);
+        intent.setPackage(BuildConfig.APPLICATION_ID);
+        intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+        intent.putExtra(CodecIpc.EXTRA_DIAGNOSTIC_LIVE_PAYLOAD, payload);
+        TrustedBroadcasts.send(context, intent);
+    }
+
+    private static Object finiteOrNull(double value) {
+        return Double.isNaN(value) || Double.isInfinite(value)
+                ? JSONObject.NULL : value;
+    }
+
+    private void noteLhdcDiagnosticReason(String reason, long capturedAtMs) {
+        synchronized (lhdcDiagnosticReasonLock) {
+            lhdcDiagnosticReasonCounts.put(reason,
+                    lhdcDiagnosticReasonCounts.getOrDefault(reason, 0) + 1);
+            lhdcDiagnosticReasonTimes.put(reason, capturedAtMs);
+        }
+    }
+
+    private void appendLhdcDiagnosticReasonHistory(JSONObject payload) throws Exception {
+        JSONObject counts = new JSONObject();
+        JSONObject times = new JSONObject();
+        synchronized (lhdcDiagnosticReasonLock) {
+            for (Map.Entry<String, Integer> entry : lhdcDiagnosticReasonCounts.entrySet()) {
+                counts.put(entry.getKey(), entry.getValue());
+            }
+            for (Map.Entry<String, Long> entry : lhdcDiagnosticReasonTimes.entrySet()) {
+                times.put(entry.getKey(), entry.getValue());
+            }
+        }
+        payload.put("reasonCounts", counts);
+        payload.put("reasonTimes", times);
     }
 
     private void hookCdmAssociationForMelody() {
@@ -377,7 +619,8 @@ public final class SystemHookInstaller {
             Context context, CodecBridgeService service) {
         if (codecBroadcastBridge != null || context == null || service == null) return;
         try {
-            codecBroadcastBridge = new CodecBroadcastBridge(context, service);
+            codecBroadcastBridge = new CodecBroadcastBridge(
+                    context, service, this::handleGovernorPolicyChanged);
             codecBroadcastBridge.register();
         } catch (Throwable t) {
             codecBroadcastBridge = null;
@@ -394,7 +637,9 @@ public final class SystemHookInstaller {
                 CodecBridgeService bridge = bridgeService;
                 if (bridge != null) {
                     try {
-                        bridge.notifyCodecChanged(chain.getArgs().toArray());
+                        CodecSnapshot snapshot =
+                                bridge.notifyCodecChanged(chain.getArgs().toArray());
+                        handleCodecSnapshotForGovernor(snapshot);
                     } catch (Throwable t) {
                         MLog.w("notifyCodecChanged failed", t);
                     }
@@ -404,6 +649,40 @@ public final class SystemHookInstaller {
             hooked++;
         }
         MLog.event("codec.updated.hooks", "count", hooked);
+    }
+
+    private void handleGovernorPolicyChanged(String mac, int policy, String reason) {
+        if (LhdcQualityPolicy.normalize(policy) == LhdcQualityPolicy.QUALITY) return;
+        mainHandler.post(() -> resetLhdcLinkState(mac,
+                policy == LhdcQualityPolicy.CONNECTION
+                        ? "policy_connection" : "policy_adaptive"));
+    }
+
+    private void handleCodecSnapshotForGovernor(CodecSnapshot snapshot) {
+        if (snapshot == null || CodecLabelTable.isLhdc(snapshot.activeCodecType)) return;
+        String mac = snapshot.mac;
+        if (mac == null || (!mac.equals(activeLhdcMac)
+                && !mac.equals(linkHealthController.activeMac()))) {
+            return;
+        }
+        resetLhdcLinkState(mac, "codec_exit");
+    }
+
+    private void resetLhdcLinkState(String mac, String reason) {
+        if (mac == null || mac.isEmpty()) return;
+        boolean nativeSessionActive = mac.equals(activeLhdcMac);
+        boolean controllerWasActive = linkHealthController.resetDevice(
+                mac, SystemClock.elapsedRealtime(), reason);
+        if (nativeSessionActive) activeLhdcMac = null;
+        if (nativeSessionActive && !controllerWasActive) {
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(1000);
+        }
+        if (nativeSessionActive || controllerWasActive) {
+            MLog.event("lhdc.link.session_reset",
+                    "mac", redactMac(mac),
+                    "reason", reason,
+                    "ceilingKbps", 1000);
+        }
     }
 
     private void hookNativeCodecPreferenceLogger() {
@@ -520,12 +799,15 @@ public final class SystemHookInstaller {
             MLog.event("lhdc.link.bqr_ignored", "mac", redactMac(mac), "reason", "not_active");
             return;
         }
-        activeLhdcMac = mac;
-        linkHealthController.activate(mac, capturedAtMs);
+        if (!mac.equals(activeLhdcMac)) {
+            activeLhdcMac = mac;
+            linkHealthController.activate(mac, capturedAtMs);
+        }
         boolean streaming = NativeLhdcMemoryPatch.isGovernorStreaming();
         linkHealthController.onBqrSample(mac, sample, capturedAtMs, streaming);
         LhdcLinkHealthController.Snapshot snapshot =
                 linkHealthController.snapshot(mac, capturedAtMs);
+        int actualBitrateKbps = NativeLhdcMemoryPatch.currentGovernorBitrateKbps();
         Object[] telemetry = {
                 "mac", redactMac(mac),
                 "unusedAfh", sample.unusedAfhChannels,
@@ -541,19 +823,34 @@ public final class SystemHookInstaller {
                 "overflow", sample.overflowCount,
                 "underflow", sample.underflowCount,
                 "streaming", streaming,
+                "actualBitrateKbps", actualBitrateKbps,
                 "healthyWindows", snapshot.healthyBqrWindows,
                 "ceilingKbps", snapshot.ceilingKbps,
                 "lock500to900", snapshot.boundary500To900Locked,
                 "lock900to1000", snapshot.boundary900To1000Locked,
                 "requiredHealthyWindows", snapshot.requiredHealthyBqrWindows,
-                "requiredQuietMs", snapshot.requiredQuietMs
+                "requiredQuietMs", snapshot.requiredQuietMs,
+                "queue", snapshot.currentQueueLength,
+                "queueCapacity", snapshot.queueCapacity,
+                "lowQueueDurationMs", snapshot.lowQueueDurationMs,
+                "lastCongestionAgoMs", snapshot.lastCongestionAgoMs,
+                "probePhase", snapshot.probePhase,
+                "probeElapsedMs", snapshot.probeElapsedMs,
+                "probeBadWindows", snapshot.probeBadBqrWindows,
+                "recoveryWaitRemainingMs", snapshot.recoveryWaitRemainingMs,
+                "nativeBackoffRemainingMs", snapshot.nativeBackoffRemainingMs,
+                "blockedReason", snapshot.blockedReason,
+                "streamSessionId", snapshot.streamSessionId
         };
         MLog.eventLogOnly("lhdc.link.bqr", telemetry);
+        sendLhdcDiagnosticLiveState(mac, snapshot, null, "bqr");
         String diagnosticState = mac + '|' + streaming + '|'
                 + snapshot.healthyBqrWindows + '|' + snapshot.ceilingKbps + '|'
                 + snapshot.boundary500To900Locked + '|'
                 + snapshot.boundary900To1000Locked + '|'
-                + snapshot.requiredHealthyBqrWindows + '|' + snapshot.requiredQuietMs;
+                + snapshot.requiredHealthyBqrWindows + '|' + snapshot.requiredQuietMs + '|'
+                + snapshot.probePhase + '|' + snapshot.blockedReason + '|'
+                + snapshot.probeBadBqrWindows + '|' + snapshot.streamSessionId;
         if (!diagnosticState.equals(lastBqrDiagnosticState)
                 || capturedAtMs - lastBqrDiagnosticMs >= BQR_DIAGNOSTIC_INTERVAL_MS) {
             lastBqrDiagnosticState = diagnosticState;
@@ -695,16 +992,24 @@ public final class SystemHookInstaller {
                     NativeLhdcMemoryPatch.reportQueueLength(length);
                     long nowMs = SystemClock.elapsedRealtime();
                     String mac = activeLhdcMac;
+                    long streamSessionId = NativeLhdcMemoryPatch.currentGovernorSessionEpoch();
                     NativeLhdcMemoryPatch.GovernorEvent event =
                             NativeLhdcMemoryPatch.consumeGovernorEvent();
                     if (mac != null) {
+                        if (NativeLhdcMemoryPatch.isGovernorStreaming()) {
+                            linkHealthController.onStreamSessionChanged(
+                                    mac, streamSessionId, nowMs);
+                        }
+                        if (event != null) {
+                            linkHealthController.onGovernorEvent(
+                                    mac, event.type, event.fromKbps, event.toKbps,
+                                    event.detailMs, nowMs);
+                        }
                         if (NativeLhdcMemoryPatch.isGovernorStreaming()) {
                             linkHealthController.onQueueSample(
                                     mac, length, LHDC_QUEUE_CAPACITY, nowMs);
                         }
                         if (event != null) {
-                            linkHealthController.onGovernorEvent(
-                                    mac, event.type, event.fromKbps, event.toKbps, nowMs);
                             LhdcLinkHealthController.Snapshot snapshot =
                                     linkHealthController.snapshot(mac, nowMs);
                             MLog.event("lhdc.link.governor_event",
@@ -712,10 +1017,27 @@ public final class SystemHookInstaller {
                                     "type", event.type,
                                     "fromKbps", event.fromKbps,
                                     "toKbps", event.toKbps,
+                                    "detailMs", event.detailMs,
+                                    "actualBitrateKbps",
+                                    NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
                                     "ceilingKbps", snapshot.ceilingKbps,
                                     "requiredHealthyWindows",
                                     snapshot.requiredHealthyBqrWindows,
-                                    "requiredQuietMs", snapshot.requiredQuietMs);
+                                    "requiredQuietMs", snapshot.requiredQuietMs,
+                                    "queue", snapshot.currentQueueLength,
+                                    "lowQueueDurationMs", snapshot.lowQueueDurationMs,
+                                    "probePhase", snapshot.probePhase,
+                                    "probeElapsedMs", snapshot.probeElapsedMs,
+                                    "nativeBackoffRemainingMs",
+                                    snapshot.nativeBackoffRemainingMs,
+                                    "blockedReason", snapshot.blockedReason,
+                                    "streamSessionId", snapshot.streamSessionId);
+                            String liveReason = null;
+                            if (event.type == LhdcLinkHealthController.EVENT_UPGRADE_APPLIED) {
+                                liveReason = "native_upgrade_applied";
+                            }
+                            sendLhdcDiagnosticLiveState(
+                                    mac, snapshot, liveReason, "governor");
                         }
                     }
                     smartAudioQueueSampleFailures = 0;

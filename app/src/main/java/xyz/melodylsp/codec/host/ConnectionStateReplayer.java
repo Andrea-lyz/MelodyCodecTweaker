@@ -50,7 +50,8 @@ public final class ConnectionStateReplayer {
     private static final String EXTRA_USER_CODEC_WRITE_ORIGIN = "user_codec_write_origin";
     private static final int STATE_CONNECTED = 2;
 
-    private static final long REPLAY_DELAY_MS = 1_500L;
+    static final long REPLAY_DELAY_MS = 1_500L;
+    static final long ACTIVE_READY_REPLAY_DELAY_MS = 100L;
     private static final long REPLAY_VERIFY_DELAY_MS = 2_000L;
     private static final long GAME_MODE_EXIT_REPLAY_DELAY_MS = 800L;
     private static final long GAME_MODE_LIVE_SBC_FALLBACK_MS = 180_000L;
@@ -338,8 +339,16 @@ public final class ConnectionStateReplayer {
                     key, fallbackUntil, GAME_MODE_EXIT_PROBE_FAST_DELAY_MS);
         }
         if (pending != null) {
-            scheduleReplay(key, pending.value, pending.delayMs, pending.activeReadyReason());
+            scheduleReplay(
+                    key,
+                    pending.value,
+                    replayDelayAfterActiveReady(pending.delayMs),
+                    pending.activeReadyReason());
         }
+    }
+
+    static long replayDelayAfterActiveReady(long pendingDelayMs) {
+        return Math.min(Math.max(0L, pendingDelayMs), ACTIVE_READY_REPLAY_DELAY_MS);
     }
 
     void onOfficialGameModeState(

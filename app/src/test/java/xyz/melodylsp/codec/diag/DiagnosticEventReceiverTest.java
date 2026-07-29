@@ -1,6 +1,7 @@
 package xyz.melodylsp.codec.diag;
 
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.After;
@@ -37,5 +38,14 @@ public final class DiagnosticEventReceiverTest {
         assertFalse(DiagnosticEvents.isRecordingUntil(0L, 10_000L));
         assertFalse(DiagnosticEvents.isRecordingUntil(10_000L, 10_000L));
         assertTrue(DiagnosticEvents.isRecordingUntil(10_001L, 10_000L));
+    }
+
+    @Test
+    public void missingStatusDistinguishesCoreConditionalAndHealthyAbsence() {
+        assertEquals("等待状态", DiagnosticEvents.defaultStatus("scope.host"));
+        assertEquals("本次未触发", DiagnosticEvents.defaultStatus("inject.detail"));
+        assertEquals("本次未触发", DiagnosticEvents.defaultStatus("inject.onespace"));
+        assertEquals("未发现", DiagnosticEvents.defaultStatus("last.warning"));
+        assertEquals("未发现", DiagnosticEvents.defaultStatus("last.error"));
     }
 }
