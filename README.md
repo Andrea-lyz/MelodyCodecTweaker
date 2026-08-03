@@ -256,7 +256,7 @@ Java 侧将队列、remote choppy 与 BQR 归一到逐耳机链路状态，nativ
 
 - 在 `com.android.bluetooth` 进程内加载 APK 自带的 `libmelody_lhdc_patch.so`。
 - 扫描当前已映射的 `/system/lib64/libbluetooth_jni.so`。
-- 先按已知蓝牙库族的机器码字节特征匹配目标函数；当前已覆盖实测的 `branch_plus_69`、`branch_plus_23_op15`、`branch_plus_73_plc110`、`branch_plus_68_pjz110_1609401` 等变体。
+- 先按已知蓝牙库族的机器码字节特征匹配目标函数；当前已覆盖实测的 `branch_plus_69`、`branch_plus_23_op15`、`branch_plus_73_plc110`、`branch_plus_68_pjz110_1609401`、`branch_plus_27_rmx6688`（realme RMX6688 等 MTK 平台 16.0.7）等变体。
 - 已知字节特征未命中时，语义扫描器会验证共享跳转目标、`cmp #0x13`、`sub #7`、`cmp #2`、`b.hs` 和固定质量模式 4 这一组控制流约束；只有全库唯一命中才写入。
 - 只有在某个已知特征或语义控制流唯一命中时，才调用 native helper 写入对应 4 字节 ARM64 指令。
 - native helper 会再次核对 expected 指令，以对齐的 32 位原子写完成替换，随后执行指令缓存刷新、回读验证并恢复原内存页权限。

@@ -54,6 +54,12 @@ final class NativeLhdcMemoryPatch {
                     hex("1f0900f144000014a83e80529a008052"),
                     4,
                     hex("44000014")),
+            new PatternSpec(
+                    "branch_plus_27_rmx6688",
+                    hex("1f0900f182030054a80e8052b8cdfff0"),
+                    hex("1f0900f11c000014a80e8052b8cdfff0"),
+                    4,
+                    hex("1c000014")),
     };
     private static final int MAX_RANGE_BYTES = 64 * 1024 * 1024;
     private static final int NATIVE_PATCH_OK = 0;
@@ -68,6 +74,11 @@ final class NativeLhdcMemoryPatch {
     private static volatile int governorPolicy = LhdcQualityPolicy.ADAPTIVE;
 
     private NativeLhdcMemoryPatch() {
+    }
+
+    /** Visible for tests. */
+    static PatternSpec[] patternsForTest() {
+        return PATTERN_SPECS;
     }
 
     static void configureModuleContext(Context hostContext) {
@@ -348,7 +359,10 @@ final class NativeLhdcMemoryPatch {
      * <p>The stable control-flow shape is: CBNZ and B.NE share a forward target, the latter is
      * guarded by {@code cmp wN, #0x13}, followed by {@code sub xN, xM, #7},
      * {@code cmp xN, #2}, and {@code b.hs same_target}. The forced path then selects quality mode
-     * 4. We only accept a unique match across executable mappings.</p>
+     * 4. OPlus sometimes interleaves string-pointer setup ({@code adrp}/{@code add}) between the
+     * guard branch and the quality-mode load, so the mode-4 store is searched within the first
+     * eight instructions after the branch. We only accept a unique match across executable
+     * mappings.</p>
      */
     private static SemanticScan scanSemanticGuard(List<MapRange> ranges) {
         SemanticScan out = new SemanticScan();
@@ -372,7 +386,7 @@ final class NativeLhdcMemoryPatch {
                 if (target <= address || target - address > 0x400L) continue;
                 if (!hasCmp19AndBranchTo(bytes, range.start, offset, target)) continue;
                 if (!hasCbnzTo(bytes, range.start, offset, target)) continue;
-                if (!hasMovWImmediate(bytes, offset + 4, 4, 4)) continue;
+                if (!hasMovWImmediate(bytes, offset + 4, 8, 4)) continue;
 
                 if (originalBranch) {
                     int replacement = encodeUnconditionalBranch(address, target);
@@ -792,7 +806,7 @@ final class NativeLhdcMemoryPatch {
         int patchedCount;
     }
 
-    private static final class PatternSpec {
+    static final class PatternSpec {
         final String name;
         final byte[] original;
         final byte[] patched;
