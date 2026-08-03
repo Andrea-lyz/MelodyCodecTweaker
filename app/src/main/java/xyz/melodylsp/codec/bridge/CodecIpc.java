@@ -73,6 +73,8 @@ public final class CodecIpc {
     public static final String EXTRA_GAME_MODE_TTL_MS = "game_mode_ttl_ms";
     public static final String EXTRA_LHDC_POLICY = "lhdc_policy";
     public static final String EXTRA_LHDC_POLICY_REASON = "lhdc_policy_reason";
+    /** Optional peer max-bitrate ceiling in kbps (0 = not supplied), sent with the policy. */
+    public static final String EXTRA_LHDC_POLICY_CEILING_KBPS = "lhdc_policy_ceiling_kbps";
     public static final String EXTRA_DIAGNOSTIC_LIVE_ENABLED = "diagnostic_live_enabled";
     public static final String EXTRA_DIAGNOSTIC_LIVE_PAYLOAD = "diagnostic_live_payload";
 

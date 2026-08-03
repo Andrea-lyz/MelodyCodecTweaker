@@ -119,6 +119,11 @@ public final class CodecBroadcastBridge {
                         CodecIpc.EXTRA_LHDC_POLICY,
                         xyz.melodylsp.codec.bridge.LhdcQualityPolicy.ADAPTIVE);
                 String reason = intent.getStringExtra(CodecIpc.EXTRA_LHDC_POLICY_REASON);
+                int ceilingKbps = intent.getIntExtra(
+                        CodecIpc.EXTRA_LHDC_POLICY_CEILING_KBPS, 0);
+                if (ceilingKbps > 0) {
+                    NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+                }
                 boolean applied = NativeLhdcMemoryPatch.setGovernorPolicy(policy);
                 if (applied) scheduleGovernorInstallRetries();
                 if (applied && governorPolicyListener != null) {
@@ -128,6 +133,7 @@ public final class CodecBroadcastBridge {
                         "applied", applied,
                         "policy", policy,
                         "reason", reason,
+                        "ceilingKbps", ceilingKbps,
                         "mac", redactMac(mac));
             }
         } catch (Throwable t) {

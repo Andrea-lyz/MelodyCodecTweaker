@@ -38,7 +38,10 @@ public final class LhdcQualityPolicy {
     }
 
     public static int normalize(int policy) {
-        if (policy == CONNECTION || policy == QUALITY) return policy;
+        if (policy == CONNECTION) return policy;
+        if (policy == QUALITY || policy == (int) CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+            return QUALITY;
+        }
         return ADAPTIVE;
     }
 
@@ -48,7 +51,30 @@ public final class LhdcQualityPolicy {
 
     public static long transportSpecific1(long specific1, int policy) {
         int normalized = normalize(policy);
+        long lowByte = specific1 & 0xFFL;
+        // A caller that already lowered the transport to the peer ceiling (900 kbps) keeps it;
+        // otherwise QUALITY is transported as the real 1000 kbps fixed mode.
+        if (normalized == QUALITY
+                && lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+            return (specific1 & ~0xFFL) | lowByte;
+        }
         return (specific1 & ~0xFFL) | (normalized & 0xFFL);
+    }
+
+    /**
+     * Lowers {@code specific1}'s quality byte to the peer ceiling when the caller requested the
+     * logical QUALITY (1000 kbps) but the peer only accepts 900 kbps. Returns the original value
+     * when no ceiling applies.
+     */
+    public static long clampToCeiling(long specific1, int ceilingLowByte) {
+        if (ceilingLowByte != (int) CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+            return specific1;
+        }
+        long lowByte = specific1 & 0xFFL;
+        if (lowByte != (int) CodecLabelTable.LHDC_QUALITY_FIXED_1000) {
+            return specific1;
+        }
+        return (specific1 & ~0xFFL) | CodecLabelTable.LHDC_QUALITY_FIXED_900;
     }
 
     public static CodecRequest transportRequest(CodecRequest request, int policy) {
@@ -69,6 +95,15 @@ public final class LhdcQualityPolicy {
 
     /** Sends the active logical policy to the governor in {@code com.android.bluetooth}. */
     public static boolean send(Context context, String mac, int policy, String reason) {
+        return send(context, mac, policy, reason, 0);
+    }
+
+    /**
+     * Sends the active logical policy together with a known peer ceiling (kbps). {@code 0}
+     * means the caller has no ceiling evidence; the governor keeps its current probe ceiling.
+     */
+    public static boolean send(
+            Context context, String mac, int policy, String reason, int ceilingKbps) {
         if (context == null || mac == null || mac.isEmpty()) return false;
         int normalized = normalize(policy);
         Intent intent = new Intent(CodecIpc.ACTION_SET_LHDC_POLICY);
@@ -78,11 +113,15 @@ public final class LhdcQualityPolicy {
         intent.putExtra(CodecIpc.EXTRA_LHDC_POLICY, normalized);
         intent.putExtra(CodecIpc.EXTRA_LHDC_POLICY_REASON,
                 reason != null && !reason.isEmpty() ? reason : "unknown");
+        if (ceilingKbps > 0) {
+            intent.putExtra(CodecIpc.EXTRA_LHDC_POLICY_CEILING_KBPS, ceilingKbps);
+        }
         boolean sent = TrustedBroadcasts.send(context, intent);
         MLog.event("lhdc.policy.send",
                 "mac", redact(mac),
                 "policy", normalized,
                 "reason", reason,
+                "ceilingKbps", ceilingKbps,
                 "sent", sent);
         return sent;
     }

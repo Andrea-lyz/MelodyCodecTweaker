@@ -424,6 +424,49 @@ public final class LhdcLinkHealthControllerTest {
         return controller;
     }
 
+    @Test
+    public void peerCeiling900CapsCeilingAndNeverProbesTo1000() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+
+        LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 200L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertFalse(snapshot.boundary900To1000Locked);
+        assertEquals("1000:device_active", recorder.events.get(0));
+        assertEquals("900:codec_confirmed", recorder.events.get(1));
+
+        // Even after healthy BQR, the controller must never open a 900->1000 recovery probe.
+        long probeAt = openHealthyProbe(controller);
+        assertEquals(900, controller.snapshot(MAC, probeAt).ceilingKbps);
+        assertEquals("stable", controller.snapshot(MAC, probeAt).probePhase);
+        assertEquals(2, recorder.events.size());
+    }
+
+    @Test
+    public void peerCeiling1000RestoresDefaultProbing() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+        controller.setPeerCeilingKbps(MAC, 1000, 300L, "codec_confirmed");
+        assertEquals(1000, controller.snapshot(MAC, 300L).ceilingKbps);
+    }
+
+    @Test
+    public void peerCeiling900SurvivesStreamSessionButResetsWithDevice() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+        controller.onStreamSessionChanged(MAC, 7L, 300L);
+        assertEquals(900, controller.snapshot(MAC, 300L).ceilingKbps);
+
+        controller.resetDevice(MAC, 400L, "session_reset");
+        assertEquals(1000, controller.snapshot(MAC, 400L).ceilingKbps);
+    }
+
     private static long openHealthyProbe(LhdcLinkHealthController controller) {
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
         controller.onQueueSample(MAC, 0, 45, 10_100L);

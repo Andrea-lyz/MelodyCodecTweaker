@@ -187,6 +187,12 @@ final class LhdcLinkHealthController {
         long healthyDecaySinceMs;
         boolean streaming;
         long streamSessionId;
+        /**
+         * Peer max-bitrate ceiling in kbps reported by the stack-confirmed codec config
+         * (0 = unknown, treated as 1000). A value of 900 or lower permanently blocks the
+         * 900→1000 upgrade boundary because it is a peer capability, not link quality.
+         */
+        int peerCeilingKbps;
     }
 
     private final Map<String, DeviceState> devices = new HashMap<>();
@@ -232,6 +238,31 @@ final class LhdcLinkHealthController {
         return activeMac;
     }
 
+    /**
+     * Records the peer max-bitrate ceiling learned from the stack-confirmed codec config.
+     * A ceiling of 900 kbps or lower cancels any in-flight 900→1000 probe and prevents the
+     * boundary from ever reopening; the 500→900 boundary keeps learning normally.
+     */
+    synchronized void setPeerCeilingKbps(
+            String mac, int ceilingKbps, long nowMs, String reason) {
+        if (mac == null || mac.isEmpty() || ceilingKbps <= 0) return;
+        DeviceState state = stateFor(mac);
+        state.peerCeilingKbps = ceilingKbps;
+        if (ceilingKbps <= 900 && state.to1000.probeInFlight) {
+            state.to1000.probeInFlight = false;
+            state.to1000.upgradeApplied = false;
+            state.to1000.lastProbeClosedMs = nowMs;
+            state.probeStableBqrWindows = 0;
+            state.probeBadBqrWindows = 0;
+        }
+        state.to1000.locked = false;
+        if (mac.equals(activeMac)) {
+            state.lastPublishedCeiling = -1;
+            publishCeiling(mac, state,
+                    reason != null && !reason.isEmpty() ? reason : "peer_ceiling");
+        }
+    }
+
     /** Clears all learned and transient state after the LHDC user-visible session ends. */
     synchronized boolean resetDevice(String mac, long nowMs, String reason) {
         if (mac == null || mac.isEmpty()) return false;
@@ -243,6 +274,7 @@ final class LhdcLinkHealthController {
         }
         clearBoundary(state.to900);
         clearBoundary(state.to1000);
+        state.peerCeilingKbps = 0;
         state.streamSessionId = 0L;
         resetSessionEvidence(state, nowMs);
         if (wasActive) {
@@ -555,6 +587,9 @@ final class LhdcLinkHealthController {
     private static int effectiveCeiling(DeviceState state) {
         if (state.to900.locked) return state.to900.probeInFlight ? 900 : 500;
         if (state.to1000.locked) return state.to1000.probeInFlight ? 1000 : 900;
+        if (state.peerCeilingKbps > 0 && state.peerCeilingKbps <= 900) {
+            return state.peerCeilingKbps;
+        }
         return 1000;
     }
 

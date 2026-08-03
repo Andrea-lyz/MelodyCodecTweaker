@@ -29,6 +29,7 @@ public final class Strings {
     public static final String TOAST_NATIVE_PATCH_UNSUPPORTED = "未适配，请联系开发者反馈";
     public static final String TOAST_A2DP_WAITING = "等待耳机就绪";
     public static final String TOAST_CODEC_MODE_UNSUPPORTED = "当前耳机不支持高品质编解码器切换";
+    public static final String TOAST_LHDC_CEILING_900 = "1Mbps码率应用失败，耳机侧报告限制最大码率为900kbps";
 
     public static final String FRESHNESS_LABEL_FORMAT = "上次同步：%s";
     public static final String QUALITY_UNKNOWN_VALUE_FORMAT = "未知档位（specific1=%s）";

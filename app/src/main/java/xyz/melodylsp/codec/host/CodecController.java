@@ -12,6 +12,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.Gravity;
 import android.view.View;
@@ -84,6 +85,8 @@ public final class CodecController {
     private static final long AAC_HIGH_QUALITY_WARMUP_DELAY_MS = 650L;
     private static final long REMEMBER_CONFIRM_RECHECK_DELAY_MS = 2_000L;
     private static final long GOVERNOR_BITRATE_POLL_MS = 1_000L;
+    /** Logcat rate limit for unchanged native-patch state (per-process). */
+    private static final long NATIVE_PATCH_STATE_LOG_INTERVAL_MS = 5_000L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
     private static volatile boolean couiPopupDiscoveryAttempted;
@@ -112,6 +115,7 @@ public final class CodecController {
     private int lhdcGovernorBitrateKbps;
     private boolean governorBitratePollScheduled;
     private final Runnable governorBitratePoll = this::runGovernorBitratePoll;
+    private long lastNativePatchStateLogMs;
 
     public interface SurfaceRescanRequester {
         void request(String reason);
@@ -405,8 +409,14 @@ public final class CodecController {
                 "bitrateKbps", lhdcGovernorBitrateKbps,
                 "unsupported", nativePatchUnsupported
         };
-        if (stateChanged) MLog.event("native.patch.state.recv", telemetry);
-        else MLog.eventLogOnly("native.patch.state.recv", telemetry);
+        long nowMs = SystemClock.elapsedRealtime();
+        if (stateChanged) {
+            MLog.event("native.patch.state.recv", telemetry);
+            lastNativePatchStateLogMs = nowMs;
+        } else if (nowMs - lastNativePatchStateLogMs >= NATIVE_PATCH_STATE_LOG_INTERVAL_MS) {
+            MLog.eventLogOnly("native.patch.state.recv", telemetry);
+            lastNativePatchStateLogMs = nowMs;
+        }
         if (bitrateChanged) {
             renderGovernorBitrateForActiveSubscriptions();
         }
@@ -1304,14 +1314,30 @@ public final class CodecController {
                     int pickedPolicy = LhdcQualityPolicy.normalize((int) (picked & 0xFFL));
                     lhdcPoliciesByMac.put(sub.mac, pickedPolicy);
                     picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
+                    if (pickedPolicy == LhdcQualityPolicy.QUALITY) {
+                        PreferenceStore.LhdcCeiling ceiling = prefs.readLhdcCeiling(sub.mac);
+                        if (ceiling != null
+                                && ceiling.lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900
+                                && ceiling.matches(
+                                        snapshot.activeCodecType,
+                                        snapshot.activeCodecSpecific3)) {
+                            picked = (picked & ~0xFFL)
+                                    | CodecLabelTable.LHDC_QUALITY_FIXED_900;
+                            MLog.event("write.lhdc.ceiling.remembered",
+                                    "mac", redactedMac(sub),
+                                    "lowByte", CodecLabelTable.LHDC_QUALITY_FIXED_900);
+                        }
+                    }
                     long expectedTransport = LhdcQualityPolicy.transportSpecific1(
                             picked, pickedPolicy);
                     boolean transportAlreadyMatches =
                             (snapshot.activeCodecSpecific1 & 0xFFL)
                                     == (expectedTransport & 0xFFL);
                     if (pickedPolicy == previousPolicy && transportAlreadyMatches) {
+                        int ceilingKbps = lhdcCeilingKbpsForActive(sub, snapshot);
                         LhdcQualityPolicy.send(
-                                context, sub.mac, pickedPolicy, "quality_picker_reaffirm");
+                                context, sub.mac, pickedPolicy,
+                                "quality_picker_reaffirm", ceilingKbps);
                         refreshSnapshot(sub);
                         return;
                     }
@@ -1323,6 +1349,13 @@ public final class CodecController {
                 if (finalPreserveLhdcHighBits) {
                     int previousPolicy = selectedPolicy;
                     applyWrite(sub, req, (result, error) -> {
+                        if (shouldProbeLhdcCeiling(sub, req, result)) {
+                            MLog.event("write.lhdc.ceiling.probe",
+                                    "mac", redactedMac(sub),
+                                    "request", req);
+                            retryLhdcQualityWithCeiling900(sub, req, previousPolicy);
+                            return true;
+                        }
                         lhdcPoliciesByMac.put(sub.mac, previousPolicy);
                         LhdcQualityPolicy.send(
                                 context, sub.mac, previousPolicy, "quality_picker_rollback");
@@ -1336,6 +1369,76 @@ public final class CodecController {
             MLog.e("showQualityPicker dialog.show failed", t);
             Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
         }
+    }
+
+    /**
+     * True when a timed-out 1000 kbps LHDC write should be retried at the 900 kbps peer
+     * ceiling: the request targets the logical QUALITY mode, the peer has not yet been
+     * observed to accept a lower ceiling, and the write actually rolled back.
+     */
+    private boolean shouldProbeLhdcCeiling(
+            Subscription sub, CodecRequest request, WriteResult result) {
+        if (sub == null || sub.mac == null || request == null || result == null) {
+            return false;
+        }
+        if (result.outcome != WriteResult.Outcome.TIMEOUT_ROLLED_BACK) {
+            return false;
+        }
+        if (!CodecLabelTable.isLhdc(request.codecType)) {
+            return false;
+        }
+        if ((request.codecSpecific1 & 0xFFL) != CodecLabelTable.LHDC_QUALITY_FIXED_1000) {
+            return false;
+        }
+        PreferenceStore.LhdcCeiling ceiling = prefs.readLhdcCeiling(sub.mac);
+        return ceiling == null
+                || !ceiling.matches(request.codecType, request.codecSpecific3);
+    }
+
+    /**
+     * Retries an unconfirmed 1000 kbps LHDC write at the 900 kbps transport. On success the
+     * peer ceiling is remembered per device so later picker taps go straight to 900; on failure
+     * the previous policy is restored and the generic failure toast is shown.
+     */
+    private void retryLhdcQualityWithCeiling900(
+            Subscription sub, CodecRequest request, int previousPolicy) {
+        if (sub == null || sub.mac == null || request == null) return;
+        CodecRequest retry = new CodecRequest(
+                request.mac,
+                request.codecType,
+                (request.codecSpecific1 & ~0xFFL)
+                        | CodecLabelTable.LHDC_QUALITY_FIXED_900,
+                request.codecSpecific2,
+                request.codecSpecific3,
+                request.codecSpecific4,
+                request.sampleRate,
+                request.bitsPerSample,
+                request.channelMode);
+        MLog.event("write.lhdc.ceiling.retry",
+                "mac", redactedMac(sub),
+                "request", retry);
+        applyWrite(sub, retry, (result, error) -> {
+            lhdcPoliciesByMac.put(sub.mac, previousPolicy);
+            LhdcQualityPolicy.send(
+                    context, sub.mac, previousPolicy, "quality_picker_rollback");
+            MLog.event("write.lhdc.ceiling.retry_failed",
+                    "mac", redactedMac(sub),
+                    "outcome", result != null ? result.outcome : "error");
+            return false;
+        }, nextCodecWriteGeneration(sub), result -> {
+            prefs.writeLhdcCeiling(sub.mac, retry.codecType, retry.codecSpecific3,
+                    (int) CodecLabelTable.LHDC_QUALITY_FIXED_900);
+            if (prefs.isRemembered(sub.mac)) {
+                // Re-write the snapshot now that the ceiling exists, so the remembered low
+                // byte stays 900 and a reconnect replay succeeds.
+                writeRememberedConfirmedSnapshot(sub, retry, result.rollbackSnapshot);
+            }
+            Toast.makeText(context, Strings.TOAST_LHDC_CEILING_900, Toast.LENGTH_LONG).show();
+            MLog.event("write.lhdc.ceiling.learned",
+                    "mac", redactedMac(sub),
+                    "lowByte", CodecLabelTable.LHDC_QUALITY_FIXED_900);
+            return false;
+        });
     }
 
     private static long[] qualityOptionsForUi(CodecSnapshot snapshot) {
@@ -1374,6 +1477,35 @@ public final class CodecController {
         return selected != null
                 ? LhdcQualityPolicy.normalize(selected)
                 : LhdcQualityPolicy.fromSpecific1(request.codecSpecific1);
+    }
+
+    /**
+     * Derives the peer max-bitrate ceiling (kbps) from the actual transport low byte when it
+     * carries a fixed quality mode: 7 = 900 kbps, 8 = 1000 kbps. Returns 0 when the transport
+     * is not fixed (e.g. ABR / connection) or no ceiling evidence exists yet.
+     */
+    private int lhdcCeilingKbpsForTransport(
+            Subscription sub, CodecRequest transportRequest) {
+        if (transportRequest == null
+                || sub == null
+                || !CodecLabelTable.isLhdc(transportRequest.codecType)) {
+            return 0;
+        }
+        long lowByte = transportRequest.codecSpecific1 & 0xFFL;
+        if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+            return 900;
+        }
+        if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_1000) {
+            return 1000;
+        }
+        return 0;
+    }
+
+    /** Ceiling derived from the live confirmed snapshot (0 = unknown / non-fixed). */
+    private int lhdcCeilingKbpsForActive(Subscription sub, CodecSnapshot snapshot) {
+        if (snapshot == null || sub == null) return 0;
+        CodecRequest probe = CodecRequest.fromActive(snapshot).build();
+        return lhdcCeilingKbpsForTransport(sub, probe);
     }
 
     private void showSampleRatePicker(Subscription sub, Object sourcePref) {
@@ -2058,7 +2190,12 @@ public final class CodecController {
         int lhdcPolicy = lhdcPolicyForRequest(sub, request);
         CodecRequest transportRequest = LhdcQualityPolicy.transportRequest(request, lhdcPolicy);
         if (CodecLabelTable.isLhdc(request.codecType)) {
-            LhdcQualityPolicy.send(context, sub.mac, lhdcPolicy, "codec_write");
+            LhdcQualityPolicy.send(
+                    context,
+                    sub.mac,
+                    lhdcPolicy,
+                    "codec_write",
+                    lhdcCeilingKbpsForTransport(sub, transportRequest));
         }
         replayer.onUserCodecWrite(
                 sub != null ? sub.mac : null, transportRequest, "codec_write");
@@ -2133,8 +2270,7 @@ public final class CodecController {
                 && confirmedSnapshot.activeCodecType == request.codecType) {
             long specific1 = confirmedSnapshot.activeCodecSpecific1;
             if (CodecLabelTable.isLhdc(confirmedSnapshot.activeCodecType)) {
-                specific1 = LhdcQualityPolicy.logicalSpecific1(
-                        specific1, lhdcPolicyForRequest(sub, request));
+                specific1 = rememberedLhdcSpecific1(sub, specific1, request);
             }
             prefs.writeSnapshot(
                     sub.mac,
@@ -2144,10 +2280,31 @@ public final class CodecController {
             return;
         }
         long specific1 = CodecLabelTable.isLhdc(request.codecType)
-                ? LhdcQualityPolicy.logicalSpecific1(
-                        request.codecSpecific1, lhdcPolicyForRequest(sub, request))
+                ? rememberedLhdcSpecific1(sub, request.codecSpecific1, request)
                 : request.codecSpecific1;
         prefs.writeSnapshot(sub.mac, request.codecType, specific1, request.sampleRate);
+    }
+
+    /**
+     * Logical LHDC snapshot value for the remember store. Normally the logical QUALITY word
+     * (1000 kbps) is persisted; when a peer ceiling of 900 kbps was learned for this device the
+     * transport low byte is kept so a reconnect replay sends 900 and succeeds.
+     */
+    private long rememberedLhdcSpecific1(
+            Subscription sub, long specific1, CodecRequest request) {
+        PreferenceStore.LhdcCeiling ceiling = sub != null && sub.mac != null
+                ? prefs.readLhdcCeiling(sub.mac) : null;
+        if (ceiling != null
+                && ceiling.lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+            long lowByte = specific1 & 0xFFL;
+            if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_1000
+                    || lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+                return (specific1 & ~0xFFL)
+                        | CodecLabelTable.LHDC_QUALITY_FIXED_900;
+            }
+        }
+        return LhdcQualityPolicy.logicalSpecific1(
+                specific1, lhdcPolicyForRequest(sub, request));
     }
 
     /**

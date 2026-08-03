@@ -659,13 +659,41 @@ public final class SystemHookInstaller {
     }
 
     private void handleCodecSnapshotForGovernor(CodecSnapshot snapshot) {
-        if (snapshot == null || CodecLabelTable.isLhdc(snapshot.activeCodecType)) return;
+        if (snapshot == null) return;
         String mac = snapshot.mac;
         if (mac == null || (!mac.equals(activeLhdcMac)
                 && !mac.equals(linkHealthController.activeMac()))) {
             return;
         }
+        if (CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+            syncPeerCeilingFromSnapshot(mac, snapshot, "codec_confirmed");
+            return;
+        }
         resetLhdcLinkState(mac, "codec_exit");
+    }
+
+    /**
+     * Mirrors the stack-confirmed transport low byte into the native governor probe ceiling
+     * and the link-health controller so a 900 kbps peer never gets probed to 1000.
+     */
+    private void syncPeerCeilingFromSnapshot(
+            String mac, CodecSnapshot snapshot, String reason) {
+        if (mac == null || snapshot == null) return;
+        long lowByte = snapshot.activeCodecSpecific1 & 0xFFL;
+        int ceilingKbps = 0;
+        if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+            ceilingKbps = 900;
+        } else if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_1000) {
+            ceilingKbps = 1000;
+        }
+        if (ceilingKbps <= 0) return;
+        NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+        linkHealthController.setPeerCeilingKbps(
+                mac, ceilingKbps, SystemClock.elapsedRealtime(), reason);
+        MLog.event("lhdc.link.peer_ceiling_sync",
+                "mac", redactMac(mac),
+                "ceilingKbps", ceilingKbps,
+                "reason", reason);
     }
 
     private void resetLhdcLinkState(String mac, String reason) {

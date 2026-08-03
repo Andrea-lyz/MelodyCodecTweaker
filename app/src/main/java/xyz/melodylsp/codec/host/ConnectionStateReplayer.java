@@ -939,7 +939,9 @@ public final class ConnectionStateReplayer {
                 : LhdcQualityPolicy.ADAPTIVE;
         CodecRequest transportRequest = LhdcQualityPolicy.transportRequest(req, policy);
         if (CodecLabelTable.isLhdc(req.codecType)) {
-            LhdcQualityPolicy.send(context, mac, policy, "remember_replay");
+            int ceilingKbps = lhdcCeilingKbpsForTransport(transportRequest);
+            LhdcQualityPolicy.send(
+                    context, mac, policy, "remember_replay", ceilingKbps);
         }
         MLog.event("replay.dispatch",
                 "mac", A2dpRouteReadiness.redactMac(mac),
@@ -959,6 +961,22 @@ public final class ConnectionStateReplayer {
             }
             scheduleReplayRetry(mac, stored, generation, attempt);
         });
+    }
+
+    /** 900 kbps fixed transport implies a peer ceiling of 900; 1000 implies 1000. */
+    private int lhdcCeilingKbpsForTransport(CodecRequest transportRequest) {
+        if (transportRequest == null
+                || !CodecLabelTable.isLhdc(transportRequest.codecType)) {
+            return 0;
+        }
+        long lowByte = transportRequest.codecSpecific1 & 0xFFL;
+        if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) {
+            return 900;
+        }
+        if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_1000) {
+            return 1000;
+        }
+        return 0;
     }
 
     private void scheduleReplayRetry(
