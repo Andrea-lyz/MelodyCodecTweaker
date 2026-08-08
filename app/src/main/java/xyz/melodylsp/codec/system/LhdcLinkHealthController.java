@@ -27,6 +27,26 @@ final class LhdcLinkHealthController {
     static final long[] REQUIRED_QUIET_MS = {15_000L, 30_000L, 45_000L};
     static final long MIN_BQR_INTERVAL_MS = 3_000L;
     static final long MAX_BQR_INTERVAL_MS = 15_000L;
+    /**
+     * Phase N-2 START_GUARD: after first play / connect / resume / stream rebuild, bad BQR
+     * windows do not participate in slow-heat downgrade counting and choppy reports are
+     * recorded but not integrated. The startup pseudo-high retx window (162.5/s evidence) is
+     * absorbed here instead of a bare first-window skip.
+     */
+    static final long START_GUARD_MS = 15_000L;
+    /**
+     * Phase N-2 POST_SWITCH_GUARD: after any Target_Cap switch, choppy (a soft signal) is
+     * recorded but not integrated for this long, so switch-transient glitches do not cancel
+     * recovery probes or count as congestion. Hard evidence (queue fast-fail, Phase 3
+     * disaster) is not blocked by this guard.
+     */
+    static final long POST_SWITCH_GUARD_MS = 10_000L;
+    /**
+     * Phase N-2 BQR_SUSPECT_INVALID: retx at or above this rate with ~zero noRx is
+     * physically contradictory; combined with a low queue and no choppy during stream
+     * warm-up it is logged and excluded from decisions.
+     */
+    static final double BQR_SUSPECT_RETX_PER_SEC = 110.0;
     static final int REQUIRED_SHADOW_UNSTABLE_WINDOWS = 2;
     static final long SHADOW_CANDIDATE_COOLDOWN_MS = 15_000L;
     static final String CHOPPY_CAPABILITY_UNKNOWN = "UNKNOWN";
@@ -118,6 +138,18 @@ final class LhdcLinkHealthController {
                 double noRxPerSecond,
                 int escalationLevel,
                 long holdMs) {
+        }
+
+        /**
+         * Phase N-2: a BQR window was excluded from downgrade/recovery bookkeeping. Reasons:
+         * illegal_fields / start_guard / suspect_invalid. Implementations only log.
+         */
+        default void onBqrWindowSkipped(
+                String mac,
+                String reason,
+                double retransmissionsPerSecond,
+                double noRxPerSecond,
+                long nowMs) {
         }
     }
 
@@ -343,6 +375,15 @@ final class LhdcLinkHealthController {
         int pendingRequestId;
         long pendingSinceMs;
         int currentConfirmedKbps;
+        /**
+         * Phase N-2 guards: START_GUARD blocks bad-window accumulation and choppy integration
+         * during stream warm-up; POST_SWITCH_GUARD blocks only the choppy soft signal after a
+         * Target_Cap switch. 0 = guard not armed.
+         */
+        long startGuardUntilMs;
+        long postSwitchGuardUntilMs;
+        /** Count of decision-eligible (valid interval) BQR windows since the last session reset. */
+        int validBqrWindowCount;
     }
 
     private final Map<String, DeviceState> devices = new HashMap<>();
@@ -370,7 +411,7 @@ final class LhdcLinkHealthController {
         DeviceState state = stateFor(mac);
         resetSessionEvidence(state, nowMs);
         state.lastPublishedCeiling = -1;
-        publishCeiling(mac, state, "device_active");
+        publishCeiling(mac, state, "device_active", nowMs);
     }
 
     /**
@@ -385,7 +426,7 @@ final class LhdcLinkHealthController {
         resetSessionEvidence(state, nowMs);
         if (mac.equals(activeMac)) {
             state.lastPublishedCeiling = -1;
-            publishCeiling(mac, state, "stream_session");
+            publishCeiling(mac, state, "stream_session", nowMs);
             if (effectiveCeiling(state) >= 900) {
                 // A fresh stream at a fixed high tier is a new 900+ attempt: arm the queue
                 // fast-fail probe window so an unsustainable rate is caught within seconds.
@@ -438,7 +479,7 @@ final class LhdcLinkHealthController {
         if (mac.equals(activeMac)) {
             state.lastPublishedCeiling = -1;
             publishCeiling(mac, state,
-                    reason != null && !reason.isEmpty() ? reason : "peer_ceiling");
+                    reason != null && !reason.isEmpty() ? reason : "peer_ceiling", nowMs);
         }
     }
 
@@ -459,7 +500,7 @@ final class LhdcLinkHealthController {
         if (wasActive) {
             state.lastPublishedCeiling = -1;
             publishCeiling(mac, state,
-                    reason != null && !reason.isEmpty() ? reason : "session_reset");
+                    reason != null && !reason.isEmpty() ? reason : "session_reset", nowMs);
             activeMac = null;
         }
         devices.remove(mac);
@@ -474,7 +515,20 @@ final class LhdcLinkHealthController {
             String mac, BqrSample sample, long nowMs, boolean streaming) {
         if (mac == null || sample == null) return;
         DeviceState state = stateFor(mac);
+        if (!state.streaming && streaming && state.lastBqrMs != 0L) {
+            // Phase N-2: resume (streaming false -> true after the device already streamed)
+            // is a new stream start and re-arms the START_GUARD. The very first BQR of a
+            // session is not an edge: activate() already armed the guard.
+            state.startGuardUntilMs = nowMs + START_GUARD_MS;
+        }
         state.streaming = streaming;
+        boolean legalWindow = sample.unusedAfhChannels >= 0
+                && sample.unusedAfhChannels <= 79
+                && sample.retransmissionCount >= 0L
+                && sample.noRxCount >= 0L
+                && sample.nakCount >= 0L
+                && sample.overflowCount >= 0L
+                && sample.underflowCount >= 0L;
         long intervalMs = state.lastBqrMs == 0L ? 0L : nowMs - state.lastBqrMs;
         state.lastBqrMs = nowMs;
         state.usableAfhChannels = Math.max(0, 79 - sample.unusedAfhChannels);
@@ -486,16 +540,18 @@ final class LhdcLinkHealthController {
         boolean strictlyHealthy = false;
         if (validInterval) {
             state.lastValidBqrMs = nowMs;
+            state.validBqrWindowCount++;
             double seconds = intervalMs / 1000.0;
             state.retransmissionsPerSecond = sample.retransmissionCount / seconds;
             state.noRxPerSecond = sample.noRxCount / seconds;
             strictlyHealthy = streaming
+                    && legalWindow
                     && sample.unusedAfhChannels <= MAX_UNUSED_AFH_CHANNELS
                     && state.retransmissionsPerSecond <= MAX_RETRANSMISSIONS_PER_SECOND
                     && state.noRxPerSecond <= MAX_NO_RX_PER_SECOND;
             state.healthyBqrWindows = strictlyHealthy ? state.healthyBqrWindows + 1 : 0;
             if (BuildConfig.LHDC_BQR_FALLBACK) {
-                evaluateBqrFallback(mac, state, nowMs, streaming);
+                evaluateBqrFallback(mac, state, nowMs, streaming, legalWindow);
             }
 
             BoundaryState probe = inFlightBoundary(state);
@@ -526,7 +582,8 @@ final class LhdcLinkHealthController {
                             && openMs >= MIN_PROBE_OPEN_MS)) {
                         if (cancelRecoveryProbe(state, nowMs, false)) {
                             publishCeiling(mac, state,
-                                    severe ? "probe_bqr_severe" : "probe_bqr_sustained_bad");
+                                    severe ? "probe_bqr_severe" : "probe_bqr_sustained_bad",
+                                    nowMs);
                         }
                     }
                 }
@@ -547,7 +604,7 @@ final class LhdcLinkHealthController {
             state.criticalQueueSinceMs = 0L;
             state.healthyDecaySinceMs = 0L;
             if (cancelRecoveryProbe(state, nowMs, true)) {
-                publishCeiling(mac, state, "probe_stream_idle");
+                publishCeiling(mac, state, "probe_stream_idle", nowMs);
             }
             return;
         }
@@ -557,6 +614,11 @@ final class LhdcLinkHealthController {
     synchronized void onQueueSample(String mac, int length, int capacity, long nowMs) {
         if (mac == null || capacity <= 0 || length < 0) return;
         DeviceState state = stateFor(mac);
+        if (!state.streaming && state.lastBqrMs != 0L) {
+            // Phase N-2: resume (queue sampling restarts after an A2DP suspend on a device
+            // that already streamed) re-arms the START_GUARD.
+            state.startGuardUntilMs = nowMs + START_GUARD_MS;
+        }
         state.streaming = true;
         state.currentQueueLength = length;
         state.queueCapacity = capacity;
@@ -581,7 +643,7 @@ final class LhdcLinkHealthController {
             noteCongestion(state, nowMs);
             if (cancelRecoveryProbe(state, nowMs, false)) {
                 publishCeiling(mac, state,
-                        full ? "probe_queue_full" : "probe_queue_congested");
+                        full ? "probe_queue_full" : "probe_queue_congested", nowMs);
             }
         } else {
             maybeCancelDegradedProbe(mac, state, nowMs);
@@ -597,7 +659,7 @@ final class LhdcLinkHealthController {
         DeviceState state = stateFor(mac);
         noteCongestion(state, nowMs);
         if (cancelRecoveryProbe(state, nowMs, false)) {
-            publishCeiling(mac, state, "probe_choppy");
+            publishCeiling(mac, state, "probe_choppy", nowMs);
         }
     }
 
@@ -618,6 +680,14 @@ final class LhdcLinkHealthController {
             state.remoteChoppyCount = 0;
         }
         state.remoteChoppyCount++;
+        if (nowMs < state.startGuardUntilMs || nowMs < state.postSwitchGuardUntilMs) {
+            // Phase N-2 guards: choppy during stream warm-up (START_GUARD) or right after a
+            // Target_Cap switch (POST_SWITCH_GUARD) is recorded but not integrated, so a
+            // startup spike or a switch-transient glitch cannot cancel recovery probes or
+            // count as congestion. Hard evidence paths (queue fast-fail, Phase 3 disaster)
+            // are not blocked here.
+            return;
+        }
         onCongestion(mac, nowMs);
     }
 
@@ -656,12 +726,13 @@ final class LhdcLinkHealthController {
                     boundary.evidenceTier = 0;
                 }
             }
-            publishCeiling(mac, state, boundary.locked ? "boundary_locked" : "quick_failure");
+            publishCeiling(mac, state,
+                    boundary.locked ? "boundary_locked" : "quick_failure", nowMs);
         } else if (event == EVENT_UPGRADE_STABLE) {
             clearBoundary(boundary);
             state.probeStableBqrWindows = 0;
             state.probeBadBqrWindows = 0;
-            publishCeiling(mac, state, "boundary_stable");
+            publishCeiling(mac, state, "boundary_stable", nowMs);
         }
     }
 
@@ -827,7 +898,7 @@ final class LhdcLinkHealthController {
         boundary.probeOpenedMs = nowMs;
         state.probeStableBqrWindows = 0;
         state.probeBadBqrWindows = 0;
-        publishCeiling(mac, state, "healthy_recovery_probe");
+        publishCeiling(mac, state, "healthy_recovery_probe", nowMs);
     }
 
     private void maybeCancelDegradedProbe(String mac, DeviceState state, long nowMs) {
@@ -838,7 +909,7 @@ final class LhdcLinkHealthController {
             return;
         }
         if (cancelRecoveryProbe(state, nowMs, false)) {
-            publishCeiling(mac, state, "probe_bqr_sustained_bad");
+            publishCeiling(mac, state, "probe_bqr_sustained_bad", nowMs);
         }
     }
 
@@ -870,7 +941,7 @@ final class LhdcLinkHealthController {
         boundary.evidenceTier = Math.max(0, boundary.evidenceTier - steps);
     }
 
-    private void publishCeiling(String mac, DeviceState state, String reason) {
+    private void publishCeiling(String mac, DeviceState state, String reason, long nowMs) {
         if (!mac.equals(activeMac)) return;
         int ceiling = effectiveCeiling(state);
         if (state.lastPublishedCeiling == ceiling) {
@@ -878,6 +949,9 @@ final class LhdcLinkHealthController {
             return;
         }
         state.lastPublishedCeiling = ceiling;
+        // Phase N-2 POST_SWITCH_GUARD: a real Target_Cap change arms the switch-transient
+        // window in which the choppy soft signal is recorded but not integrated.
+        state.postSwitchGuardUntilMs = nowMs + POST_SWITCH_GUARD_MS;
         if (listener != null) listener.onProbeCeilingChanged(mac, ceiling, reason);
     }
 
@@ -907,10 +981,22 @@ final class LhdcLinkHealthController {
      * full decision record.
      */
     private void evaluateBqrFallback(String mac, DeviceState state, long nowMs, boolean streaming) {
+        evaluateBqrFallback(mac, state, nowMs, streaming, true);
+    }
+
+    private void evaluateBqrFallback(
+            String mac, DeviceState state, long nowMs, boolean streaming, boolean legalWindow) {
         if (!streaming) return;
         double retx = state.retransmissionsPerSecond;
         double noRx = state.noRxPerSecond;
         if (Double.isNaN(retx) || Double.isNaN(noRx)) return;
+        if (!legalWindow) {
+            // Phase N-2 BQR valid gate: illegal fields must never drive downgrade bookkeeping.
+            if (listener != null) {
+                listener.onBqrWindowSkipped(mac, "illegal_fields", retx, noRx, nowMs);
+            }
+            return;
+        }
         if (state.peerCeilingKbps > 0 && state.peerCeilingKbps <= BQR_FALLBACK_CAP_KBPS) return;
 
         boolean bad = retx >= BQR_FALLBACK_BAD_RETX_PER_SEC
@@ -918,8 +1004,36 @@ final class LhdcLinkHealthController {
         boolean healthy = retx < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
                 && noRx < BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC;
 
+        // Phase N-2 BQR_SUSPECT_INVALID: high retx with ~zero noRx is physically
+        // contradictory; with a low queue, no choppy and stream warm-up it is logged and
+        // never allowed to participate in decisions.
+        if (retx >= BQR_SUSPECT_RETX_PER_SEC
+                && noRx < 1.0
+                && (state.currentQueueLength < 0
+                        || state.currentQueueLength * 100L
+                                <= (long) state.queueCapacity * 25L)
+                && (state.remoteChoppyWindowStartMs == 0L
+                        || nowMs - state.remoteChoppyWindowStartMs > 5_000L)
+                && state.validBqrWindowCount <= 2) {
+            if (listener != null) {
+                listener.onBqrWindowSkipped(mac, "suspect_invalid", retx, noRx, nowMs);
+            }
+        }
+
         if (state.bqrFallbackCapKbps == 0) {
-            state.bqrFallbackBadWindows = bad ? state.bqrFallbackBadWindows + 1 : 0;
+            if (bad) {
+                if (nowMs < state.startGuardUntilMs) {
+                    // Phase N-2 START_GUARD: bad windows do not participate in slow-heat
+                    // counting during stream warm-up; they are only recorded.
+                    if (listener != null) {
+                        listener.onBqrWindowSkipped(mac, "start_guard", retx, noRx, nowMs);
+                    }
+                } else {
+                    state.bqrFallbackBadWindows++;
+                }
+            } else {
+                state.bqrFallbackBadWindows = 0;
+            }
             if (state.bqrFallbackBadWindows >= BQR_FALLBACK_REQUIRED_BAD_WINDOWS) {
                 int windows = state.bqrFallbackBadWindows;
                 triggerBqrFallback(mac, state, nowMs, "triggered", windows, false);
@@ -936,7 +1050,7 @@ final class LhdcLinkHealthController {
             state.bqrFallbackRecoveredMs = nowMs;
             state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
             state.bqrFastFailQueueSinceMs = 0L;
-            publishCeiling(mac, state, "bqr_fallback_recovered");
+            publishCeiling(mac, state, "bqr_fallback_recovered", nowMs);
             notifyBqrFallback(mac, state, "recovered", 0, windows);
         }
     }
@@ -967,7 +1081,8 @@ final class LhdcLinkHealthController {
             state.bqrFallbackEscalationLevel = 0;
         }
         publishCeiling(mac, state,
-                queueFastFail ? "bqr_fallback_triggered_queue" : "bqr_fallback_triggered");
+                queueFastFail ? "bqr_fallback_triggered_queue" : "bqr_fallback_triggered",
+                nowMs);
         notifyBqrFallback(mac, state, notifyReason, badWindows, 0);
     }
 
@@ -1134,6 +1249,11 @@ final class LhdcLinkHealthController {
         state.pendingRequestId = 0;
         state.pendingSinceMs = 0L;
         state.currentConfirmedKbps = 0;
+        // Phase N-2: every stream start (first play / connect / stream rebuild) arms the
+        // START_GUARD. Resume within a session re-arms it through the streaming edge.
+        state.startGuardUntilMs = nowMs + START_GUARD_MS;
+        state.postSwitchGuardUntilMs = 0L;
+        state.validBqrWindowCount = 0;
         state.lastBqrMs = 0L;
         state.lastValidBqrMs = 0L;
         state.healthyBqrWindows = 0;

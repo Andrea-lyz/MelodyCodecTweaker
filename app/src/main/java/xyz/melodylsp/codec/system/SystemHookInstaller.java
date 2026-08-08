@@ -70,6 +70,13 @@ public final class SystemHookInstaller {
     private static final long GAME_MODE_SBC_FALLBACK_TTL_MS = 180_000L;
     private static final long LHDC_QUEUE_SAMPLE_INTERVAL_MS = 200L;
     private static final long LHDC_QUEUE_IDLE_INTERVAL_MS = 1_000L;
+    /**
+     * Phase N-2 choppy 1s dedup (decision 33/6.8.2): the host double-delivers the same
+     * physical glitch within ~2 ms; one physical perturbation is one audible glitch, so
+     * duplicate reports inside this window are logged and dropped at the Java convergence
+     * point.
+     */
+    private static final long CHOPPY_DEDUP_WINDOW_MS = 1_000L;
     private static final long BQR_DIAGNOSTIC_INTERVAL_MS = 60_000L;
     private static final long BQR_LIVE_SUBSCRIPTION_TTL_MS = 12_000L;
     private static final int LHDC_QUEUE_CAPACITY = 45;
@@ -110,6 +117,8 @@ public final class SystemHookInstaller {
     private final Map<String, Long> lhdcDiagnosticReasonTimes = new HashMap<>();
     /** Per-MAC confirmed peer max-bitrate capability (900/1000 kbps), surviving process ordering. */
     private final Map<String, Integer> peerCeilingByMac = new HashMap<>();
+    /** Phase N-2: last accepted choppy report per MAC for the 1 s dedup window. */
+    private final Map<String, Long> lastRemoteChoppyEventMsByMac = new HashMap<>();
     private final AtomicLong remoteChoppySequence = new AtomicLong();
 
     public SystemHookInstaller(
@@ -171,6 +180,21 @@ public final class SystemHookInstaller {
                                 noRxPerSecond,
                                 escalationLevel,
                                 holdMs);
+                    }
+
+                    @Override
+                    public void onBqrWindowSkipped(
+                            String mac,
+                            String reason,
+                            double retransmissionsPerSecond,
+                            double noRxPerSecond,
+                            long nowMs) {
+                        MLog.event("lhdc.link.bqr_window_skipped",
+                                "mac", redactMac(mac),
+                                "reason", reason,
+                                "retxPerSec", rateText(retransmissionsPerSecond),
+                                "noRxPerSec", rateText(noRxPerSecond),
+                                "nowMs", nowMs);
                     }
                 });
     }
@@ -406,8 +430,10 @@ public final class SystemHookInstaller {
         // Phase N-1 requestId transaction: register the issued Target_Cap so native
         // confirmations with the same requestId close the switch and timeouts fall back
         // to the getter. requestId == 0 means nothing was written (governor unavailable or the
-        // same rung already applied): no transaction, no phantom timeout.
-        if (requestId > 0) {
+        // same rung already applied): no transaction, no phantom timeout. When the queue/event
+        // loop is not sampling (ADAPTIVE policy), no confirmation can ever arrive, so the
+        // transaction is not registered either (Phase N-1 review P1-4).
+        if (requestId > 0 && NativeLhdcMemoryPatch.shouldSampleQueue()) {
             linkHealthController.onTargetCapIssued(
                     mac, NativeLhdcMemoryPatch.currentDesiredGovernorProbeCeilingKbps(),
                     requestId, SystemClock.elapsedRealtime());
@@ -1199,25 +1225,43 @@ public final class SystemHookInstaller {
                     RemoteChoppyAttribution attribution =
                             resolveRemoteChoppyAttribution(callbackPayload);
                     if (level > 0) {
-                        NativeLhdcMemoryPatch.reportRemoteChoppy(level);
-                        if (attribution.reliable && attribution.mac != null) {
-                            mainHandler.post(() -> {
-                                linkHealthController.onRemoteChoppyReport(
-                                        attribution.mac, level, nowMs);
-                                LhdcLinkHealthController.Snapshot snapshot =
-                                        linkHealthController.snapshot(
-                                                attribution.mac, SystemClock.elapsedRealtime());
-                                logRemoteChoppyEvent(
-                                        level, sequence, callbackPayload, attribution, snapshot);
-                                sendLhdcDiagnosticLiveState(
-                                        attribution.mac,
-                                        snapshot,
-                                        "remote_choppy",
-                                        "choppy");
-                            });
+                        String dedupKey = attribution.reliable && attribution.mac != null
+                                ? attribution.mac : "<unknown>";
+                        Long lastAcceptedAt = lastRemoteChoppyEventMsByMac.get(dedupKey);
+                        if (lastAcceptedAt != null
+                                && nowMs - lastAcceptedAt < CHOPPY_DEDUP_WINDOW_MS) {
+                            // Phase N-2 1s dedup: same physical event re-delivered; record the
+                            // drop so the feedback package can audit double-delivery, but do
+                            // not feed the decision path twice.
+                            MLog.event("lhdc.link.choppy_dedup",
+                                    "mac", redactMac(dedupKey),
+                                    "level", level,
+                                    "sequence", sequence,
+                                    "sinceMs", nowMs - lastAcceptedAt);
                         } else {
-                            logRemoteChoppyEvent(
-                                    level, sequence, callbackPayload, attribution, null);
+                            lastRemoteChoppyEventMsByMac.put(dedupKey, nowMs);
+                            NativeLhdcMemoryPatch.reportRemoteChoppy(level);
+                            if (attribution.reliable && attribution.mac != null) {
+                                mainHandler.post(() -> {
+                                    linkHealthController.onRemoteChoppyReport(
+                                            attribution.mac, level, nowMs);
+                                    LhdcLinkHealthController.Snapshot snapshot =
+                                            linkHealthController.snapshot(
+                                                    attribution.mac,
+                                                    SystemClock.elapsedRealtime());
+                                    logRemoteChoppyEvent(
+                                            level, sequence, callbackPayload, attribution,
+                                            snapshot);
+                                    sendLhdcDiagnosticLiveState(
+                                            attribution.mac,
+                                            snapshot,
+                                            "remote_choppy",
+                                            "choppy");
+                                });
+                            } else {
+                                logRemoteChoppyEvent(
+                                        level, sequence, callbackPayload, attribution, null);
+                            }
                         }
                     } else {
                         LhdcLinkHealthController.Snapshot snapshot = attribution.mac != null

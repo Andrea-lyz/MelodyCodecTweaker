@@ -276,6 +276,11 @@ void publish_governor_event(
             std::memory_order_relaxed);
     g_governor_event.store(pack_governor_event(event, from, to, detail_ms),
             std::memory_order_release);
+    // One-shot transaction stamp (Phase N-1 review P1-3): only the first event after a Java
+    // Target_Cap write carries its requestId. Spontaneous native events that follow (upgrade
+    // verification, peer-ceiling detect, restore retries) start from 0 again, so the Java
+    // stale filter is not fooled into treating them as part of the latest transaction.
+    g_pending_request_id.store(0, std::memory_order_relaxed);
 }
 
 uint32_t transition_reason_id(const char* reason) {
