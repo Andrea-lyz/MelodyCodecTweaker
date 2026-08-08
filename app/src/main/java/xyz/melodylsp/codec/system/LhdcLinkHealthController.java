@@ -90,7 +90,6 @@ final class LhdcLinkHealthController {
     static final double BQR_FALLBACK_BAD_NO_RX_PER_SEC = 25.0;
     static final int BQR_FALLBACK_REQUIRED_BAD_WINDOWS = 4;
     static final double BQR_FALLBACK_HEALTHY_RETX_PER_SEC = 24.0;
-    static final double BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC = 21.0;
     /**
      * Mid-tier (500 -> 900) recovery noRx gate (2026-08-09 compromise, decision 44): the
      * Buds-calibrated <21 noRx sits inside the X3-family normal band (noRx 21-29), so
@@ -124,7 +123,8 @@ final class LhdcLinkHealthController {
     static final int RECOVERY_FAST_HEALTHY_WINDOWS = 5;
     static final long RECOVERY_FAST_HOLD_MS = 30_000L;
     // 900 -> 1000 is the strictest tier: more windows and a longer hold than the regular
-    // 500 -> 900 tier (which keeps the calibrated <24/<21 + escalating hold).
+    // 500 -> 900 tier (which keeps the calibrated <24 retx with a relaxed <25 noRx,
+    // decision 44, plus the escalating hold).
     static final int BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT = 8;
     static final long BQR_FALLBACK_HOLD_MS_STRICT = 120_000L;
 
@@ -688,7 +688,8 @@ final class LhdcLinkHealthController {
                     // streak (review P2-1). X3 sits in the 24-35 band after interference
                     // stops; the strict gate never accumulated six windows and stranded the
                     // 900 rung (earlier the AFH<=49 gate made it unreachable). The BQR
-                    // fallback recovery (500 and above) keeps the calibrated <24/<21.
+                    // fallback recovery keeps the calibrated <24 retx; noRx is <25 for the
+                    // 500 tier (decision 44) and non-bad <25 for the 900 tier (3a7d64a).
                     if (streaming && legalWindow) {
                         if (nowMs < state.downgradeDeadZoneUntilMs) {
                             // Phase N-4 dead zone (6.8.4): freeze recovery evidence too.
@@ -1223,8 +1224,6 @@ final class LhdcLinkHealthController {
 
         boolean bad = retx >= BQR_FALLBACK_BAD_RETX_PER_SEC
                 && noRx >= BQR_FALLBACK_BAD_NO_RX_PER_SEC;
-        boolean healthy = retx < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
-                && noRx < BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC;
 
         if (state.bqrFallbackCapKbps == 0) {
             if (bad) {
