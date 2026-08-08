@@ -101,6 +101,24 @@ final class LhdcLinkHealthController {
     static final long[] BQR_FALLBACK_HOLD_MS = {60_000L, 120_000L, 300_000L};
     static final long BQR_FALLBACK_SUCCESS_WINDOW_MS = 2 * 60_000L;
 
+    // Phase N-4 (6.8.4): absolute downgrade dead zone. After any successful downgrade, BQR
+    // recovery windows and the 8 s leap window are frozen for this long, so evidence cannot
+    // start from the old bitrate's tail (no fast-in-fast-out ping-pong). Shares the 10 s
+    // timing of MIN_PROBE_COOLDOWN_MS. Disaster evidence is the only exception (6.8.4).
+    static final long DOWNGRADE_DEAD_ZONE_MS = 10_000L;
+
+    // Phase N-4 asymmetric recovery (6.8.5): tiers recover at different speeds.
+    // 400 -> 500 is the fast channel: 5 windows at relaxed evidence (retx<=40/noRx<=25,
+    // short stay) — fast means short stay and light window count, not skipping verification.
+    static final double RECOVERY_FAST_RETX_PER_SEC = 40.0;
+    static final double RECOVERY_FAST_NO_RX_PER_SEC = 25.0;
+    static final int RECOVERY_FAST_HEALTHY_WINDOWS = 5;
+    static final long RECOVERY_FAST_HOLD_MS = 30_000L;
+    // 900 -> 1000 is the strictest tier: more windows and a longer hold than the regular
+    // 500 -> 900 tier (which keeps the calibrated <24/<21 + escalating hold).
+    static final int BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT = 8;
+    static final long BQR_FALLBACK_HOLD_MS_STRICT = 120_000L;
+
     // Phase N-3 leaky bucket (6.8.3/6.8.9): the deduped choppy soft signal integrates at
     // +10 per event with a linear -0.5/s decay; threshold 15 ≈ 2 events within ~8-10 s
     // (calibrated from the 05:44:34/42 double-burst evidence). Filling downgrades one rung.
@@ -386,6 +404,12 @@ final class LhdcLinkHealthController {
         int bqrFallbackHealthyWindows;
         long bqrFallbackSinceMs;
         int bqrFallbackEscalationLevel;
+        /**
+         * Phase N-4 step evidence: while a fallback cap is active, consecutive bad windows
+         * keep accumulating (one rung per trigger, decision 32) so a capped tier can keep
+         * stepping down instead of waiting for a recovery that a bad link never grants.
+         */
+        int bqrFallbackStepBadWindows;
         long bqrFallbackRecoveredMs;
         long bqrFastFailUntilMs;
         long bqrFastFailQueueSinceMs;
@@ -427,6 +451,8 @@ final class LhdcLinkHealthController {
         int pendingRequestId;
         long pendingSinceMs;
         int currentConfirmedKbps;
+        /** Phase N-4: absolute dead zone after a downgrade (6.8.4). 0 = not armed. */
+        long downgradeDeadZoneUntilMs;
         /**
          * Phase N-2 guards: START_GUARD blocks bad-window accumulation and choppy integration
          * during stream warm-up; POST_SWITCH_GUARD blocks only the choppy soft signal after a
@@ -532,6 +558,8 @@ final class LhdcLinkHealthController {
             state.bqrFallbackSinceMs = 0L;
             state.bqrFallbackEscalationLevel = 0;
             state.bqrFallbackRecoveredMs = 0L;
+            state.bqrFallbackStepBadWindows = 0;
+            state.downgradeDeadZoneUntilMs = 0L;
             state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
             state.bqrFastFailQueueSinceMs = 0L;
             // A user codec write is an explicit attempt: drop any active leaky-bucket cap
@@ -649,15 +677,19 @@ final class LhdcLinkHealthController {
                     // 900 rung (earlier the AFH<=49 gate made it unreachable). The BQR
                     // fallback recovery (500 and above) keeps the calibrated <24/<21.
                     if (streaming && legalWindow) {
-                        // Only decision-eligible windows participate (review P2-1): a
-                        // suspended or illegal window keeps the streak instead of resetting
-                        // it, matching the BQR fallback early-return semantics.
-                        state.leakyFallbackHealthyWindows =
-                                state.retransmissionsPerSecond
-                                                < BQR_FALLBACK_BAD_RETX_PER_SEC
-                                        && state.noRxPerSecond
-                                                < BQR_FALLBACK_BAD_NO_RX_PER_SEC
-                                ? state.leakyFallbackHealthyWindows + 1 : 0;
+                        if (nowMs < state.downgradeDeadZoneUntilMs) {
+                            // Phase N-4 dead zone (6.8.4): freeze recovery evidence too.
+                        } else {
+                            // Only decision-eligible windows participate (review P2-1): a
+                            // suspended or illegal window keeps the streak instead of
+                            // resetting it, matching the BQR fallback early-return semantics.
+                            state.leakyFallbackHealthyWindows =
+                                    state.retransmissionsPerSecond
+                                                    < BQR_FALLBACK_BAD_RETX_PER_SEC
+                                            && state.noRxPerSecond
+                                                    < BQR_FALLBACK_BAD_NO_RX_PER_SEC
+                                    ? state.leakyFallbackHealthyWindows + 1 : 0;
+                        }
                     }
                     if (state.leakyFallbackHealthyWindows >= BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS
                             && nowMs - state.leakyFallbackSinceMs >= BQR_FALLBACK_HOLD_MS[0]) {
@@ -1182,7 +1214,14 @@ final class LhdcLinkHealthController {
 
         if (state.bqrFallbackCapKbps == 0) {
             if (bad) {
-                if (nowMs < state.startGuardUntilMs) {
+                if (nowMs < state.downgradeDeadZoneUntilMs) {
+                    // Phase N-4 review P1-3: the dead zone also freezes the uncapped bad
+                    // streak, so a leaky downgrade is not immediately followed by a BQR
+                    // step from borrowed pre-downgrade windows.
+                    if (listener != null) {
+                        listener.onBqrWindowSkipped(mac, "dead_zone", retx, noRx, nowMs);
+                    }
+                } else if (nowMs < state.startGuardUntilMs) {
                     // Phase N-2 START_GUARD: bad windows do not participate in slow-heat
                     // counting during stream warm-up; they are only recorded.
                     if (listener != null) {
@@ -1201,17 +1240,80 @@ final class LhdcLinkHealthController {
             return;
         }
 
-        state.bqrFallbackHealthyWindows = healthy ? state.bqrFallbackHealthyWindows + 1 : 0;
-        if (state.bqrFallbackHealthyWindows >= BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS
-                && nowMs - state.bqrFallbackSinceMs >= bqrFallbackHoldMs(state)) {
-            int windows = state.bqrFallbackHealthyWindows;
+        if (nowMs < state.downgradeDeadZoneUntilMs) {
+            // Phase N-4 dead zone (6.8.4): no recovery evidence during the old bitrate's
+            // tail — windows are frozen until the dead zone ends.
+            if (listener != null) {
+                listener.onBqrWindowSkipped(mac, "dead_zone", retx, noRx, nowMs);
+            }
+            return;
+        }
+        int cap = state.bqrFallbackCapKbps;
+        if (bad) {
+            // Phase N-4 step evidence (decision 32): while capped, consecutive bad windows
+            // keep accumulating so the tier steps down again instead of waiting for a
+            // recovery that a persistently bad link never grants.
+            // START_GUARD excludes warm-up pseudo-high windows from the step evidence,
+            // matching the uncapped path (review P2-2).
+            if (nowMs >= state.startGuardUntilMs) {
+                state.bqrFallbackStepBadWindows++;
+            }
             state.bqrFallbackHealthyWindows = 0;
-            state.bqrFallbackCapKbps = 0;
-            state.bqrFallbackRecoveredMs = nowMs;
-            state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
-            state.bqrFastFailQueueSinceMs = 0L;
-            publishCeiling(mac, state, "bqr_fallback_recovered", nowMs);
-            notifyBqrFallback(mac, state, "recovered", 0, windows);
+        } else {
+            state.bqrFallbackStepBadWindows = 0;
+            // Phase N-4 asymmetric recovery (6.8.5): one rung up per tier.
+            boolean tierHealthy;
+            int requiredWindows;
+            long holdMs;
+            if (cap <= 400) {
+                // Fast channel 400 -> 500: relaxed evidence (retx<=40/noRx<=25), short stay.
+                tierHealthy = retx <= RECOVERY_FAST_RETX_PER_SEC
+                        && noRx <= RECOVERY_FAST_NO_RX_PER_SEC;
+                requiredWindows = RECOVERY_FAST_HEALTHY_WINDOWS;
+                holdMs = RECOVERY_FAST_HOLD_MS;
+            } else if (cap <= 500) {
+                // Regular tier 500 -> 900: calibrated <24/<21 + escalating hold.
+                tierHealthy = healthy;
+                requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS;
+                holdMs = bqrFallbackHoldMs(state);
+            } else {
+                // Strictest tier 900 -> 1000: more windows, longer hold (6.8.5).
+                tierHealthy = healthy;
+                requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT;
+                holdMs = BQR_FALLBACK_HOLD_MS_STRICT;
+            }
+            state.bqrFallbackHealthyWindows =
+                    tierHealthy ? state.bqrFallbackHealthyWindows + 1 : 0;
+            if (state.bqrFallbackHealthyWindows >= requiredWindows
+                    && nowMs - state.bqrFallbackSinceMs >= holdMs) {
+                int windows = state.bqrFallbackHealthyWindows;
+                state.bqrFallbackHealthyWindows = 0;
+                // One rung up: 400->500, 500->900 (or straight to the peer ceiling on
+                // peer-capped devices), 900->peer ceiling.
+                state.bqrFallbackCapKbps = cap <= 400
+                        ? 500
+                        : cap <= 500 && state.peerCeilingKbps > 0
+                                && state.peerCeilingKbps <= 900
+                        ? 0
+                        : cap <= 500 ? 900 : 0;
+                if (state.bqrFallbackCapKbps > 0) {
+                    // Phase N-4 review P1-2: a partial recovery enters a new tier, so the
+                    // next tier's hold counts from now — otherwise a 1000->900->500->900
+                    // path would enter the strict 900 tier with a stale sinceMs and only
+                    // hold ~60 s instead of the blueprint's 2-3 min.
+                    state.bqrFallbackSinceMs = nowMs;
+                }
+                state.bqrFallbackRecoveredMs = nowMs;
+                state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
+                state.bqrFastFailQueueSinceMs = 0L;
+                publishCeiling(mac, state, "bqr_fallback_recovered", nowMs);
+                notifyBqrFallback(mac, state, "recovered", 0, windows);
+            }
+        }
+        if (state.bqrFallbackStepBadWindows >= BQR_FALLBACK_REQUIRED_BAD_WINDOWS) {
+            state.bqrFallbackStepBadWindows = 0;
+            triggerBqrFallback(mac, state, nowMs, "triggered",
+                    BQR_FALLBACK_REQUIRED_BAD_WINDOWS, false);
         }
     }
 
@@ -1258,6 +1360,10 @@ final class LhdcLinkHealthController {
         state.leakyFallbackSinceMs = nowMs;
         state.leakyFallbackHealthyWindows = 0;
         state.choppyBucket = 0.0;
+        // Phase N-4 review P1-3 (6.8.4): a downgrade clears the uncapped BQR bad streak so
+        // the next tier needs fresh evidence.
+        state.bqrFallbackBadWindows = 0;
+        state.downgradeDeadZoneUntilMs = nowMs + DOWNGRADE_DEAD_ZONE_MS;
         publishCeiling(mac, state, "leaky_bucket_triggered", nowMs);
     }
 
@@ -1315,6 +1421,7 @@ final class LhdcLinkHealthController {
     private void evaluateLeapWindow(String mac, DeviceState state, long nowMs) {
         if (!state.streaming) return;  // review P1-1: stale queue/choppy from a suspend must not align
         if (nowMs < state.startGuardUntilMs) return;
+        if (nowMs < state.downgradeDeadZoneUntilMs) return;  // Phase N-4 dead zone
         if (state.lastLeapShadowMs != 0L
                 && nowMs - state.lastLeapShadowMs < SHADOW_CANDIDATE_COOLDOWN_MS) return;
         double retx = state.retransmissionsPerSecond;
@@ -1366,7 +1473,10 @@ final class LhdcLinkHealthController {
             int badWindows,
             boolean queueFastFail) {
         state.bqrFallbackBadWindows = 0;
-        state.bqrFallbackCapKbps = BQR_FALLBACK_CAP_KBPS;
+        state.bqrFallbackStepBadWindows = 0;
+        // Phase N-4 (6.8.3/decision 32): one rung per trigger — 1000->900, 900->500.
+        // 400 stays reserved for the disaster tier; the bucket is already cleared.
+        state.bqrFallbackCapKbps = nextLowerRung(effectiveCeiling(state));
         state.bqrFallbackSinceMs = nowMs;
         state.bqrFastFailUntilMs = 0L;
         state.bqrFastFailQueueSinceMs = 0L;
@@ -1386,10 +1496,20 @@ final class LhdcLinkHealthController {
         } else {
             state.bqrFallbackEscalationLevel = 0;
         }
+        // Phase N-4 dead zone (6.8.4): recovery evidence must not start from the old
+        // bitrate's tail.
+        state.downgradeDeadZoneUntilMs = nowMs + DOWNGRADE_DEAD_ZONE_MS;
         publishCeiling(mac, state,
                 queueFastFail ? "bqr_fallback_triggered_queue" : "bqr_fallback_triggered",
                 nowMs);
         notifyBqrFallback(mac, state, notifyReason, badWindows, 0);
+    }
+
+    /** Phase N-4: the rung below the current effective ceiling; 500 is the slow-heat floor. */
+    private static int nextLowerRung(int ceilingKbps) {
+        if (ceilingKbps >= 1000) return 900;
+        if (ceilingKbps >= 900) return 500;
+        return 500;
     }
 
     /**
@@ -1401,7 +1521,9 @@ final class LhdcLinkHealthController {
      */
     private void evaluateBqrQueueFastFail(
             String mac, DeviceState state, int length, long nowMs) {
-        if (state.bqrFallbackCapKbps > 0) return;
+        // Phase N-4 review P1-1: no cap early-return. A capped tier (500->900 recovery)
+        // must still be queue-protected during its probe window; cap 500/400 tiers are
+        // already excluded by the effectiveCeiling < 900 gate below.
         if (effectiveCeiling(state) < 900) return;
         if (state.bqrFastFailUntilMs == 0L || nowMs > state.bqrFastFailUntilMs) {
             state.bqrFastFailQueueSinceMs = 0L;
@@ -1438,6 +1560,22 @@ final class LhdcLinkHealthController {
     private static long bqrFallbackHoldMs(DeviceState state) {
         return BQR_FALLBACK_HOLD_MS[Math.max(0,
                 Math.min(state.bqrFallbackEscalationLevel, BQR_FALLBACK_HOLD_MS.length - 1))];
+    }
+
+    /**
+     * Test-only hook: forces the BQR fallback cap so the recovery tiers (including the
+     * disaster 400 rung, which has no live trigger while the sentinel is shadow-only) can be
+     * verified without a real downgrade sequence.
+     */
+    synchronized void setBqrFallbackCapKbpsForTest(
+            String mac, int capKbps, long nowMs) {
+        DeviceState state = stateFor(mac);
+        state.bqrFallbackCapKbps = capKbps;
+        state.bqrFallbackSinceMs = nowMs;
+        state.bqrFallbackHealthyWindows = 0;
+        state.bqrFallbackRecoveredMs = 0L;
+        state.bqrFallbackEscalationLevel = 0;
+        state.downgradeDeadZoneUntilMs = 0L;
     }
 
     private static BoundaryState inFlightBoundary(DeviceState state) {
@@ -1559,6 +1697,7 @@ final class LhdcLinkHealthController {
         state.pendingRequestId = 0;
         state.pendingSinceMs = 0L;
         state.currentConfirmedKbps = 0;
+        state.downgradeDeadZoneUntilMs = 0L;
         // Phase N-2: every stream start (first play / connect / stream rebuild) arms the
         // START_GUARD. Resume within a session re-arms it through the streaming edge.
         state.startGuardUntilMs = nowMs + START_GUARD_MS;
@@ -1583,6 +1722,7 @@ final class LhdcLinkHealthController {
         state.noRxPerSecond = Double.NaN;
         state.bqrFallbackEscalationLevel = 0;
         state.bqrFallbackRecoveredMs = 0L;
+        state.bqrFallbackStepBadWindows = 0;
         state.bqrFastFailUntilMs = 0L;
         state.bqrFastFailQueueSinceMs = 0L;
         state.lastCongestionMs = nowMs;

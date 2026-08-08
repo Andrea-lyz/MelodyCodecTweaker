@@ -469,6 +469,114 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
+    public void bqrFallbackStepsDownOneRungAtATimeOnADevice() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        // A device: peer ceiling stays at the default 1000.
+
+        // First step: 1000 -> 900 after four sustained bad windows.
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        for (int i = 1; i <= 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L + i * 6_000L);
+        }
+        assertEquals(900, controller.snapshot(MAC, 34_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("900:bqr_fallback_triggered"));
+
+        // Second step needs fresh evidence: four more bad windows while capped -> 500.
+        // The first bad window after the downgrade sits in the 10 s dead zone and is
+        // frozen; the following four accumulate.
+        controller.onBqrSample(MAC, bqrFallbackBad(), 40_000L);   // dead zone
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 46_000L + i * 6_000L);  // 46..64
+        }
+        assertEquals(500, controller.snapshot(MAC, 64_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("500:bqr_fallback_triggered"));
+    }
+
+    @Test
+    public void downgradeDeadZoneFreezesRecoveryEvidence() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        for (int i = 1; i <= 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L + i * 6_000L);  // 16..34
+        }
+        assertEquals(500, controller.snapshot(MAC, 34_000L).ceilingKbps);
+
+        // Healthy windows inside the 10 s dead zone must not start the recovery streak.
+        controller.onBqrSample(MAC, bqrFallbackHealthy(), 40_000L);  // 6 s after trigger
+        controller.onBqrSample(MAC, bqrFallbackHealthy(), 44_000L);  // dead zone ends 44 s
+        controller.onBqrSample(MAC, bqrFallbackHealthy(), 50_000L);  // streak starts here
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, bqrFallbackHealthy(), 56_000L + i * 6_000L);  // 62..92
+        }
+        // Windows 44/50 are frozen or first; recovery needs 6 counted (62..92) + 60 s hold
+        // from 34 s (expires 94 s) -> still capped at 92 s.
+        assertEquals(500, controller.snapshot(MAC, 92_000L).ceilingKbps);
+        controller.onBqrSample(MAC, bqrFallbackHealthy(), 98_000L);
+        assertEquals(900, controller.snapshot(MAC, 98_000L).ceilingKbps);
+        assertTrue(recorder.skippedBqrWindows.contains("dead_zone"));
+    }
+
+    @Test
+    public void fastRecoveryTierMoves400To500() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 400, 10_000L);
+        assertEquals(400, controller.snapshot(MAC, 10_000L).ceilingKbps);
+
+        // Fast channel: 5 windows at relaxed evidence (retx<=40/noRx<=25) + 30 s hold.
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 5; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 26_000L + i * 6_000L);  // 32..56
+        }
+        assertEquals(500, controller.snapshot(MAC, 56_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("500:bqr_fallback_recovered"));
+    }
+
+    @Test
+    public void fastRecoveryTierCountsMidBandWindows() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 400, 10_000L);
+
+        // The relaxed 400 tier counts mid-band windows (26/23) that the <24/<21 evidence
+        // would reject (review P2-3c).
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 5; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);  // 32..56
+        }
+        assertEquals(500, controller.snapshot(MAC, 56_000L).ceilingKbps);
+    }
+
+    @Test
+    public void bqrFallbackFloorRetriggerIsIdempotent() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        for (int i = 1; i <= 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L + i * 6_000L);
+        }
+        assertEquals(500, controller.snapshot(MAC, 34_000L).ceilingKbps);  // 900 -> 500
+
+        // At the 500 floor another four bad windows re-trigger but the rung stays 500.
+        controller.onBqrSample(MAC, bqrFallbackBad(), 44_000L);   // dead zone ends 44 s
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 46_000L + i * 6_000L);  // 46..64
+        }
+        assertEquals(500, controller.snapshot(MAC, 64_000L).ceilingKbps);
+    }
+
+    @Test
     public void bqrFallbackSingleBadWindowDoesNotClamp() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
@@ -1658,7 +1766,14 @@ public final class LhdcLinkHealthControllerTest {
         for (int i = 8; i < 10; i++) {
             controller.onBqrSample(MAC, healthyBqr(), 66_000L + i * 6_000L);  // 114..120
         }
-        assertEquals(1000, controller.snapshot(MAC, 120_000L).ceilingKbps);  // bqr recovered at 114 s
+        // Phase N-4 tiered recovery: 500 recovers one rung to 900 at 114 s; the strict
+        // 900->1000 tier (8 windows + 120 s hold from the 114 s partial recovery) completes
+        // at 234 s.
+        assertEquals(900, controller.snapshot(MAC, 120_000L).ceilingKbps);
+        for (int i = 10; i < 30; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 66_000L + i * 6_000L);  // 126..240
+        }
+        assertEquals(1000, controller.snapshot(MAC, 240_000L).ceilingKbps);
     }
 
     private static long openHealthyProbe(LhdcLinkHealthController controller) {
