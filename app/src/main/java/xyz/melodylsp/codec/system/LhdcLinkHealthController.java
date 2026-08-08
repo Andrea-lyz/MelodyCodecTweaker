@@ -107,6 +107,13 @@ final class LhdcLinkHealthController {
     static final double LEAKY_BUCKET_FILL_PER_EVENT = 10.0;
     static final double LEAKY_BUCKET_DECAY_PER_SEC = 0.5;
     static final double LEAKY_BUCKET_THRESHOLD = 15.0;
+    /**
+     * Phase N-3 (review P1-1): after a leaky recovery, re-triggering is blocked for this
+     * long, so an X3-edge environment cannot oscillate 1000<->900 every ~1.5-3 min. This is
+     * the trigger-side precursor of the Phase 4 dead zone and must be carried into that
+     * design explicitly.
+     */
+    static final long LEAKY_RETRIGGER_DEAD_ZONE_MS = 60_000L;
 
     // Phase N-3 8 s leap window (6.8.3): a consistent triple alignment (deduped choppy +
     // sustained high queue + BQR bad window, queue not draining) within 8 s would cross
@@ -435,6 +442,7 @@ final class LhdcLinkHealthController {
         int leakyFallbackCapKbps;
         long leakyFallbackSinceMs;
         int leakyFallbackHealthyWindows;
+        long leakyRecoveredMs;
         // Phase N-3 8 s leap window state (shadow): high-queue accumulation is sampled on the
         // 200 ms queue tick, so only continuous segments accumulate.
         long lastQueueSampleMs;
@@ -530,6 +538,7 @@ final class LhdcLinkHealthController {
             // the same way the BQR fallback cap is dropped.
             state.leakyFallbackCapKbps = 0;
             state.leakyFallbackHealthyWindows = 0;
+            state.leakyRecoveredMs = 0L;
             // Review P2-5: the attempt also clears the bucket and the shadow cooldowns so a
             // fresh user write starts with a clean slate instead of inherited state.
             state.choppyBucket = 0.0;
@@ -630,25 +639,31 @@ final class LhdcLinkHealthController {
                     // Phase N-3 transitional recovery: 6 healthy windows plus the base hold
                     // restore the rung. Phase 4 replaces this with the full asymmetric
                     // recovery (fast 400->500, long 500->900, strictest 900->1000).
-                    // Phase 3 device fix (feedback 205714): recovery evidence is aligned with
-                    // the BQR fallback recovery (retx<24 && noRx<21, no AFH gate). The earlier
-                    // strictlyHealthy gate required unusedAfh<=49, which X3 never meets
-                    // (AFH 51-54 in normal use) and stranded the 900 rung forever.
+                    // Phase 3 device fixes (feedback 205714/213744): the rung is only one
+                    // step down, so recovery evidence is the conservative AND sub-complement
+                    // of the bad-window gate (retx<30 && noRx<25, no AFH condition) instead
+                    // of the strict BQR-recovery thresholds (<24/<21). A single-sided hot
+                    // window (e.g. retx=32/noRx=10) is not a bad window but still resets the
+                    // streak (review P2-1). X3 sits in the 24-35 band after interference
+                    // stops; the strict gate never accumulated six windows and stranded the
+                    // 900 rung (earlier the AFH<=49 gate made it unreachable). The BQR
+                    // fallback recovery (500 and above) keeps the calibrated <24/<21.
                     if (streaming && legalWindow) {
                         // Only decision-eligible windows participate (review P2-1): a
                         // suspended or illegal window keeps the streak instead of resetting
                         // it, matching the BQR fallback early-return semantics.
                         state.leakyFallbackHealthyWindows =
                                 state.retransmissionsPerSecond
-                                                < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
+                                                < BQR_FALLBACK_BAD_RETX_PER_SEC
                                         && state.noRxPerSecond
-                                                < BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC
+                                                < BQR_FALLBACK_BAD_NO_RX_PER_SEC
                                 ? state.leakyFallbackHealthyWindows + 1 : 0;
                     }
                     if (state.leakyFallbackHealthyWindows >= BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS
                             && nowMs - state.leakyFallbackSinceMs >= BQR_FALLBACK_HOLD_MS[0]) {
                         state.leakyFallbackCapKbps = 0;
                         state.leakyFallbackHealthyWindows = 0;
+                        state.leakyRecoveredMs = nowMs;
                         publishCeiling(mac, state, "leaky_bucket_recovered", nowMs);
                     }
                 }
@@ -1230,6 +1245,12 @@ final class LhdcLinkHealthController {
     private void evaluateLeakyBucket(String mac, DeviceState state, long nowMs) {
         if (state.choppyBucket < LEAKY_BUCKET_THRESHOLD) return;
         if (state.leakyFallbackCapKbps > 0) return;
+        if (state.leakyRecoveredMs != 0L
+                && nowMs - state.leakyRecoveredMs < LEAKY_RETRIGGER_DEAD_ZONE_MS) {
+            // Review P1-1: re-trigger dead zone after a recovery prevents 1000<->900
+            // oscillation in edge environments. Phase 4 generalizes this into the dead zone.
+            return;
+        }
         int ceiling = effectiveCeiling(state);
         if (ceiling <= 500) return;
         int target = ceiling >= 1000 ? 900 : 500;
@@ -1548,6 +1569,7 @@ final class LhdcLinkHealthController {
         state.leakyFallbackCapKbps = 0;
         state.leakyFallbackSinceMs = 0L;
         state.leakyFallbackHealthyWindows = 0;
+        state.leakyRecoveredMs = 0L;
         state.lastQueueSampleMs = 0L;
         state.queueHighAccumMs = 0L;
         state.lastQueueHighMs = 0L;

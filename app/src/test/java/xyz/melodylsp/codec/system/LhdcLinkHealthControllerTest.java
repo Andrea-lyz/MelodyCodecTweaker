@@ -1514,7 +1514,7 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
-    public void leakyRecoveryBoundaryWindowsStrictlyBelowThresholds() {
+    public void leakyRecoveryCountsMidBandWindows() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
         controller.activate(MAC, 100L);
@@ -1522,18 +1522,116 @@ public final class LhdcLinkHealthControllerTest {
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
         controller.onRemoteChoppyReport(MAC, 1, 24_000L);  // trigger -> 900
 
-        // 48..78 is 6 healthy but hold (from 24 s) only expires at 84 s; the boundary window
-        // at exactly 24.0/21.0 resets the streak, so recovery waits for 96..126 (6 more).
         controller.onBqrSample(MAC, healthyBqr(), 36_000L);        // baseline
         for (int i = 1; i <= 6; i++) {
             controller.onBqrSample(MAC, healthyBqr(), 42_000L + i * 6_000L);  // 48..78
         }
-        controller.onBqrSample(MAC, boundaryBqr(), 84_000L);       // exactly on threshold
+        // X3 mid-band window (26/23) at hold expiry counts: the strict <24/<21 gate would
+        // have ignored it and deferred recovery (feedback 213744).
+        controller.onBqrSample(MAC, midBandBqr(), 84_000L);
+        assertEquals(1000, controller.snapshot(MAC, 84_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("1000:leaky_bucket_recovered"));
+    }
+
+    @Test
+    public void leakyRecoveryBadThresholdBoundaryStrictlyBelow() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);  // trigger -> 900
+
+        controller.onBqrSample(MAC, healthyBqr(), 36_000L);        // baseline
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 42_000L + i * 6_000L);  // 48..78
+        }
+        // Exactly 30.0/25.0 is the bad-window boundary: the strict < complement must not
+        // count it, so the streak resets at 84 s and recovery waits for 96..126.
+        controller.onBqrSample(MAC, boundaryBqr(), 84_000L);
         assertEquals(900, controller.snapshot(MAC, 90_000L).ceilingKbps);
         for (int i = 1; i <= 6; i++) {
             controller.onBqrSample(MAC, healthyBqr(), 90_000L + i * 6_000L);  // 96..126
         }
         assertEquals(1000, controller.snapshot(MAC, 126_000L).ceilingKbps);
+    }
+
+    @Test
+    public void leakyRetriggerBlockedWithinDeadZoneAfterRecovery() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);  // trigger -> 900
+        controller.onBqrSample(MAC, healthyBqr(), 36_000L);        // baseline
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 42_000L + i * 6_000L);  // 48..78
+        }
+        controller.onBqrSample(MAC, healthyBqr(), 84_000L);       // hold expired -> recovery
+        assertEquals(1000, controller.snapshot(MAC, 84_000L).ceilingKbps);
+
+        // A choppy pair 16 s after recovery (outside POST_SWITCH_GUARD) fills the bucket
+        // but the 60 s re-trigger dead zone keeps the rung.
+        controller.onRemoteChoppyReport(MAC, 1, 100_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 101_000L);
+        assertEquals(1000, controller.snapshot(MAC, 101_000L).ceilingKbps);
+        assertEquals(1, recorder.events.stream()
+                .filter(e -> e.endsWith("leaky_bucket_triggered")).count());
+
+        // After the dead zone expires the same pair triggers again.
+        controller.onRemoteChoppyReport(MAC, 1, 150_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 151_000L);
+        assertEquals(900, controller.snapshot(MAC, 151_000L).ceilingKbps);
+    }
+
+    @Test
+    public void leakyRecoverySingleSidedHotWindowResetsStreak() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);  // trigger -> 900
+        controller.onBqrSample(MAC, healthyBqr(), 36_000L);        // baseline
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 42_000L + i * 6_000L);  // 48..78
+        }
+        // retx=32/noRx=10 is NOT a bad window (noRx<25) but must still reset the leaky
+        // streak: recovery evidence is the conservative AND sub-complement (review P2-1).
+        controller.onBqrSample(MAC, oneSidedBqr(), 84_000L);
+        assertEquals(900, controller.snapshot(MAC, 90_000L).ceilingKbps);
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 90_000L + i * 6_000L);  // 96..126
+        }
+        assertEquals(1000, controller.snapshot(MAC, 126_000L).ceilingKbps);
+    }
+
+    @Test
+    public void bqrRecoveryBoundaryWindowsStrictlyBelowThresholds() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);   // baseline
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L + i * 6_000L);  // 16..34
+        }
+        assertEquals(500, controller.snapshot(MAC, 34_000L).ceilingKbps);
+
+        // 6 deep-healthy windows plus an exactly-24.0/21.0 window at hold expiry: the
+        // strict < gate must reset, deferring recovery to the following six windows.
+        controller.onBqrSample(MAC, healthyBqr(), 40_000L);        // baseline
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 46_000L + i * 6_000L);  // 52..82
+        }
+        controller.onBqrSample(MAC, strictBoundaryBqr(), 88_000L);
+        assertEquals(500, controller.snapshot(MAC, 94_000L).ceilingKbps);
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 94_000L + i * 6_000L);  // 100..130
+        }
+        assertEquals(900, controller.snapshot(MAC, 130_000L).ceilingKbps);
     }
 
     @Test
@@ -1639,8 +1737,26 @@ public final class LhdcLinkHealthControllerTest {
                 54, 0, 90, 60, 2, -45, 10, 0, 0);
     }
 
-    /** 6 s window: exactly 24.0/21.0 — the strict `<` boundary must NOT count as healthy. */
+    /** 6 s window: exactly 30.0/25.0 — the bad-window boundary, strict `<` must NOT count. */
     private static LhdcLinkHealthController.BqrSample boundaryBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, 180, 150, 0, -45, 10, 0, 0);
+    }
+
+    /** 6 s window: 26.0/23.0 — the X3 mid-band sample that must count as recovery evidence. */
+    private static LhdcLinkHealthController.BqrSample midBandBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, 156, 138, 0, -45, 10, 0, 0);
+    }
+
+    /** 6 s window: retx=32/noRx=10 — single-sided hot: not a bad window, not recovery. */
+    private static LhdcLinkHealthController.BqrSample oneSidedBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, 192, 60, 0, -45, 10, 0, 0);
+    }
+
+    /** 6 s window: exactly 24.0/21.0 — the BQR recovery boundary, strict < must NOT count. */
+    private static LhdcLinkHealthController.BqrSample strictBoundaryBqr() {
         return new LhdcLinkHealthController.BqrSample(
                 30, 0, 144, 126, 0, -45, 10, 0, 0);
     }
