@@ -403,6 +403,12 @@ public final class SystemHookInstaller {
 
     private void handleProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
         NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+        // Phase N-1 requestId transaction: register the issued Target_Cap so native
+        // confirmations with the same requestId close the switch and timeouts fall back
+        // to the getter.
+        linkHealthController.onTargetCapIssued(
+                mac, ceilingKbps, NativeLhdcMemoryPatch.lastIssuedGovernorRequestId(),
+                SystemClock.elapsedRealtime());
         MLog.event("lhdc.link.probe_ceiling",
                 "mac", redactMac(mac),
                 "ceilingKbps", ceilingKbps,
@@ -1421,11 +1427,29 @@ public final class SystemHookInstaller {
                                 rememberPeerCeiling(mac, event.toKbps, "native_detected");
                             }
                         } else if (event != null) {
+                            boolean current =
+                                    NativeLhdcMemoryPatch.isGovernorEventCurrent(event);
+                            if (!current) {
+                                // Phase N-1 requestId transaction: the event belongs to a
+                                // superseded Target_Cap write. Java only acts on the latest
+                                // transaction; older results are logged and dropped.
+                                MLog.event("lhdc.governor.event_stale",
+                                        "mac", redactMac(mac),
+                                        "type", event.type,
+                                        "fromKbps", event.fromKbps,
+                                        "toKbps", event.toKbps,
+                                        "reasonId", event.reasonId,
+                                        "requestId", event.requestId);
+                            }
                             if (event.type
                                     == LhdcLinkHealthController.EVENT_TRANSITION_APPLIED) {
                                 noteLhdcDiagnosticReason(
                                         nativeTransitionReason(event), nowMs);
-                            } else {
+                                if (current) {
+                                    linkHealthController.onTransitionConfirmed(
+                                            mac, event.toKbps, event.requestId, nowMs);
+                                }
+                            } else if (current) {
                                 linkHealthController.onGovernorEvent(
                                         mac, event.type, event.fromKbps, event.toKbps,
                                         event.detailMs, nowMs);
@@ -1434,6 +1458,19 @@ public final class SystemHookInstaller {
                         if (NativeLhdcMemoryPatch.isGovernorStreaming()) {
                             linkHealthController.onQueueSample(
                                     mac, length, LHDC_QUEUE_CAPACITY, nowMs);
+                        }
+                        LhdcLinkHealthController.PendingTransaction switchTimedOut =
+                                linkHealthController.tickSwitchTransactions(mac, nowMs);
+                        if (switchTimedOut != null) {
+                            MLog.event("lhdc.governor.switch_timeout",
+                                    "mac", redactMac(mac),
+                                    "targetKbps", switchTimedOut.targetKbps,
+                                    "requestId", switchTimedOut.requestId,
+                                    "sinceMs", switchTimedOut.sinceMs,
+                                    "actualBitrateKbps",
+                                    NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                                    "bitrateVerification",
+                                    NativeLhdcMemoryPatch.currentGovernorVerification());
                         }
                         if (event != null) {
                             LhdcLinkHealthController.Snapshot snapshot =

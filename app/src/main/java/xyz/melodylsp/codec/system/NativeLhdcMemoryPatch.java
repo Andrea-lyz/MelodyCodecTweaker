@@ -14,6 +14,7 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.util.MLog;
@@ -202,9 +203,28 @@ final class NativeLhdcMemoryPatch {
     /** Normalizes any input to the supported probe-ceiling ladder; 0/negative means "unknown" -> 1000. */
     static int normalizeProbeCeilingKbps(int ceilingKbps) {
         if (ceilingKbps <= 0) return 1000;
+        if (ceilingKbps <= 400) return 400;
         if (ceilingKbps <= 500) return 500;
         if (ceilingKbps <= 900) return 900;
         return 1000;
+    }
+
+    /**
+     * Phase N-1 requestId transaction: every Target_Cap write is stamped with a monotonically
+     * increasing id. Native events carry the id of the request that caused them, so Java can
+     * drop stale results from superseded transactions.
+     */
+    private static final AtomicInteger GOVERNOR_REQUEST_COUNTER = new AtomicInteger();
+    private static volatile int lastIssuedGovernorRequestId;
+
+    static int lastIssuedGovernorRequestId() {
+        return lastIssuedGovernorRequestId;
+    }
+
+    /** requestId 0 means the event is not bound to a Java request (native init path). */
+    static boolean isGovernorEventCurrent(GovernorEvent event) {
+        if (event == null || event.requestId == 0) return true;
+        return event.requestId == lastIssuedGovernorRequestId;
     }
 
     /** Updates the desired ceiling cache and returns the previously cached value. */
@@ -231,10 +251,13 @@ final class NativeLhdcMemoryPatch {
         }
         if (!governorInstalled) return;
         try {
-            nativeSetGovernorProbeCeilingKbps(normalized);
+            int requestId = GOVERNOR_REQUEST_COUNTER.incrementAndGet();
+            lastIssuedGovernorRequestId = requestId;
+            nativeSetGovernorTargetKbps(normalized, requestId);
             MLog.event("lhdc.governor.ceiling_applied",
                     "ceilingKbps", normalized,
-                    "previousKbps", previous);
+                    "previousKbps", previous,
+                    "requestId", requestId);
         } catch (Throwable t) {
             MLog.w("lhdc governor probe ceiling update failed", t);
         }
@@ -243,9 +266,12 @@ final class NativeLhdcMemoryPatch {
     private static void replayGovernorProbeCeiling() {
         int ceilingKbps = desiredGovernorProbeCeilingKbps;
         try {
-            nativeSetGovernorProbeCeilingKbps(ceilingKbps);
+            int requestId = GOVERNOR_REQUEST_COUNTER.incrementAndGet();
+            lastIssuedGovernorRequestId = requestId;
+            nativeSetGovernorTargetKbps(ceilingKbps, requestId);
             MLog.event("lhdc.governor.ceiling_replayed_after_install",
-                    "ceilingKbps", ceilingKbps);
+                    "ceilingKbps", ceilingKbps,
+                    "requestId", requestId);
         } catch (Throwable t) {
             MLog.w("lhdc governor probe ceiling replay failed", t);
         }
@@ -424,16 +450,17 @@ final class NativeLhdcMemoryPatch {
             int toKbps = bitrateForNativeRate((int) ((packed >>> 16) & 0xffL));
             long detailMs = packed >>> 24;
             int reasonId = nativeConsumeGovernorEventReasonId();
+            int requestId = nativeConsumeGovernorEventRequestId();
             if (event == LhdcLinkHealthController.EVENT_PEER_CEILING_DETECTED) {
                 if (toKbps == 0) return null;
-                return new GovernorEvent(event, 0, toKbps, detailMs, reasonId);
+                return new GovernorEvent(event, 0, toKbps, detailMs, reasonId, requestId);
             }
             if (event == LhdcLinkHealthController.EVENT_TRANSITION_APPLIED) {
                 if (toKbps == 0) return null;
-                return new GovernorEvent(event, fromKbps, toKbps, detailMs, reasonId);
+                return new GovernorEvent(event, fromKbps, toKbps, detailMs, reasonId, requestId);
             }
             if (fromKbps == 0 || toKbps == 0) return null;
-            return new GovernorEvent(event, fromKbps, toKbps, detailMs, reasonId);
+            return new GovernorEvent(event, fromKbps, toKbps, detailMs, reasonId, requestId);
         } catch (Throwable t) {
             MLog.w("lhdc governor event read failed", t);
             return null;
@@ -454,13 +481,16 @@ final class NativeLhdcMemoryPatch {
         final int toKbps;
         final long detailMs;
         final int reasonId;
+        final int requestId;
 
-        GovernorEvent(int type, int fromKbps, int toKbps, long detailMs, int reasonId) {
+        GovernorEvent(int type, int fromKbps, int toKbps, long detailMs, int reasonId,
+                int requestId) {
             this.type = type;
             this.fromKbps = fromKbps;
             this.toKbps = toKbps;
             this.detailMs = detailMs;
             this.reasonId = reasonId;
+            this.requestId = requestId;
         }
     }
 
@@ -953,10 +983,11 @@ final class NativeLhdcMemoryPatch {
 
     private static native void nativeSetGovernorPolicy(int policy);
 
-    private static native void nativeSetGovernorProbeCeilingKbps(int ceilingKbps);
+    private static native void nativeSetGovernorTargetKbps(int targetKbps, int requestId);
 
     private static native long nativeConsumeGovernorEvent();
     private static native int nativeConsumeGovernorEventReasonId();
+    private static native int nativeConsumeGovernorEventRequestId();
 
     private static native int nativeGetGovernorBitrateKbps();
 

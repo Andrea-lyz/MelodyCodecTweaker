@@ -2,6 +2,8 @@ package xyz.melodylsp.codec.system;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.util.ArrayList;
@@ -913,6 +915,57 @@ public final class LhdcLinkHealthControllerTest {
                 new LhdcLinkHealthController(null);
         assertEquals(LhdcLinkHealthController.CHOPPY_CAPABILITY_UNKNOWN,
                 newProcessController.snapshot(MAC, 400L).choppyCapabilityState);
+    }
+
+    @Test
+    public void issuedTargetCapTimesOutAndReturnsPendingTransactionOnce() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
+        assertNull(controller.tickSwitchTransactions(MAC, 3_400L));
+
+        LhdcLinkHealthController.PendingTransaction pending =
+                controller.tickSwitchTransactions(MAC, 3_600L);
+        assertNotNull(pending);
+        assertEquals(500, pending.targetKbps);
+        assertEquals(7, pending.requestId);
+        assertEquals(1_000L, pending.sinceMs);
+
+        assertNull(controller.tickSwitchTransactions(MAC, 3_700L));
+    }
+
+    @Test
+    public void matchingTransitionConfirmationClosesTransactionBeforeTimeout() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
+        controller.onTransitionConfirmed(MAC, 500, 7, 1_200L);
+        assertNull(controller.tickSwitchTransactions(MAC, 10_000L));
+    }
+
+    @Test
+    public void staleTransitionConfirmationIsIgnoredAndTransactionStillTimesOut() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
+        controller.onTransitionConfirmed(MAC, 500, 6, 1_200L);
+        LhdcLinkHealthController.PendingTransaction pending =
+                controller.tickSwitchTransactions(MAC, 4_000L);
+        assertNotNull(pending);
+        assertEquals(7, pending.requestId);
+    }
+
+    @Test
+    public void sessionResetClearsPendingTransaction() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
+        controller.onStreamSessionChanged(MAC, 99L, 2_000L);
+        assertNull(controller.tickSwitchTransactions(MAC, 10_000L));
     }
 
     private static long openHealthyProbe(LhdcLinkHealthController controller) {

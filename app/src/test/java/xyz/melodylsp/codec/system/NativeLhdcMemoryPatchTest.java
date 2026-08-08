@@ -204,7 +204,7 @@ public final class NativeLhdcMemoryPatchTest {
     public void probeCeilingNormalizationIsFixed() {
         assertEquals(1000, NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(0));
         assertEquals(1000, NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(-1));
-        assertEquals(500, NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(400));
+        assertEquals(400, NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(400));
         assertEquals(500, NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(500));
         assertEquals(900, NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(600));
         assertEquals(900, NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(900));

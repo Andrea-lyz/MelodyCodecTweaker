@@ -113,9 +113,6 @@ constexpr uint32_t kRate500 = 6;
 constexpr uint32_t kRate900 = 7;
 constexpr uint32_t kRate1000 = 8;
 constexpr uint32_t kDefaultQueueCapacity = 45;
-constexpr uint64_t kCriticalOccupancyPercent = 90ULL;
-constexpr uint64_t kCriticalHoldMs = 300ULL;
-constexpr uint64_t kUpgradeStableMs = 15'000ULL;
 constexpr uint64_t kUpgradeFailureWindowMs = 10'000ULL;
 constexpr uint64_t kUpgradeRecoveryMs = 60'000ULL;
 constexpr uint64_t kStreamingRecentMs = 2'000ULL;
@@ -190,6 +187,11 @@ std::atomic<int> g_choppy_level{0};
 std::atomic<uint32_t> g_probe_ceiling_rate{kRate1000};
 std::atomic<uint64_t> g_governor_event{0};
 std::atomic<uint32_t> g_governor_event_reason_id{0};
+// Phase N-1 requestId transaction: Java stamps every Target_Cap write; publish_governor_event
+// copies the pending id into the event slot so Java can tell which transaction an event belongs
+// to. 0 means the event is not bound to a Java request (native session-initialization path).
+std::atomic<uint32_t> g_pending_request_id{0};
+std::atomic<uint32_t> g_governor_event_request_id{0};
 std::atomic<uint64_t> g_stream_session_epoch{0};
 std::atomic<uint32_t> g_requested_rate{0};
 std::atomic<int> g_verification_state{kVerificationNone};
@@ -266,6 +268,12 @@ uint64_t pack_governor_event(
 
 void publish_governor_event(
         uint32_t event, uint32_t from, uint32_t to, uint64_t detail_ms = 0) {
+    // Store the transaction id before the event. The consumer reads the event (acquire) before
+    // reason/request ids, and the release/acquire chain on g_governor_event makes both ids
+    // visible to it.
+    g_governor_event_request_id.store(
+            g_pending_request_id.load(std::memory_order_acquire),
+            std::memory_order_relaxed);
     g_governor_event.store(pack_governor_event(event, from, to, detail_ms),
             std::memory_order_release);
 }
@@ -608,7 +616,7 @@ void apply_choppy_protection(uint32_t queue, uint64_t now, bool observe_only) {
     if (observe_only) {
         __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
                 "evt=choppy.report level=%d sequence=%llu count=%u "
-                "action=observe_only_fixed_1000 target=%d",
+                "action=observe_only target=%d",
                 level, static_cast<unsigned long long>(sequence), g_choppy_count,
                 bitrate_for_rate(g_current_rate));
         return;
@@ -656,84 +664,16 @@ void quality_governor_sample(void* handle, uint32_t queue) {
         set_rate(probe_ceiling, "probe_ceiling", queue, now, false);
         return;
     }
-    const bool fixed_1000_ab = fixed_1000_ab_mode();
-    apply_choppy_protection(queue, now, fixed_1000_ab);
-    // Evidence-only debug mode: keep the one-time quality_start write and getter verification,
-    // but never let queue/choppy signals change bitrate afterward. Java/root diagnostics still
-    // receive every signal, which isolates whether the dynamic setter transitions are audible.
-    if (fixed_1000_ab) {
-        // The fixed-mode upgrade ladder is disabled, so a released Java fallback cap (probe
-        // ceiling raised back to the peer ceiling) would otherwise leave the encoder parked at
-        // the clamped rung forever. Re-apply the ceiling explicitly. set_rate(upgrade=false)
-        // updates g_current_rate optimistically, so this fires once per ceiling release; a hard
-        // setter failure retries at the transition-hold cadence like the downgrade clamp does.
-        if (g_current_rate != 0 && g_current_rate < probe_ceiling
-                && g_pending_upgrade_ms == 0
-                && (g_last_transition_ms == 0
-                        || now - g_last_transition_ms >= 700ULL)) {
-            set_rate(probe_ceiling, "probe_ceiling_restore", queue, now, false);
-        }
-        return;
-    }
-
-    const uint64_t occupancy = static_cast<uint64_t>(queue) * 100ULL;
-    const uint64_t capacity = static_cast<uint64_t>(g_queue_capacity);
-    const bool full = queue >= g_queue_capacity;
-    const bool critical = occupancy >= capacity * kCriticalOccupancyPercent;
-    const bool low = occupancy <= capacity * 25ULL;
-
-    if (full) {
-        note_congestion(now);
-        const uint32_t target = g_current_rate >= kRate900 ? kRate500 : kRate400;
-        set_rate(target, "queue_full", queue, now, false);
-        return;
-    }
-
-    if (critical) {
-        note_congestion(now);
-        if (g_critical_since_ms == 0) g_critical_since_ms = now;
-    } else {
-        g_critical_since_ms = 0;
-    }
-
-    const bool transition_hold_elapsed = g_last_transition_ms == 0
-            || now - g_last_transition_ms >= 700ULL;
-    if (transition_hold_elapsed
-            && g_critical_since_ms != 0
-            && now - g_critical_since_ms >= kCriticalHoldMs
-            && g_current_rate > kRate400) {
-        const uint32_t target = g_current_rate >= kRate900 ? kRate500 : kRate400;
-        set_rate(target, "queue_critical", queue, now, false);
-        return;
-    }
-
-    if (!low) {
-        g_low_since_ms = 0;
-        return;
-    }
-    if (g_low_since_ms == 0) g_low_since_ms = now;
-
-    uint64_t required_stable_ms = 0;
-    uint32_t target = g_current_rate;
-    if (g_current_rate == kRate400) {
-        required_stable_ms = kUpgradeStableMs;
-        target = kRate500;
-    } else if (g_current_rate == kRate500) {
-        required_stable_ms = kUpgradeStableMs;
-        target = kRate900;
-    } else if (g_current_rate == kRate900) {
-        required_stable_ms = kUpgradeStableMs;
-        target = kRate1000;
-    }
-    if (required_stable_ms == 0) return;
-    target = clamp_to_probe_ceiling(target);
-    if (target <= g_current_rate) return;
-    UpgradeBoundaryRuntime* boundary = boundary_for_upgrade(g_current_rate, target);
-    if (boundary != nullptr && now < boundary->backoff_until_ms) return;
-    const uint64_t stable_from = g_low_since_ms > g_last_congestion_ms
-            ? g_low_since_ms : g_last_congestion_ms;
-    if (now - stable_from >= required_stable_ms) {
-        set_rate(target, "stable_upgrade", queue, now, true);
+    // Phase N-1 (Java single brain): native choppy/queue/stable-upgrade decisions are removed.
+    // The encoder still receives choppy reports and queue samples as sensors, but native never
+    // downgrades or upgrades on its own. Java owns every Target_Cap change through the cap
+    // channel (nativeSetGovernorTargetKbps); the cap is re-applied here when a session reset
+    // left the encoder below it.
+    apply_choppy_protection(queue, now, true);
+    if (g_current_rate != 0 && g_current_rate < probe_ceiling
+            && g_pending_upgrade_ms == 0
+            && (g_last_transition_ms == 0 || now - g_last_transition_ms >= 700ULL)) {
+        set_rate(probe_ceiling, "probe_ceiling_restore", queue, now, false);
     }
 }
 
@@ -1329,15 +1269,21 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorPolicy(
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorProbeCeilingKbps(
-        JNIEnv*, jclass, jint ceiling_kbps) {
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorTargetKbps(
+        JNIEnv*, jclass, jint target_kbps, jint request_id) {
     uint32_t rate = kRate1000;
-    if (ceiling_kbps > 0) {
-        if (ceiling_kbps <= 500) {
+    if (target_kbps > 0) {
+        if (target_kbps <= 400) {
+            rate = kRate400;
+        } else if (target_kbps <= 500) {
             rate = kRate500;
-        } else if (ceiling_kbps <= 900) {
+        } else if (target_kbps <= 900) {
             rate = kRate900;
         }
+    }
+    if (request_id > 0) {
+        g_pending_request_id.store(static_cast<uint32_t>(request_id),
+                std::memory_order_release);
     }
     g_probe_ceiling_rate.store(rate, std::memory_order_release);
     {
@@ -1362,7 +1308,9 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorProbeCeil
         }
     }
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=probe.ceiling bitrate=%d", bitrate_for_rate(rate));
+            "evt=probe.ceiling bitrate=%d request_id=%u",
+            bitrate_for_rate(rate),
+            g_pending_request_id.load(std::memory_order_acquire));
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -1377,6 +1325,13 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeConsumeGovernorEvent
         JNIEnv*, jclass) {
     return static_cast<jint>(
             g_governor_event_reason_id.exchange(0, std::memory_order_acq_rel));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeConsumeGovernorEventRequestId(
+        JNIEnv*, jclass) {
+    return static_cast<jint>(
+            g_governor_event_request_id.exchange(0, std::memory_order_acq_rel));
 }
 
 extern "C" JNIEXPORT jint JNICALL

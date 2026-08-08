@@ -50,6 +50,12 @@ final class LhdcLinkHealthController {
     static final long MIN_PROBE_OPEN_MS = 15_000L;
     static final long MIN_PROBE_COOLDOWN_MS = 10_000L;
     static final long CRITICAL_QUEUE_HOLD_MS = 300L;
+    /**
+     * Phase N-1 requestId transaction: if the native side did not confirm a Target_Cap write
+     * (TRANSITION_APPLIED/UPGRADE_APPLIED with the matching requestId) within this window, the
+     * switch is marked timed out and Java falls back to the getter for the real bitrate.
+     */
+    static final long SWITCH_CONFIRM_TIMEOUT_MS = 2_500L;
     static final long EVIDENCE_TIER_DECAY_MS = 10 * 60_000L;
 
     // Experimental BQR fallback downgrade (validation build, Issue-8 Buds Ace 3): the headset
@@ -328,6 +334,15 @@ final class LhdcLinkHealthController {
          * 900→1000 upgrade boundary because it is a peer capability, not link quality.
          */
         int peerCeilingKbps;
+        /**
+         * Phase N-1 switch transaction: the most recent Target_Cap issued to native and whether
+         * it has been confirmed by a native event with the matching requestId. 0 = no pending
+         * transaction (IDLE).
+         */
+        int pendingTargetKbps;
+        int pendingRequestId;
+        long pendingSinceMs;
+        int currentConfirmedKbps;
     }
 
     private final Map<String, DeviceState> devices = new HashMap<>();
@@ -654,6 +669,64 @@ final class LhdcLinkHealthController {
     synchronized void onGovernorEvent(
             String mac, int event, int fromKbps, int toKbps, long nowMs) {
         onGovernorEvent(mac, event, fromKbps, toKbps, 0L, nowMs);
+    }
+
+    static final class PendingTransaction {
+        final int targetKbps;
+        final int requestId;
+        final long sinceMs;
+
+        PendingTransaction(int targetKbps, int requestId, long sinceMs) {
+            this.targetKbps = targetKbps;
+            this.requestId = requestId;
+            this.sinceMs = sinceMs;
+        }
+    }
+
+    /**
+     * Phase N-1 requestId transaction: records that a Target_Cap write was issued to native.
+     * The transaction stays open until a native event confirms it with the matching requestId
+     * or {@link #tickSwitchTransactions} times it out.
+     */
+    synchronized void onTargetCapIssued(
+            String mac, int targetKbps, int requestId, long nowMs) {
+        if (mac == null || requestId <= 0 || targetKbps <= 0) return;
+        DeviceState state = stateFor(mac);
+        state.pendingTargetKbps = targetKbps;
+        state.pendingRequestId = requestId;
+        state.pendingSinceMs = nowMs;
+    }
+
+    /**
+     * Phase N-1 requestId transaction: a native transition confirmed the requested rung. Only
+     * the latest transaction's requestId is accepted; stale confirmations are ignored.
+     */
+    synchronized void onTransitionConfirmed(
+            String mac, int toKbps, int requestId, long nowMs) {
+        if (mac == null || requestId <= 0) return;
+        DeviceState state = devices.get(mac);
+        if (state == null || state.pendingRequestId != requestId) return;
+        state.currentConfirmedKbps = toKbps;
+        state.pendingTargetKbps = 0;
+        state.pendingRequestId = 0;
+        state.pendingSinceMs = 0L;
+    }
+
+    /**
+     * Phase N-1 requestId transaction: called on the 200 ms queue tick. Returns the pending
+     * transaction when it exceeded {@link #SWITCH_CONFIRM_TIMEOUT_MS} without a native
+     * confirmation, so the caller can fall back to the getter for the real bitrate.
+     */
+    synchronized PendingTransaction tickSwitchTransactions(String mac, long nowMs) {
+        DeviceState state = devices.get(mac);
+        if (state == null || state.pendingRequestId == 0) return null;
+        if (nowMs - state.pendingSinceMs < SWITCH_CONFIRM_TIMEOUT_MS) return null;
+        PendingTransaction timedOut = new PendingTransaction(
+                state.pendingTargetKbps, state.pendingRequestId, state.pendingSinceMs);
+        state.pendingTargetKbps = 0;
+        state.pendingRequestId = 0;
+        state.pendingSinceMs = 0L;
+        return timedOut;
     }
 
     synchronized Snapshot snapshot(String mac, long nowMs) {
@@ -1057,6 +1130,10 @@ final class LhdcLinkHealthController {
 
     private static void resetSessionEvidence(DeviceState state, long nowMs) {
         cancelRecoveryProbe(state, nowMs, true);
+        state.pendingTargetKbps = 0;
+        state.pendingRequestId = 0;
+        state.pendingSinceMs = 0L;
+        state.currentConfirmedKbps = 0;
         state.lastBqrMs = 0L;
         state.lastValidBqrMs = 0L;
         state.healthyBqrWindows = 0;
