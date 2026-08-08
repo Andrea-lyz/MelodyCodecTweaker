@@ -1277,8 +1277,13 @@ final class LhdcLinkHealthController {
                 requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS;
                 holdMs = bqrFallbackHoldMs(state);
             } else {
-                // Strictest tier 900 -> 1000: more windows, longer hold (6.8.5).
-                tierHealthy = healthy;
+                // Strictest tier 900 -> 1000: 8 windows at non-bad evidence + 120 s hold
+                // (6.8.5). The strict <24/<21 evidence proved unreachable for X3's normal
+                // 24-35 band (feedback 231816: 10 minutes of 900-tier windows never reached
+                // 8 consecutive strict healthy windows); strictness lives in the long hold
+                // and window count, matching the leaky recovery evidence.
+                tierHealthy = retx < BQR_FALLBACK_BAD_RETX_PER_SEC
+                        && noRx < BQR_FALLBACK_BAD_NO_RX_PER_SEC;
                 requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT;
                 holdMs = BQR_FALLBACK_HOLD_MS_STRICT;
             }

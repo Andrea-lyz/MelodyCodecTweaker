@@ -577,6 +577,31 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
+    public void strictTierCountsMidBandWindows() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+        assertEquals(900, controller.snapshot(MAC, 10_000L).ceilingKbps);
+
+        // X3 regression (feedback 231816): the strict <24/<21 evidence never reached 8
+        // consecutive windows in the 900 tier; mid-band windows (26/23) now count and the
+        // 120 s hold from the cap start completes at 130 s.
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 8; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);  // 32..74
+        }
+        assertEquals(900, controller.snapshot(MAC, 74_000L).ceilingKbps);
+        for (int i = 9; i <= 20; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);  // 80..146
+        }
+        assertEquals(1000, controller.snapshot(MAC, 146_000L).ceilingKbps);
+        // The test hook bypasses the publish path, so the ceiling value never changed from
+        // the activation-time 1000 and the recovery lands in the state channel.
+        assertTrue(recorder.stateEvents.contains("1000:bqr_fallback_recovered"));
+    }
+
+    @Test
     public void bqrFallbackSingleBadWindowDoesNotClamp() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
