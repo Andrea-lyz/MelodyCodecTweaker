@@ -271,16 +271,18 @@ void publish_governor_event(
     // Store the transaction id before the event. The consumer reads the event (acquire) before
     // reason/request ids, and the release/acquire chain on g_governor_event makes both ids
     // visible to it.
-    g_governor_event_request_id.store(
-            g_pending_request_id.load(std::memory_order_acquire),
-            std::memory_order_relaxed);
+    uint32_t stamped_request_id = g_pending_request_id.load(std::memory_order_acquire);
+    g_governor_event_request_id.store(stamped_request_id, std::memory_order_relaxed);
     g_governor_event.store(pack_governor_event(event, from, to, detail_ms),
             std::memory_order_release);
     // One-shot transaction stamp (Phase N-1 review P1-3): only the first event after a Java
     // Target_Cap write carries its requestId. Spontaneous native events that follow (upgrade
     // verification, peer-ceiling detect, restore retries) start from 0 again, so the Java
     // stale filter is not fooled into treating them as part of the latest transaction.
-    g_pending_request_id.store(0, std::memory_order_relaxed);
+    // CAS (Phase N-2 review P2-1): if a new Java request landed between the read and the
+    // clear, keep its id so the next event still carries it.
+    g_pending_request_id.compare_exchange_strong(
+            stamped_request_id, 0, std::memory_order_relaxed);
 }
 
 uint32_t transition_reason_id(const char* reason) {

@@ -1081,6 +1081,84 @@ public final class LhdcLinkHealthControllerTest {
         assertTrue(recorder.fallbackEvents.isEmpty());
     }
 
+    @Test
+    public void startGuardSuppressesChoppyCongestion() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        // START_GUARD runs until 15.1 s: choppy inside it is recorded but not integrated.
+        controller.onRemoteChoppyReport(MAC, 1, 5_000L);
+        assertTrue(controller.snapshot(MAC, 5_100L).lastCongestionAgoMs > 4_000L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        assertTrue(controller.snapshot(MAC, 16_100L).lastCongestionAgoMs < 1_000L);
+    }
+
+    @Test
+    public void startGuardDoesNotBlockHealthyWindowCounting() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);  // baseline, interval 0
+        controller.onBqrSample(MAC, healthyBqr(), 13_000L);  // inside guard but healthy
+        assertEquals(1, controller.snapshot(MAC, 13_000L).healthyBqrWindows);
+    }
+
+    @Test
+    public void queueResumeEdgeReArmsStartGuard() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        controller.onBqrSample(MAC, bqrFallbackBad(), 13_000L);  // inside initial guard
+        controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L, false);  // stream idle
+        controller.onQueueSample(MAC, 0, 45, 17_000L);  // resume edge -> guard to 32 s
+        controller.onBqrSample(MAC, bqrFallbackBad(), 20_000L);  // suppressed
+        controller.onBqrSample(MAC, bqrFallbackBad(), 26_000L);  // suppressed
+        controller.onBqrSample(MAC, bqrFallbackBad(), 32_000L);  // +1 (guard ended 32 s)
+        controller.onBqrSample(MAC, bqrFallbackBad(), 38_000L);  // +2
+        assertEquals(900, controller.snapshot(MAC, 38_000L).ceilingKbps);
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 44_000L);  // +3
+        controller.onBqrSample(MAC, bqrFallbackBad(), 50_000L);  // +4 -> clamp
+        assertEquals(500, controller.snapshot(MAC, 50_000L).ceilingKbps);
+    }
+
+    @Test
+    public void suspectWindowDoesNotResetBadStreak() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L);  // +1
+        controller.onBqrSample(MAC, suspectBqr(), 22_000L);      // suspect: skip, keep streak
+        controller.onBqrSample(MAC, bqrFallbackBad(), 28_000L);  // +2
+        controller.onBqrSample(MAC, bqrFallbackBad(), 34_000L);  // +3
+        assertEquals(900, controller.snapshot(MAC, 34_000L).ceilingKbps);
+        assertTrue(recorder.skippedBqrWindows.contains("suspect_invalid"));
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 40_000L);  // +4 -> clamp
+        assertEquals(500, controller.snapshot(MAC, 40_000L).ceilingKbps);
+        assertTrue(recorder.fallbackEvents.contains("500:triggered:4:0"));
+    }
+
+    @Test
+    public void suspectCombinationIsLoggedEvenWhenPeerCeilingAtOrBelowCap() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 500, 200L, "codec_confirmed");
+        controller.onQueueSample(MAC, 5, 45, 9_500L);
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        controller.onBqrSample(MAC, suspectBqr(), 16_000L);
+        assertEquals(500, controller.snapshot(MAC, 16_000L).ceilingKbps);
+        assertTrue(recorder.skippedBqrWindows.contains("suspect_invalid"));
+    }
+
     private static long openHealthyProbe(LhdcLinkHealthController controller) {
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
         controller.onQueueSample(MAC, 0, 45, 10_100L);

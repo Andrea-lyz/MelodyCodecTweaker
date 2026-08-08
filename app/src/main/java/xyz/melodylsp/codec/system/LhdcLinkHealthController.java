@@ -555,10 +555,12 @@ final class LhdcLinkHealthController {
             }
 
             BoundaryState probe = inFlightBoundary(state);
-            updateBqrShadowCandidate(
-                    mac, state, sample, nowMs, streaming,
-                    probe == null && mac.equals(activeMac));
-            if (probe != null) {
+            if (legalWindow) {
+                updateBqrShadowCandidate(
+                        mac, state, sample, nowMs, streaming,
+                        probe == null && mac.equals(activeMac));
+            }
+            if (legalWindow && probe != null) {
                 boolean maintainable = streaming
                         && sample.unusedAfhChannels <= MAX_PROBE_UNUSED_AFH_CHANNELS
                         && state.retransmissionsPerSecond
@@ -949,9 +951,15 @@ final class LhdcLinkHealthController {
             return;
         }
         state.lastPublishedCeiling = ceiling;
-        // Phase N-2 POST_SWITCH_GUARD: a real Target_Cap change arms the switch-transient
-        // window in which the choppy soft signal is recorded but not integrated.
-        state.postSwitchGuardUntilMs = nowMs + POST_SWITCH_GUARD_MS;
+        // Phase N-2 POST_SWITCH_GUARD: a real Target_Cap decision arms the switch-transient
+        // window in which the choppy soft signal is recorded but not integrated. Pure status
+        // re-publishes (activation / stream rebuild / teardown) are not Target_Cap switches
+        // and are already covered by the longer START_GUARD (review P2-2).
+        if (!"device_active".equals(reason)
+                && !"stream_session".equals(reason)
+                && !"session_reset".equals(reason)) {
+            state.postSwitchGuardUntilMs = nowMs + POST_SWITCH_GUARD_MS;
+        }
         if (listener != null) listener.onProbeCeilingChanged(mac, ceiling, reason);
     }
 
@@ -997,16 +1005,12 @@ final class LhdcLinkHealthController {
             }
             return;
         }
-        if (state.peerCeilingKbps > 0 && state.peerCeilingKbps <= BQR_FALLBACK_CAP_KBPS) return;
-
-        boolean bad = retx >= BQR_FALLBACK_BAD_RETX_PER_SEC
-                && noRx >= BQR_FALLBACK_BAD_NO_RX_PER_SEC;
-        boolean healthy = retx < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
-                && noRx < BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC;
 
         // Phase N-2 BQR_SUSPECT_INVALID: high retx with ~zero noRx is physically
         // contradictory; with a low queue, no choppy and stream warm-up it is logged and
-        // never allowed to participate in decisions.
+        // never allowed to participate in decisions. Logged for every device (including
+        // peer-capped ones) because it is the calibration sample source for the Phase 3
+        // disaster threshold (review P2-4).
         if (retx >= BQR_SUSPECT_RETX_PER_SEC
                 && noRx < 1.0
                 && (state.currentQueueLength < 0
@@ -1018,7 +1022,14 @@ final class LhdcLinkHealthController {
             if (listener != null) {
                 listener.onBqrWindowSkipped(mac, "suspect_invalid", retx, noRx, nowMs);
             }
+            return;
         }
+        if (state.peerCeilingKbps > 0 && state.peerCeilingKbps <= BQR_FALLBACK_CAP_KBPS) return;
+
+        boolean bad = retx >= BQR_FALLBACK_BAD_RETX_PER_SEC
+                && noRx >= BQR_FALLBACK_BAD_NO_RX_PER_SEC;
+        boolean healthy = retx < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
+                && noRx < BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC;
 
         if (state.bqrFallbackCapKbps == 0) {
             if (bad) {

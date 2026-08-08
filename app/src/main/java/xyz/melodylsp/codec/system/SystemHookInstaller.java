@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -117,8 +118,12 @@ public final class SystemHookInstaller {
     private final Map<String, Long> lhdcDiagnosticReasonTimes = new HashMap<>();
     /** Per-MAC confirmed peer max-bitrate capability (900/1000 kbps), surviving process ordering. */
     private final Map<String, Integer> peerCeilingByMac = new HashMap<>();
-    /** Phase N-2: last accepted choppy report per MAC for the 1 s dedup window. */
-    private final Map<String, Long> lastRemoteChoppyEventMsByMac = new HashMap<>();
+    /**
+     * Phase N-2: last accepted choppy report per MAC for the 1 s dedup window. The choppy
+     * hook runs on binder threads, so the map must be safe for concurrent access
+     * (review P2-5).
+     */
+    private final Map<String, Long> lastRemoteChoppyEventMsByMac = new ConcurrentHashMap<>();
     private final AtomicLong remoteChoppySequence = new AtomicLong();
 
     public SystemHookInstaller(
