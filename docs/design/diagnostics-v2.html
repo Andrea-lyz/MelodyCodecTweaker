@@ -901,6 +901,7 @@
       unknown:   ['未知', 'var(--muted)', ''],
       locked:    ['已锁定', 'var(--red)', 'warn'],
       blocked:   ['等待低档恢复', 'var(--muted)', 'blocked'],
+      recovering: ['恢复中', 'var(--blue)', 'testing'],
       probing:   ['试探中', 'var(--blue)', 'testing'],
       verifying: ['验证中', 'var(--blue)', 'testing'],
       available: ['可尝试', 'var(--green)', ''],
@@ -914,6 +915,7 @@
       unknown: '状态未知',
       locked: '已锁定',
       blocked: '等待低档恢复',
+      recovering: '恢复中',
       probing: '试探中',
       verifying: '验证中',
       available: '可尝试',
@@ -967,8 +969,15 @@
         choppyCapability === 'OBSERVED' ? 'good' : 'idle');
       const bqrFallbackCapKbps = number(latest.bqrFallbackCapKbps, 0);
       if (bqrFallbackCapKbps > 0) {
+        // Phase N-4 tiered recovery (6.8.5): the evidence text follows the tier.
+        const tierText = bqrFallbackCapKbps <= 400
+          ? '连续 5 个健康窗口 + 30s 驻留'
+          : bqrFallbackCapKbps <= 500
+          ? '连续 6 个健康窗口 + 60s~5min 驻留（连续失败后递增）'
+          : '连续 8 个健康窗口 + 2min 驻留';
         byId('bqr-evidence').textContent =
-          '链路压力持续偏高，BQR 保护降档已生效，当前上限钳制在 ' + bqrFallbackCapKbps + ' kbps；需续 6 个健康窗口 + 60s~5min 驻留（连续失败后递增）后自动恢复。';
+          '链路压力持续偏高，BQR 保护降档已生效，当前上限钳制在 ' + bqrFallbackCapKbps
+          + ' kbps；需' + tierText + '后自动恢复。';
       } else if (retx > 60 || norx > 60 || unused > 49 || queueRatio >= 0.9) {
         byId('bqr-evidence').textContent =
           '链路压力较高，尚无保护降档证据；RF-only 不会触发强制降档。';
@@ -1015,7 +1024,9 @@
       } else if (upperLocked) {
         upperState = 'locked';
       } else if (bqrFallbackCapKbps > 0) {
-        upperState = 'blocked';
+        // Phase N-4: the 900 tier is itself recovering to 1000; only lower caps wait for
+        // the tier below to recover first.
+        upperState = bqrFallbackCapKbps >= 900 ? 'recovering' : 'blocked';
       } else if (lowerLocked || lowerTesting) {
         upperState = 'blocked';
       } else if (upperTesting) {
@@ -1025,8 +1036,11 @@
       } else {
         upperState = 'unknown';
       }
-      renderBoundary('boundary-500-900', (lowerLocked || bqrFallbackCapKbps > 0)
-        ? 'locked' : lowerTesting ? probeState : 'available');
+      // Phase N-4: a BQR fallback cap is a governor state, not a boundary lock — the
+      // 500->900 bar reflects only the learned boundary state, and the cap is already
+      // shown by the ceiling pill and the evidence text.
+      renderBoundary('boundary-500-900',
+        lowerLocked ? 'locked' : lowerTesting ? probeState : 'available');
       renderBoundary('boundary-900-1000', upperState);
     }
     renderReasons(data.reasonCounts || {}, data.reasonTimes || {});
