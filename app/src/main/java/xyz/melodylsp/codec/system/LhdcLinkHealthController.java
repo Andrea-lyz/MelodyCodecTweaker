@@ -1524,8 +1524,10 @@ final class LhdcLinkHealthController {
         if (state.bqrFallbackRecoveredMs != 0L) {
             if (nowMs - state.bqrFallbackRecoveredMs <= BQR_FALLBACK_SUCCESS_WINDOW_MS) {
                 // The previous 900 phase died shortly after a recovery: failed probe, escalate.
+                // Clamp to the shorter escalation table so both tiers stay in bounds.
                 state.bqrFallbackEscalationLevel = Math.min(
-                        BQR_FALLBACK_HOLD_MS.length - 1,
+                        Math.min(BQR_FALLBACK_HOLD_MS.length,
+                                BQR_FALLBACK_HOLD_MS_STRICT_ESCALATION.length) - 1,
                         state.bqrFallbackEscalationLevel + 1);
             } else {
                 // The previous 900 phase survived long enough: start over with the base hold.
