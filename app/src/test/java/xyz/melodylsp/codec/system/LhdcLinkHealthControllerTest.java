@@ -602,6 +602,77 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
+    public void strictTierKeepsStreakAcrossOneSidedHotWindows() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+        assertEquals(900, controller.snapshot(MAC, 10_000L).ceilingKbps);
+
+        // Decision 45 (feedback 011139): one-sided hot windows (retx>=30 alone with clean
+        // noRx) are neutral for the strict tier — they keep the streak without counting.
+        // The headset's 900-tier retx band (26-42) straddles the 30 gate while noRx stays
+        // clean, so the old reset-on-one-sided made 900->1000 unreachable.
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        controller.onBqrSample(MAC, strictOneSidedRetxBqr(), 26_000L);  // neutral
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 32_000L + i * 6_000L);  // 38..68
+        }
+        controller.onBqrSample(MAC, strictOneSidedRetxBqr(), 74_000L);  // neutral
+        for (int i = 1; i <= 3; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 80_000L + i * 6_000L);  // 86..98
+        }
+        // 9 counted windows (38..68 + 86..98); hold (10s trigger + 120s) not yet elapsed.
+        assertEquals(900, controller.snapshot(MAC, 98_000L).ceilingKbps);
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 104_000L + i * 6_000L);  // 110..134
+        }
+        // 134s window: hold elapsed and the streak survived the one-sided windows.
+        assertEquals(1000, controller.snapshot(MAC, 134_000L).ceilingKbps);
+        assertTrue(recorder.fallbackEvents.contains("0:recovered:0:14"));
+    }
+
+    @Test
+    public void strictTierEscalatesHoldAfterQuickReTrigger() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        // First trigger at 34s: 1000 -> 900, level 0 -> 120s strict hold.
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        for (int i = 1; i <= 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L + i * 6_000L);  // 16..34
+        }
+        assertEquals(900, controller.snapshot(MAC, 34_000L).ceilingKbps);
+        assertEquals("0:120000", recorder.fallbackDetails.get(recorder.fallbackDetails.size() - 1));
+
+        // Recover at 154s (120s hold from 34s; dead zone until 44s).
+        for (int i = 0; i <= 20; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 44_000L + i * 6_000L);  // 44..164
+        }
+        assertEquals(1000, controller.snapshot(MAC, 154_000L).ceilingKbps);
+
+        // Re-trigger at 188s, 34s after recovery -> escalation level 1 (240s strict hold).
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 170_000L + i * 6_000L);  // 170..188
+        }
+        assertEquals(900, controller.snapshot(MAC, 188_000L).ceilingKbps);
+        assertEquals("1:240000", recorder.fallbackDetails.get(recorder.fallbackDetails.size() - 1));
+
+        // 194s window is inside the 10s dead zone; recovery evidence starts at 200s.
+        controller.onBqrSample(MAC, midBandBqr(), 194_000L);  // dead zone skip
+        for (int i = 0; i <= 16; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 200_000L + i * 6_000L);  // 200..296
+        }
+        // 17 windows by 296s are not enough: the 240s hold blocks until 428s.
+        assertEquals(900, controller.snapshot(MAC, 296_000L).ceilingKbps);
+        for (int i = 17; i <= 39; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 200_000L + i * 6_000L);  // 302..434
+        }
+        assertEquals(1000, controller.snapshot(MAC, 434_000L).ceilingKbps);
+    }
+
+    @Test
     public void midTierCountsRelaxedNoRxButKeepsRetxAndOneSidedHotGates() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
@@ -1944,6 +2015,12 @@ public final class LhdcLinkHealthControllerTest {
     private static LhdcLinkHealthController.BqrSample oneSidedNoRxBqr() {
         return new LhdcLinkHealthController.BqrSample(
                 30, 0, 138, 156, 0, -45, 10, 0, 0);
+    }
+
+    /** 6 s window: retx 33.0/noRx 23.0 — one-sided hot retx: neutral for the strict tier. */
+    private static LhdcLinkHealthController.BqrSample strictOneSidedRetxBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, 198, 138, 0, -45, 10, 0, 0);
     }
 
     /** 6 s window: retx=32/noRx=10 — single-sided hot: not a bad window, not recovery. */

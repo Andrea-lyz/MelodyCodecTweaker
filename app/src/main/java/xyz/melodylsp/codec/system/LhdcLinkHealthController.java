@@ -126,7 +126,14 @@ final class LhdcLinkHealthController {
     // 500 -> 900 tier (which keeps the calibrated <24 retx with a relaxed <25 noRx,
     // decision 44, plus the escalating hold).
     static final int BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT = 8;
-    static final long BQR_FALLBACK_HOLD_MS_STRICT = 120_000L;
+    /**
+     * Strict-tier (900 -> 1000) escalating hold (decision 45, 2026-08-09): the base 120 s
+     * stay is unchanged, but a re-trigger within {@link #BQR_FALLBACK_SUCCESS_WINDOW_MS}
+     * escalates 120s -> 240s -> 300s. With the one-sided-neutral recovery evidence the
+     * strict tier upgrades more easily, so a marginal link must not cycle 900<->1000 at a
+     * constant period (feedback 011139).
+     */
+    static final long[] BQR_FALLBACK_HOLD_MS_STRICT_ESCALATION = {120_000L, 240_000L, 300_000L};
 
     // Phase N-3 leaky bucket (6.8.3/6.8.9): the deduped choppy soft signal integrates at
     // +10 per event with a linear -0.5/s decay; threshold 15 ≈ 2 events within ~8-10 s
@@ -1293,18 +1300,28 @@ final class LhdcLinkHealthController {
                 requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS;
                 holdMs = bqrFallbackHoldMs(state);
             } else {
-                // Strictest tier 900 -> 1000: 8 windows at non-bad evidence + 120 s hold
-                // (6.8.5). The strict <24/<21 evidence proved unreachable for X3's normal
-                // 24-35 band (feedback 231816: 10 minutes of 900-tier windows never reached
-                // 8 consecutive strict healthy windows); strictness lives in the long hold
-                // and window count, matching the leaky recovery evidence.
+                // Strictest tier 900 -> 1000: 8 windows at non-bad evidence + escalating
+                // hold 120s -> 240s -> 300s (decision 45). One-sided hot windows (only
+                // retx>=30 or only noRx>=25) are neutral for this tier: feedback 011139
+                // showed this headset's 900-tier retx band (26-42) straddles the 30 gate
+                // while noRx stays clean, so resetting on one-sided windows made
+                // 900->1000 unreachable even in a tolerable environment. Strictness now
+                // lives in the 8-window count, the escalating hold and the true-bad reset.
                 tierHealthy = retx < BQR_FALLBACK_BAD_RETX_PER_SEC
                         && noRx < BQR_FALLBACK_BAD_NO_RX_PER_SEC;
                 requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT;
-                holdMs = BQR_FALLBACK_HOLD_MS_STRICT;
+                holdMs = strictFallbackHoldMs(state);
             }
-            state.bqrFallbackHealthyWindows =
-                    tierHealthy ? state.bqrFallbackHealthyWindows + 1 : 0;
+            if (cap >= 900) {
+                // Decision 45: the bad branch above already reset the streak for true bad
+                // windows; a one-sided hot window keeps the streak without counting.
+                if (tierHealthy) {
+                    state.bqrFallbackHealthyWindows++;
+                }
+            } else {
+                state.bqrFallbackHealthyWindows =
+                        tierHealthy ? state.bqrFallbackHealthyWindows + 1 : 0;
+            }
             if (state.bqrFallbackHealthyWindows >= requiredWindows
                     && nowMs - state.bqrFallbackSinceMs >= holdMs) {
                 int windows = state.bqrFallbackHealthyWindows;
@@ -1328,7 +1345,7 @@ final class LhdcLinkHealthController {
                 state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
                 state.bqrFastFailQueueSinceMs = 0L;
                 publishCeiling(mac, state, "bqr_fallback_recovered", nowMs);
-                notifyBqrFallback(mac, state, "recovered", 0, windows);
+                notifyBqrFallback(mac, state, "recovered", 0, windows, holdMs);
             }
         }
         if (state.bqrFallbackStepBadWindows >= BQR_FALLBACK_REQUIRED_BAD_WINDOWS) {
@@ -1565,6 +1582,15 @@ final class LhdcLinkHealthController {
 
     private void notifyBqrFallback(
             String mac, DeviceState state, String reason, int badWindows, int healthyWindows) {
+        notifyBqrFallback(mac, state, reason, badWindows, healthyWindows,
+                state.bqrFallbackCapKbps >= 900
+                        ? strictFallbackHoldMs(state)
+                        : bqrFallbackHoldMs(state));
+    }
+
+    private void notifyBqrFallback(
+            String mac, DeviceState state, String reason, int badWindows, int healthyWindows,
+            long holdMs) {
         if (listener == null) return;
         listener.onBqrFallbackStateChanged(
                 mac,
@@ -1575,12 +1601,18 @@ final class LhdcLinkHealthController {
                 state.retransmissionsPerSecond,
                 state.noRxPerSecond,
                 state.bqrFallbackEscalationLevel,
-                bqrFallbackHoldMs(state));
+                holdMs);
     }
 
     private static long bqrFallbackHoldMs(DeviceState state) {
         return BQR_FALLBACK_HOLD_MS[Math.max(0,
                 Math.min(state.bqrFallbackEscalationLevel, BQR_FALLBACK_HOLD_MS.length - 1))];
+    }
+
+    private static long strictFallbackHoldMs(DeviceState state) {
+        return BQR_FALLBACK_HOLD_MS_STRICT_ESCALATION[Math.max(0,
+                Math.min(state.bqrFallbackEscalationLevel,
+                        BQR_FALLBACK_HOLD_MS_STRICT_ESCALATION.length - 1))];
     }
 
     /**
