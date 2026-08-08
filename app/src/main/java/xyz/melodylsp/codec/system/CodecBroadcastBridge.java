@@ -17,7 +17,7 @@ import xyz.melodylsp.codec.util.TrustedBroadcasts;
 public final class CodecBroadcastBridge {
 
     interface GovernorPolicyListener {
-        void onPolicyChanged(String mac, int policy, String reason);
+        void onPolicyChanged(String mac, int policy, String reason, int ceilingKbps);
     }
 
     private static final long[] GOVERNOR_INSTALL_RETRY_DELAYS_MS = {
@@ -122,18 +122,28 @@ public final class CodecBroadcastBridge {
                 int ceilingKbps = intent.getIntExtra(
                         CodecIpc.EXTRA_LHDC_POLICY_CEILING_KBPS, 0);
                 if (ceilingKbps > 0) {
+                    // Cache and apply the peer ceiling even when the governor is not installed
+                    // yet; the desired value is replayed after a later successful install.
                     NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
                 }
                 boolean applied = NativeLhdcMemoryPatch.setGovernorPolicy(policy);
                 if (applied) scheduleGovernorInstallRetries();
-                if (applied && governorPolicyListener != null) {
-                    governorPolicyListener.onPolicyChanged(mac, policy, reason);
+                boolean listenerSynced = false;
+                if (governorPolicyListener != null) {
+                    // The listener caches the capability per MAC regardless of this process's
+                    // install state, so an early broadcast survives a late governor install.
+                    governorPolicyListener.onPolicyChanged(mac, policy, reason, ceilingKbps);
+                    listenerSynced = true;
                 }
                 MLog.event("lhdc.governor.policy",
                         "applied", applied,
                         "policy", policy,
+                        "mode", NativeLhdcMemoryPatch.governorModeForDiagnostics(),
                         "reason", reason,
                         "ceilingKbps", ceilingKbps,
+                        "listenerSync", listenerSynced
+                                ? (ceilingKbps > 0 ? "ceiling_synced" : "policy_synced")
+                                : "none",
                         "mac", redactMac(mac));
             }
         } catch (Throwable t) {

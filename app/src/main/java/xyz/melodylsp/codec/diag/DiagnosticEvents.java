@@ -54,6 +54,8 @@ public final class DiagnosticEvents {
     private static final String KEY_MEMORY_SNAPSHOT_COUNT = "memory.snapshot.count";
     private static final String KEY_MEMORY_REPLAY_CHAIN = "memory.replay.chain";
     private static final String KEY_MEMORY_REPLAY_TIME = "memory.replay.time";
+    private static final java.util.regex.Pattern SESSION_ID_PATTERN =
+            java.util.regex.Pattern.compile("[0-9]{8}-[0-9]{6}");
     private static final String[] DIAGNOSTIC_SCOPES = {
             "com.oplus.melody",
             "com.android.bluetooth",
@@ -97,11 +99,22 @@ public final class DiagnosticEvents {
         }
     }
 
-    public static String startSession(Context context) {
+    /** Generates a candidate session id without committing it (root gate may still fail). */
+    public static String prepareSessionId() {
+        return new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT)
+                .format(new Date(System.currentTimeMillis()));
+    }
+
+    /**
+     * Commits a previously prepared session id as the active diagnostic session. Call this only
+     * after the mandatory root-backed capture has actually started; otherwise the session must
+     * stay uncommitted and the capture must be rolled back.
+     */
+    public static String commitSession(Context context, String id) {
         if (context == null) return "";
+        if (!isValidSessionId(id)) return "";
         long now = System.currentTimeMillis();
         long expires = now + RECORDING_DURATION_MS;
-        String id = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.ROOT).format(new Date(now));
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = sp.edit()
                 .putString(KEY_SESSION_ID, id)
@@ -128,6 +141,11 @@ public final class DiagnosticEvents {
                 "evt=diag.session.start id=" + id + " expires=" + expires, now);
         notifyRecordingState(context, expires);
         return id;
+    }
+
+    static boolean isValidSessionId(String sessionId) {
+        if (sessionId == null) return false;
+        return SESSION_ID_PATTERN.matcher(sessionId).matches();
     }
 
     public static boolean isRecording(Context context) {
@@ -166,7 +184,7 @@ public final class DiagnosticEvents {
                 "evt=diag.session.stop reason=" + safe(reason), now);
         diagnostics.edit().putLong(KEY_SESSION_ENDED, now).apply();
         notifyRecordingState(context, 0L);
-        setReceiverEnabled(context, false);
+        RootBluetoothLogCapture.stopAsync(context, "session_" + safe(reason));
     }
 
     public static void reconcileReceiverState(Context context) {
@@ -183,8 +201,36 @@ public final class DiagnosticEvents {
                     .putLong(KEY_SESSION_ENDED, System.currentTimeMillis())
                     .apply();
             notifyRecordingState(context, 0L);
+            RootBluetoothLogCapture.stopAsync(context, "expired");
         }
-        setReceiverEnabled(context, active);
+        // The receiver is intentionally resident: outside a session it mirrors only the
+        // remember-card events and drops everything else. Older builds permanently disabled the
+        // component via setComponentEnabledSetting, which survives APK updates, so always
+        // re-enable here instead of only enabling during a recording session.
+        setReceiverEnabled(context, true);
+    }
+
+    /**
+     * True when the message carries a remember-card mirror snapshot (begin/item/end). These
+     * events are intentionally recorded outside a diagnostic session so the diagnostic page's
+     * memory card always refreshes; they are low-frequency state snapshots, not telemetry.
+     */
+    static boolean isMemoryMirrorEvent(String message) {
+        if (message == null) return false;
+        return message.contains("evt=remember.snapshot.");
+    }
+
+    /**
+     * Applies a remember-card mirror snapshot without touching the recording event ring. Used
+     * by the receiver when no diagnostic session is active.
+     */
+    static void recordMemoryMirror(Context context, String message, long time) {
+        if (context == null || message == null || message.isEmpty()) return;
+        message = limit(message, MAX_MESSAGE_CHARS);
+        SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = sp.edit();
+        mirrorMemory(sp, editor, message, time);
+        editor.apply();
     }
 
     private static void notifyRecordingState(Context context, long until) {
@@ -235,6 +281,15 @@ public final class DiagnosticEvents {
                 || time > now + MAX_EVENT_TIME_SKEW_MS) {
             time = now;
         }
+        record(context, scope, priority, message, time);
+    }
+
+    static void recordLocal(
+            Context context,
+            String scope,
+            int priority,
+            String message,
+            long time) {
         record(context, scope, priority, message, time);
     }
 
@@ -436,13 +491,41 @@ public final class DiagnosticEvents {
                 || message.contains("evt=native.patch.state.recv")) {
             mark(editor, "native.patch", stateFromMessage(message), message, time);
         }
+        if (message.contains("evt=diag.root_capture")) {
+            String captureStatus = message.contains("status=started")
+                    ? "active"
+                    : message.contains("status=failed")
+                    || message.contains("status=missing")
+                    || message.contains("status=unavailable")
+                    ? "attention"
+                    : "ready";
+            mark(editor, "diag.root.capture", captureStatus, message, time);
+        }
         if (message.contains("evt=lhdc.link.bqr_hooks")) {
             mark(editor, "lhdc.link.bqr",
                     message.contains("count=0") ? "attention" : "hooked", message, time);
         }
+        if (message.contains("evt=lhdc.link.stage_d")) {
+            mark(editor, "lhdc.link.shadow", "armed", message, time);
+        }
         if (message.contains("evt=lhdc.link.bqr_summary")) {
             mark(editor, "lhdc.link.bqr", "active", message, time);
             mark(editor, "lhdc.link.governor", "active", message, time);
+        }
+        if (message.contains("evt=lhdc.governor.choppy_hooks")) {
+            mark(editor, "lhdc.link.choppy",
+                    message.contains("count=0") ? "attention" : "hooked", message, time);
+        }
+        if (message.contains("evt=lhdc.governor.queue_hooks")) {
+            mark(editor, "lhdc.link.queue",
+                    message.contains("count=0") ? "attention" : "hooked", message, time);
+        }
+        if (message.contains("evt=lhdc.link.remote_choppy")) {
+            mark(editor, "lhdc.link.choppy", "active", message, time);
+        }
+        if (message.contains("evt=lhdc.link.bqr_shadow_candidate")) {
+            mark(editor, "lhdc.link.bqr", "active", message, time);
+            mark(editor, "lhdc.link.shadow", "would_protect", message, time);
         }
         if (message.contains("evt=lhdc.link.probe_ceiling")
                 || message.contains("evt=lhdc.link.governor_event")) {

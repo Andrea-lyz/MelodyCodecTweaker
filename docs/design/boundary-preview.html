@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>边界状态条 · 样式预览</title>
+<style>
+    :root {
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --line: #e5eaf2;
+      --text: #151b26;
+      --subtext: #687385;
+      --muted: #8b96aa;
+      --blue: #0a84ff;
+      --green: #1f9d63;
+      --orange: #d9822b;
+      --red: #d64545;
+      --red-soft: #fbe3e3;
+      --shadow: 0 1px 2px rgba(20,27,38,.04), 0 8px 24px rgba(20,27,38,.05);
+      --radius: 18px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1218; --card: #161a23; --line: #232a36;
+        --text: #e7eaf0; --subtext: #a4adbd; --muted: #6b7589;
+        --red-soft: #2c1717;
+        --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { background: var(--bg); }
+    body {
+      margin: 0; color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      padding: 24px 16px;
+    }
+    .card {
+      max-width: 560px; margin: 0 auto; background: var(--card);
+      border: 1px solid var(--line); border-radius: var(--radius);
+      box-shadow: var(--shadow); padding: 16px 18px;
+    }
+    .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+    h3 { margin: 0; font-size: 15px; }
+    .pill {
+      display: inline-block; padding: 2px 9px; border-radius: 999px;
+      font-size: 12px; font-weight: 600;
+    }
+    .pill.info { color: var(--blue); background: color-mix(in srgb, var(--blue) 12%, transparent); }
+
+    /* ── 与 diagnostics-v2.html 一致的环境条样式 ── */
+    .env-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; align-items: center; padding: 8px 0; }
+    .env-row .name { color: var(--subtext); font-size: 13px; }
+    .env-row .bar-wrap {
+      position: relative; height: 20px; display: flex; align-items: center;
+    }
+    .env-row .bar {
+      height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; flex: 1;
+    }
+    .env-row .bar > i {
+      display: block; height: 100%;
+      background: linear-gradient(90deg, var(--green), var(--blue));
+    }
+    .env-row .bar > i.warn { background: linear-gradient(90deg, var(--orange), var(--red)); }
+    .env-row .bar > i.blocked { background: var(--muted); opacity: .45; }
+    .env-row .bar > i.testing { background: linear-gradient(90deg, var(--blue), #72b7ff); }
+    .env-row .bar > i.unsupported {
+      background: var(--muted); opacity: .55;
+    }
+    .env-row .val { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--subtext); }
+    .env-row .lock-icon {
+      position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      width: 20px; height: 20px; pointer-events: none; z-index: 2;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted);
+    }
+    .env-row .lock-icon svg { width: 16px; height: 16px; }
+
+    .note { margin-top: 16px; font-size: 12px; color: var(--muted); line-height: 1.6; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="section-head">
+      <h3>边界状态</h3>
+      <span class="pill info">当前上限 900 kbps · 能力受限</span>
+    </div>
+
+    <div class="env-row">
+      <div class="name">500 → 900</div>
+      <div class="bar-wrap"><div class="bar"><i class="" style="width:100%"></i></div></div>
+      <span class="val" style="color: var(--green)">可尝试</span>
+    </div>
+    <div class="env-row">
+      <div class="name">900 → 1000</div>
+      <div class="bar-wrap">
+        <div class="bar"><i class="unsupported" style="width:100%"></i></div>
+        <span class="lock-icon">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>
+        </span>
+      </div>
+      <span class="val" style="color: var(--muted)">不支持</span>
+    </div>
+
+    <hr style="border:none;border-top:1px solid var(--line);margin:14px 0">
+    <div style="font-size:12px;color:var(--subtext);margin-bottom:6px">其他状态样式参考：</div>
+
+    <div class="env-row">
+      <div class="name">500 → 900</div>
+      <div class="bar-wrap"><div class="bar"><i class="warn" style="width:100%"></i></div></div>
+      <span class="val" style="color: var(--red)">已锁定</span>
+    </div>
+    <div class="env-row">
+      <div class="name">900 → 1000</div>
+      <div class="bar-wrap"><div class="bar"><i class="blocked" style="width:100%"></i></div></div>
+      <span class="val" style="color: var(--muted)">等待低档恢复</span>
+    </div>
+    <div class="env-row">
+      <div class="name">900 → 1000</div>
+      <div class="bar-wrap"><div class="bar"><i class="testing" style="width:100%"></i></div></div>
+      <span class="val" style="color: var(--blue)">试探中</span>
+    </div>
+    <div class="env-row">
+      <div class="name">900 → 1000</div>
+      <div class="bar-wrap"><div class="bar"><i class="" style="width:100%"></i></div></div>
+      <span class="val" style="color: var(--green)">可尝试</span>
+    </div>
+    <div class="env-row">
+      <div class="name">900 → 1000</div>
+      <div class="bar-wrap"><div class="bar"><i class="" style="width:0%"></i></div></div>
+      <span class="val" style="color: var(--muted)">未知</span>
+    </div>
+
+    <p class="note">预览页：锁图标为扁平实心灰色锁（与状态条同色系），居中放在“不支持”条正中间，与 diagnostics-v2.html 中 unsupported 状态一致。</p>
+  </div>
+</body>
+</html>

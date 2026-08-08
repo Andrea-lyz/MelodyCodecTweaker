@@ -22,10 +22,13 @@ public final class DiagnosticEventReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context context, Intent intent) {
         if (intent == null || !DiagnosticEvents.ACTION.equals(intent.getAction())) return;
-        if (!DiagnosticEvents.isRecording(context)) {
-            DiagnosticEvents.setReceiverEnabled(context, false);
-            return;
-        }
+        String message = intent.getStringExtra(DiagnosticEvents.EXTRA_MESSAGE);
+        boolean memoryMirror = DiagnosticEvents.isMemoryMirrorEvent(message);
+        // Memory-mirror events are exempt from the recording gate: the diagnostic page must be
+        // able to refresh the remember card anytime. Other events are only recorded while a
+        // session is active, so the receiver stays resident and ignores telemetry outside
+        // recording instead of disabling itself.
+        if (!DiagnosticEvents.isRecording(context) && !memoryMirror) return;
         TrustedBroadcasts.SenderIdentity sender = TrustedBroadcasts.captureSender(this);
         String scope;
         int rateLimitUid;
@@ -47,6 +50,15 @@ public final class DiagnosticEventReceiver extends BroadcastReceiver {
             // the supplied scope label and place all legacy traffic in one conservative bucket.
             scope = "legacy_trusted";
             rateLimitUid = -1;
+        }
+        if (!DiagnosticEvents.isRecording(context)) {
+            // Outside a session, mirror only the remember card state; do not touch telemetry.
+            DiagnosticEvents.recordMemoryMirror(
+                    context,
+                    message,
+                    intent.getLongExtra(
+                            DiagnosticEvents.EXTRA_TIME, System.currentTimeMillis()));
+            return;
         }
         if (!allowEvent(rateLimitUid, SystemClock.elapsedRealtime())) return;
         DiagnosticEvents.record(context, intent, scope);

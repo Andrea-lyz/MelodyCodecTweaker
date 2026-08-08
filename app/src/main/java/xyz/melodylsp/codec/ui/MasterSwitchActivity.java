@@ -36,6 +36,7 @@ import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.diag.FeedbackCollector;
+import xyz.melodylsp.codec.diag.RootBluetoothLogCapture;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /** Hosts the diagnostics-v2 HTML design and supplies its read-only foreground snapshot bridge. */
@@ -66,6 +67,11 @@ public final class MasterSwitchActivity extends Activity {
             {"无线设置作用域", "scope.wirelesssettings"},
             {"LE Audio 无线设置桥", "bridge.le.ws"},
             {"Native 内存补丁", "native.patch"},
+            {"root 蓝牙持续日志", "diag.root.capture"},
+            {"LHDC BQR Hook", "lhdc.link.bqr"},
+            {"LHDC choppy Hook", "lhdc.link.choppy"},
+            {"LHDC queue Hook", "lhdc.link.queue"},
+            {"BQR 影子保护", "lhdc.link.shadow"},
             {"最近写入", "codec.write"},
             {"记忆写入", "remember.write"},
             {"重连重放", "remember.replay"},
@@ -412,22 +418,51 @@ public final class MasterSwitchActivity extends Activity {
     }
 
     private void startRecordSession() {
+        if (feedbackBusy) return;
+        feedbackBusy = true;
+        pushSnapshotToPage();
         Toast.makeText(this, "正在检测 root 权限...", Toast.LENGTH_SHORT).show();
         new Thread(() -> {
+            Context appContext = getApplicationContext();
             boolean rootGranted;
             try {
                 rootGranted = FeedbackCollector.hasRootAccess();
             } catch (Throwable t) {
                 rootGranted = false;
             }
-            boolean finalRootGranted = rootGranted;
+            if (!rootGranted) {
+                runOnUiThread(() -> {
+                    feedbackBusy = false;
+                    Toast.makeText(MasterSwitchActivity.this,
+                            "记录问题需要授予模块 root 权限，请在 Root 管理器授权后重试",
+                            Toast.LENGTH_LONG).show();
+                    pushSnapshotToPage();
+                });
+                return;
+            }
+            // prepare -> startRootCapture -> commit: an uncommitted session must never look
+            // packageable, and a failed capture must not leave a half-open session behind.
+            String id = DiagnosticEvents.prepareSessionId();
+            RootBluetoothLogCapture.StartResult captureResult =
+                    RootBluetoothLogCapture.start(appContext, id);
+            if (captureResult == null || !captureResult.started) {
+                RootBluetoothLogCapture.retireSession(appContext, id, "capture_failed");
+                runOnUiThread(() -> {
+                    feedbackBusy = false;
+                    Toast.makeText(MasterSwitchActivity.this,
+                            "root 蓝牙日志启动失败，未开始记录："
+                                    + (captureResult == null ? "未知错误" : captureResult.detail),
+                            Toast.LENGTH_LONG).show();
+                    pushSnapshotToPage();
+                });
+                return;
+            }
+            DiagnosticEvents.commitSession(appContext, id);
             runOnUiThread(() -> {
-                String id = DiagnosticEvents.startSession(this);
+                feedbackBusy = false;
                 scheduleRecordingControlRetries();
-                Toast.makeText(this,
-                        finalRootGranted
-                                ? "已开始记录：" + id
-                                : "没有 root 权限，反馈包将缺少蓝牙日志",
+                Toast.makeText(MasterSwitchActivity.this,
+                        "已开始记录：" + id + "（root 蓝牙日志持续采集中）",
                         Toast.LENGTH_SHORT).show();
                 pushSnapshotToPage();
             });

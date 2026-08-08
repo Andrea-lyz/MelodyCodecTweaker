@@ -3,6 +3,8 @@ package xyz.melodylsp.codec.system;
 import java.util.HashMap;
 import java.util.Map;
 
+import xyz.melodylsp.codec.BuildConfig;
+
 /**
  * Learns whether each headset can sustain the next LHDC quality rung.
  *
@@ -15,12 +17,20 @@ final class LhdcLinkHealthController {
     static final int EVENT_QUICK_FAILURE = 1;
     static final int EVENT_UPGRADE_STABLE = 2;
     static final int EVENT_UPGRADE_APPLIED = 3;
+    /** Native getter confirmed the peer cannot sustain the requested rung (e.g. actual 900 for target 1000). */
+    static final int EVENT_PEER_CEILING_DETECTED = 4;
+    /** Native set_rate actually wrote a new target (transition evidence for diagnostics). */
+    static final int EVENT_TRANSITION_APPLIED = 5;
 
     static final long QUICK_FAILURE_HISTORY_MS = 5 * 60_000L;
     static final int[] REQUIRED_HEALTHY_WINDOWS = {3, 4, 5};
     static final long[] REQUIRED_QUIET_MS = {15_000L, 30_000L, 45_000L};
     static final long MIN_BQR_INTERVAL_MS = 3_000L;
     static final long MAX_BQR_INTERVAL_MS = 15_000L;
+    static final int REQUIRED_SHADOW_UNSTABLE_WINDOWS = 2;
+    static final long SHADOW_CANDIDATE_COOLDOWN_MS = 15_000L;
+    static final String CHOPPY_CAPABILITY_UNKNOWN = "UNKNOWN";
+    static final String CHOPPY_CAPABILITY_OBSERVED = "OBSERVED";
 
     // A recovery probe is admitted conservatively, then maintained with wider limits. This
     // hysteresis prevents one borderline six-second BQR window from bouncing 900 -> 500.
@@ -42,10 +52,66 @@ final class LhdcLinkHealthController {
     static final long CRITICAL_QUEUE_HOLD_MS = 300L;
     static final long EVIDENCE_TIER_DECAY_MS = 10 * 60_000L;
 
+    // Experimental BQR fallback downgrade (validation build, Issue-8 Buds Ace 3): the headset
+    // never reports remote choppy, so sustained BQR retransmission/noRx pressure becomes the
+    // only usable strong signal for 900 -> 500. Calibrated from 20260806-221217/222058:
+    // audible-bad windows had retx 27-43/s and noRx 26-36/s; X3 healthy sessions stayed
+    // retx < 25 and noRx < 22. The cap is temporary: healthy windows plus a minimum hold
+    // restore the peer ceiling.
+    static final int BQR_FALLBACK_CAP_KBPS = 500;
+    static final double BQR_FALLBACK_BAD_RETX_PER_SEC = 30.0;
+    static final double BQR_FALLBACK_BAD_NO_RX_PER_SEC = 25.0;
+    static final int BQR_FALLBACK_REQUIRED_BAD_WINDOWS = 4;
+    static final double BQR_FALLBACK_HEALTHY_RETX_PER_SEC = 24.0;
+    static final double BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC = 21.0;
+    static final int BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS = 6;
+    /**
+     * Escalating recovery hold (2026-08-07): a re-trigger shortly after a recovery escalates the
+     * next hold 60s -> 2min -> 5min (capped). A 900 phase that survives
+     * {@link #BQR_FALLBACK_SUCCESS_WINDOW_MS} resets the escalation. Mirrors TCP RTO backoff,
+     * AARF doubled success counts, and the LDAC ABR nPenalty observing-count penalty.
+     */
+    static final long[] BQR_FALLBACK_HOLD_MS = {60_000L, 120_000L, 300_000L};
+    static final long BQR_FALLBACK_SUCCESS_WINDOW_MS = 2 * 60_000L;
+    /**
+     * Queue fast-fail (2026-08-07, probe window only). Calibrated from X3 healthy sessions
+     * (sampled queue p99 <= 36, max 40) versus Buds Ace 3 bad 900 phases (queue pegged at 45
+     * within ~1.5s of a restore). Active only for the first 30s after an upgrade/recovery/codec
+     * write; a sustained high-water queue there means the air cannot drain the rate, so clamp
+     * immediately instead of waiting four bad BQR windows (~24s).
+     */
+    static final int BQR_FAST_FAIL_QUEUE_THRESHOLD = 40;
+    static final long BQR_FAST_FAIL_HOLD_MS = 3_000L;
+    static final long BQR_FAST_FAIL_PROBE_WINDOW_MS = 30_000L;
+
     interface Listener {
         void onProbeCeilingChanged(String mac, int ceilingKbps, String reason);
 
         default void onProbeStateChanged(String mac, int ceilingKbps, String reason) {
+        }
+
+        /** Stage-D evidence only. Implementations must not change the native or Java ceiling. */
+        default void onBqrShadowCandidate(
+                String mac,
+                int fromKbps,
+                int candidateKbps,
+                long overflowCount,
+                long underflowCount,
+                int candidateCount,
+                long streamSessionId) {
+        }
+
+        /** Experimental BQR fallback state change; implementations only log, never re-enter. */
+        default void onBqrFallbackStateChanged(
+                String mac,
+                int capKbps,
+                String reason,
+                int badWindows,
+                int healthyWindows,
+                double retransmissionsPerSecond,
+                double noRxPerSecond,
+                int escalationLevel,
+                long holdMs) {
         }
     }
 
@@ -103,6 +169,25 @@ final class LhdcLinkHealthController {
         final long nativeBackoffRemainingMs;
         final String blockedReason;
         final long streamSessionId;
+        /** 0 = unknown, 500/900/1000 = stack-confirmed peer max bitrate capability. */
+        final int peerCeilingKbps;
+        /** Only meaningful when {@link #peerCeilingKbps} is known; never claims support for unknown. */
+        final boolean boundary900To1000Supported;
+        /** Age of the most recent BQR sample; -1 when no BQR has arrived yet. */
+        final long lastBqrAgoMs;
+        final int lastRemoteChoppyLevel;
+        final long lastRemoteChoppyAgoMs;
+        final int remoteChoppyCount5s;
+        final String choppyCapabilityState;
+        final long lastBqrOverflowCount;
+        final long lastBqrUnderflowCount;
+        final int shadowUnstableWindows;
+        final int shadowCandidateCount;
+        final int lastShadowCandidateKbps;
+        final long lastShadowCandidateAgoMs;
+        final long shadowStreamSessionId;
+        /** BQR fallback cap in kbps; 0 when inactive. */
+        final int bqrFallbackCapKbps;
 
         Snapshot(
                 int ceilingKbps,
@@ -124,7 +209,22 @@ final class LhdcLinkHealthController {
                 long recoveryWaitRemainingMs,
                 long nativeBackoffRemainingMs,
                 String blockedReason,
-                long streamSessionId) {
+                long streamSessionId,
+                int peerCeilingKbps,
+                boolean boundary900To1000Supported,
+                long lastBqrAgoMs,
+                int lastRemoteChoppyLevel,
+                long lastRemoteChoppyAgoMs,
+                int remoteChoppyCount5s,
+                String choppyCapabilityState,
+                long lastBqrOverflowCount,
+                long lastBqrUnderflowCount,
+                int shadowUnstableWindows,
+                int shadowCandidateCount,
+                int lastShadowCandidateKbps,
+                long lastShadowCandidateAgoMs,
+                long shadowStreamSessionId,
+                int bqrFallbackCapKbps) {
             this.ceilingKbps = ceilingKbps;
             this.healthyBqrWindows = healthyBqrWindows;
             this.usableAfhChannels = usableAfhChannels;
@@ -145,6 +245,21 @@ final class LhdcLinkHealthController {
             this.nativeBackoffRemainingMs = nativeBackoffRemainingMs;
             this.blockedReason = blockedReason;
             this.streamSessionId = streamSessionId;
+            this.peerCeilingKbps = peerCeilingKbps;
+            this.boundary900To1000Supported = boundary900To1000Supported;
+            this.lastBqrAgoMs = lastBqrAgoMs;
+            this.lastRemoteChoppyLevel = lastRemoteChoppyLevel;
+            this.lastRemoteChoppyAgoMs = lastRemoteChoppyAgoMs;
+            this.remoteChoppyCount5s = remoteChoppyCount5s;
+            this.choppyCapabilityState = choppyCapabilityState;
+            this.lastBqrOverflowCount = lastBqrOverflowCount;
+            this.lastBqrUnderflowCount = lastBqrUnderflowCount;
+            this.shadowUnstableWindows = shadowUnstableWindows;
+            this.shadowCandidateCount = shadowCandidateCount;
+            this.lastShadowCandidateKbps = lastShadowCandidateKbps;
+            this.lastShadowCandidateAgoMs = lastShadowCandidateAgoMs;
+            this.shadowStreamSessionId = shadowStreamSessionId;
+            this.bqrFallbackCapKbps = bqrFallbackCapKbps;
         }
     }
 
@@ -176,6 +291,14 @@ final class LhdcLinkHealthController {
         int usableAfhChannels;
         double retransmissionsPerSecond = Double.NaN;
         double noRxPerSecond = Double.NaN;
+        int bqrFallbackCapKbps;
+        int bqrFallbackBadWindows;
+        int bqrFallbackHealthyWindows;
+        long bqrFallbackSinceMs;
+        int bqrFallbackEscalationLevel;
+        long bqrFallbackRecoveredMs;
+        long bqrFastFailUntilMs;
+        long bqrFastFailQueueSinceMs;
         long lastCongestionMs;
         long lowQueueSinceMs;
         long criticalQueueSinceMs;
@@ -187,6 +310,18 @@ final class LhdcLinkHealthController {
         long healthyDecaySinceMs;
         boolean streaming;
         long streamSessionId;
+        int lastRemoteChoppyLevel;
+        long lastRemoteChoppyMs;
+        long remoteChoppyWindowStartMs;
+        int remoteChoppyCount;
+        long lastBqrOverflowCount;
+        long lastBqrUnderflowCount;
+        int shadowUnstableWindows;
+        long lastShadowUnstableWindowMs;
+        long lastShadowCandidateMs;
+        int shadowCandidateCount;
+        int lastShadowCandidateKbps;
+        long shadowStreamSessionId;
         /**
          * Peer max-bitrate ceiling in kbps reported by the stack-confirmed codec config
          * (0 = unknown, treated as 1000). A value of 900 or lower permanently blocks the
@@ -196,6 +331,8 @@ final class LhdcLinkHealthController {
     }
 
     private final Map<String, DeviceState> devices = new HashMap<>();
+    /** Positive reports observed per MAC for the lifetime of this Bluetooth process. */
+    private final Map<String, Boolean> choppyCapabilityObservedByMac = new HashMap<>();
     private final Listener listener;
     private String activeMac;
 
@@ -209,7 +346,10 @@ final class LhdcLinkHealthController {
         if (mac.equals(activeMac)) return;
         if (activeMac != null) {
             DeviceState previous = devices.get(activeMac);
-            if (previous != null) cancelRecoveryProbe(previous, nowMs, true);
+            if (previous != null) {
+                cancelRecoveryProbe(previous, nowMs, true);
+                clearShadowWindow(previous);
+            }
         }
         activeMac = mac;
         DeviceState state = stateFor(mac);
@@ -231,6 +371,12 @@ final class LhdcLinkHealthController {
         if (mac.equals(activeMac)) {
             state.lastPublishedCeiling = -1;
             publishCeiling(mac, state, "stream_session");
+            if (effectiveCeiling(state) >= 900) {
+                // A fresh stream at a fixed high tier is a new 900+ attempt: arm the queue
+                // fast-fail probe window so an unsustainable rate is caught within seconds.
+                state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
+                state.bqrFastFailQueueSinceMs = 0L;
+            }
         }
     }
 
@@ -248,14 +394,32 @@ final class LhdcLinkHealthController {
         if (mac == null || mac.isEmpty() || ceilingKbps <= 0) return;
         DeviceState state = stateFor(mac);
         state.peerCeilingKbps = ceilingKbps;
-        if (ceilingKbps <= 900 && state.to1000.probeInFlight) {
-            state.to1000.probeInFlight = false;
-            state.to1000.upgradeApplied = false;
-            state.to1000.lastProbeClosedMs = nowMs;
-            state.probeStableBqrWindows = 0;
-            state.probeBadBqrWindows = 0;
+        if (ceilingKbps >= 900 && "codec_confirmed".equals(reason)) {
+            // A stack-confirmed fixed-quality config is an explicit 900+ attempt (the user picked
+            // 音质优先, or the remembered config was replayed). Grant it even when a BQR fallback
+            // cap is active, reset the escalation bookkeeping, and arm the fast-fail window so an
+            // unsustainable rate is clamped within seconds instead of staying capped.
+            state.bqrFallbackCapKbps = 0;
+            state.bqrFallbackBadWindows = 0;
+            state.bqrFallbackHealthyWindows = 0;
+            state.bqrFallbackSinceMs = 0L;
+            state.bqrFallbackEscalationLevel = 0;
+            state.bqrFallbackRecoveredMs = 0L;
+            state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
+            state.bqrFastFailQueueSinceMs = 0L;
         }
-        state.to1000.locked = false;
+        if (ceilingKbps <= 900) {
+            if (state.to1000.probeInFlight) {
+                state.to1000.probeInFlight = false;
+                state.to1000.upgradeApplied = false;
+                state.to1000.lastProbeClosedMs = nowMs;
+                state.probeStableBqrWindows = 0;
+                state.probeBadBqrWindows = 0;
+            }
+            // A hard peer capability replaces the learned 900->1000 lock semantics. A repeated
+            // 1000-capable codec snapshot, however, must not erase a real link-quality lock.
+            state.to1000.locked = false;
+        }
         if (mac.equals(activeMac)) {
             state.lastPublishedCeiling = -1;
             publishCeiling(mac, state,
@@ -299,6 +463,8 @@ final class LhdcLinkHealthController {
         long intervalMs = state.lastBqrMs == 0L ? 0L : nowMs - state.lastBqrMs;
         state.lastBqrMs = nowMs;
         state.usableAfhChannels = Math.max(0, 79 - sample.unusedAfhChannels);
+        state.lastBqrOverflowCount = sample.overflowCount;
+        state.lastBqrUnderflowCount = sample.underflowCount;
 
         boolean validInterval = intervalMs >= MIN_BQR_INTERVAL_MS
                 && intervalMs <= MAX_BQR_INTERVAL_MS;
@@ -313,8 +479,14 @@ final class LhdcLinkHealthController {
                     && state.retransmissionsPerSecond <= MAX_RETRANSMISSIONS_PER_SECOND
                     && state.noRxPerSecond <= MAX_NO_RX_PER_SECOND;
             state.healthyBqrWindows = strictlyHealthy ? state.healthyBqrWindows + 1 : 0;
+            if (BuildConfig.LHDC_BQR_FALLBACK) {
+                evaluateBqrFallback(mac, state, nowMs, streaming);
+            }
 
             BoundaryState probe = inFlightBoundary(state);
+            updateBqrShadowCandidate(
+                    mac, state, sample, nowMs, streaming,
+                    probe == null && mac.equals(activeMac));
             if (probe != null) {
                 boolean maintainable = streaming
                         && sample.unusedAfhChannels <= MAX_PROBE_UNUSED_AFH_CHANNELS
@@ -352,6 +524,7 @@ final class LhdcLinkHealthController {
             state.noRxPerSecond = Double.NaN;
             state.healthyBqrWindows = 0;
             state.healthyDecaySinceMs = 0L;
+            clearShadowWindow(state);
         }
 
         if (!streaming) {
@@ -398,6 +571,9 @@ final class LhdcLinkHealthController {
         } else {
             maybeCancelDegradedProbe(mac, state, nowMs);
         }
+        if (BuildConfig.LHDC_BQR_FALLBACK) {
+            evaluateBqrQueueFastFail(mac, state, length, nowMs);
+        }
         if (mac.equals(activeMac)) maybeOpenRecoveryProbe(mac, state, nowMs);
     }
 
@@ -408,6 +584,26 @@ final class LhdcLinkHealthController {
         if (cancelRecoveryProbe(state, nowMs, false)) {
             publishCeiling(mac, state, "probe_choppy");
         }
+    }
+
+    /**
+     * Records every positive headset-side choppy report with a rolling 5-second counter so the
+     * diagnostic page can distinguish "reports arrived" from "a downgrade was actually issued"
+     * (the latter still surfaces through {@link #onCongestion} and native governor events).
+     */
+    synchronized void onRemoteChoppyReport(String mac, int level, long nowMs) {
+        if (mac == null || level <= 0) return;
+        choppyCapabilityObservedByMac.put(mac, Boolean.TRUE);
+        DeviceState state = stateFor(mac);
+        state.lastRemoteChoppyLevel = level;
+        state.lastRemoteChoppyMs = nowMs;
+        if (state.remoteChoppyWindowStartMs == 0L
+                || nowMs - state.remoteChoppyWindowStartMs > 5_000L) {
+            state.remoteChoppyWindowStartMs = nowMs;
+            state.remoteChoppyCount = 0;
+        }
+        state.remoteChoppyCount++;
+        onCongestion(mac, nowMs);
     }
 
     synchronized void onGovernorEvent(
@@ -462,10 +658,14 @@ final class LhdcLinkHealthController {
 
     synchronized Snapshot snapshot(String mac, long nowMs) {
         DeviceState state = devices.get(mac);
+        String choppyCapabilityState = Boolean.TRUE.equals(choppyCapabilityObservedByMac.get(mac))
+                ? CHOPPY_CAPABILITY_OBSERVED : CHOPPY_CAPABILITY_UNKNOWN;
         if (state == null) {
             return new Snapshot(1000, 0, 0, Double.NaN, Double.NaN,
                     false, false, 0, 0L, -1, 0, 0L, -1L,
-                    "stable", 0L, 0, 0L, 0L, "none", 0L);
+                    "stable", 0L, 0, 0L, 0L, "none", 0L,
+                    0, false, -1L, 0, -1L, 0,
+                    choppyCapabilityState, 0L, 0L, 0, 0, 0, -1L, 0L, 0);
         }
         BoundaryState probe = inFlightBoundary(state);
         BoundaryState blocked = probe != null ? probe : firstBlockedBoundary(state);
@@ -477,6 +677,15 @@ final class LhdcLinkHealthController {
                 ? 0L : Math.max(0L, nowMs - probe.probeOpenedMs);
         long nativeBackoffRemainingMs = blocked == null
                 ? 0L : remaining(blocked.nativeBackoffUntilMs, nowMs);
+        long lastBqrAgoMs = state.lastBqrMs == 0L
+                ? -1L : Math.max(0L, nowMs - state.lastBqrMs);
+        long lastRemoteChoppyAgoMs = state.lastRemoteChoppyMs == 0L
+                ? -1L : Math.max(0L, nowMs - state.lastRemoteChoppyMs);
+        int remoteChoppyCount5s = state.remoteChoppyWindowStartMs != 0L
+                && nowMs - state.remoteChoppyWindowStartMs <= 5_000L
+                ? state.remoteChoppyCount : 0;
+        long lastShadowCandidateAgoMs = state.lastShadowCandidateMs == 0L
+                ? -1L : Math.max(0L, nowMs - state.lastShadowCandidateMs);
         return new Snapshot(
                 effectiveCeiling(state),
                 state.healthyBqrWindows,
@@ -497,7 +706,22 @@ final class LhdcLinkHealthController {
                 recoveryWaitRemainingMs(state, blocked, nowMs),
                 nativeBackoffRemainingMs,
                 blockedReason(state, blocked, nowMs),
-                state.streamSessionId);
+                state.streamSessionId,
+                state.peerCeilingKbps,
+                state.peerCeilingKbps > 900,
+                lastBqrAgoMs,
+                state.lastRemoteChoppyLevel,
+                lastRemoteChoppyAgoMs,
+                remoteChoppyCount5s,
+                choppyCapabilityState,
+                state.lastBqrOverflowCount,
+                state.lastBqrUnderflowCount,
+                state.shadowUnstableWindows,
+                state.shadowCandidateCount,
+                state.lastShadowCandidateKbps,
+                lastShadowCandidateAgoMs,
+                state.shadowStreamSessionId,
+                state.bqrFallbackCapKbps);
     }
 
     private DeviceState stateFor(String mac) {
@@ -585,12 +809,141 @@ final class LhdcLinkHealthController {
     }
 
     private static int effectiveCeiling(DeviceState state) {
-        if (state.to900.locked) return state.to900.probeInFlight ? 900 : 500;
-        if (state.to1000.locked) return state.to1000.probeInFlight ? 1000 : 900;
-        if (state.peerCeilingKbps > 0 && state.peerCeilingKbps <= 900) {
-            return state.peerCeilingKbps;
+        int ceiling;
+        if (state.to900.locked) {
+            ceiling = state.to900.probeInFlight ? 900 : 500;
+        } else if (state.to1000.locked) {
+            ceiling = state.to1000.probeInFlight ? 1000 : 900;
+        } else if (state.peerCeilingKbps > 0 && state.peerCeilingKbps <= 900) {
+            ceiling = state.peerCeilingKbps;
+        } else {
+            ceiling = 1000;
         }
-        return 1000;
+        if (state.bqrFallbackCapKbps > 0 && state.bqrFallbackCapKbps < ceiling) {
+            ceiling = state.bqrFallbackCapKbps;
+        }
+        return ceiling;
+    }
+
+    /**
+     * Experimental validation path: when the headset never reports remote choppy (Buds Ace 3),
+     * sustained BQR retransmission/noRx pressure is the only strong downgrade signal. Four
+     * consecutive bad windows (about 24 s) clamp the effective ceiling to 500; six consecutive
+     * healthy windows after an escalating hold (60s -> 2min -> 5min) restore the peer ceiling.
+     * Every transition is reported through the listener so the feedback package contains the
+     * full decision record.
+     */
+    private void evaluateBqrFallback(String mac, DeviceState state, long nowMs, boolean streaming) {
+        if (!streaming) return;
+        double retx = state.retransmissionsPerSecond;
+        double noRx = state.noRxPerSecond;
+        if (Double.isNaN(retx) || Double.isNaN(noRx)) return;
+        if (state.peerCeilingKbps > 0 && state.peerCeilingKbps <= BQR_FALLBACK_CAP_KBPS) return;
+
+        boolean bad = retx >= BQR_FALLBACK_BAD_RETX_PER_SEC
+                && noRx >= BQR_FALLBACK_BAD_NO_RX_PER_SEC;
+        boolean healthy = retx < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
+                && noRx < BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC;
+
+        if (state.bqrFallbackCapKbps == 0) {
+            state.bqrFallbackBadWindows = bad ? state.bqrFallbackBadWindows + 1 : 0;
+            if (state.bqrFallbackBadWindows >= BQR_FALLBACK_REQUIRED_BAD_WINDOWS) {
+                int windows = state.bqrFallbackBadWindows;
+                triggerBqrFallback(mac, state, nowMs, "triggered", windows, false);
+            }
+            return;
+        }
+
+        state.bqrFallbackHealthyWindows = healthy ? state.bqrFallbackHealthyWindows + 1 : 0;
+        if (state.bqrFallbackHealthyWindows >= BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS
+                && nowMs - state.bqrFallbackSinceMs >= bqrFallbackHoldMs(state)) {
+            int windows = state.bqrFallbackHealthyWindows;
+            state.bqrFallbackHealthyWindows = 0;
+            state.bqrFallbackCapKbps = 0;
+            state.bqrFallbackRecoveredMs = nowMs;
+            state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
+            state.bqrFastFailQueueSinceMs = 0L;
+            publishCeiling(mac, state, "bqr_fallback_recovered");
+            notifyBqrFallback(mac, state, "recovered", 0, windows);
+        }
+    }
+
+    private void triggerBqrFallback(
+            String mac,
+            DeviceState state,
+            long nowMs,
+            String notifyReason,
+            int badWindows,
+            boolean queueFastFail) {
+        state.bqrFallbackBadWindows = 0;
+        state.bqrFallbackCapKbps = BQR_FALLBACK_CAP_KBPS;
+        state.bqrFallbackSinceMs = nowMs;
+        state.bqrFastFailUntilMs = 0L;
+        state.bqrFastFailQueueSinceMs = 0L;
+        if (state.bqrFallbackRecoveredMs != 0L) {
+            if (nowMs - state.bqrFallbackRecoveredMs <= BQR_FALLBACK_SUCCESS_WINDOW_MS) {
+                // The previous 900 phase died shortly after a recovery: failed probe, escalate.
+                state.bqrFallbackEscalationLevel = Math.min(
+                        BQR_FALLBACK_HOLD_MS.length - 1,
+                        state.bqrFallbackEscalationLevel + 1);
+            } else {
+                // The previous 900 phase survived long enough: start over with the base hold.
+                state.bqrFallbackEscalationLevel = 0;
+            }
+        } else {
+            state.bqrFallbackEscalationLevel = 0;
+        }
+        publishCeiling(mac, state,
+                queueFastFail ? "bqr_fallback_triggered_queue" : "bqr_fallback_triggered");
+        notifyBqrFallback(mac, state, notifyReason, badWindows, 0);
+    }
+
+    /**
+     * Probe-window queue fast-fail: during the first {@link #BQR_FAST_FAIL_PROBE_WINDOW_MS} after
+     * an upgrade/recovery/codec write, a sustained high-water TX queue means the air cannot drain
+     * the current rate. Clamp to 500 immediately instead of waiting four bad BQR windows.
+     * Calibrated so X3 healthy sessions (sampled queue max 40, and only outside probe windows)
+     * never trip it, while Buds Ace 3 bad phases peg the queue at 45 within ~1.5s.
+     */
+    private void evaluateBqrQueueFastFail(
+            String mac, DeviceState state, int length, long nowMs) {
+        if (state.bqrFallbackCapKbps > 0) return;
+        if (effectiveCeiling(state) < 900) return;
+        if (state.bqrFastFailUntilMs == 0L || nowMs > state.bqrFastFailUntilMs) {
+            state.bqrFastFailQueueSinceMs = 0L;
+            return;
+        }
+        if (length >= BQR_FAST_FAIL_QUEUE_THRESHOLD) {
+            if (state.bqrFastFailQueueSinceMs == 0L) {
+                state.bqrFastFailQueueSinceMs = nowMs;
+            } else if (nowMs - state.bqrFastFailQueueSinceMs >= BQR_FAST_FAIL_HOLD_MS) {
+                state.bqrFastFailQueueSinceMs = 0L;
+                triggerBqrFallback(
+                        mac, state, nowMs, "triggered_queue_fast_fail", 0, true);
+            }
+        } else {
+            state.bqrFastFailQueueSinceMs = 0L;
+        }
+    }
+
+    private void notifyBqrFallback(
+            String mac, DeviceState state, String reason, int badWindows, int healthyWindows) {
+        if (listener == null) return;
+        listener.onBqrFallbackStateChanged(
+                mac,
+                state.bqrFallbackCapKbps,
+                reason,
+                badWindows,
+                healthyWindows,
+                state.retransmissionsPerSecond,
+                state.noRxPerSecond,
+                state.bqrFallbackEscalationLevel,
+                bqrFallbackHoldMs(state));
+    }
+
+    private static long bqrFallbackHoldMs(DeviceState state) {
+        return BQR_FALLBACK_HOLD_MS[Math.max(0,
+                Math.min(state.bqrFallbackEscalationLevel, BQR_FALLBACK_HOLD_MS.length - 1))];
     }
 
     private static BoundaryState inFlightBoundary(DeviceState state) {
@@ -617,6 +970,60 @@ final class LhdcLinkHealthController {
         state.criticalQueueSinceMs = 0L;
         state.healthyBqrWindows = 0;
         state.healthyDecaySinceMs = 0L;
+    }
+
+    private void updateBqrShadowCandidate(
+            String mac,
+            DeviceState state,
+            BqrSample sample,
+            long nowMs,
+            boolean streaming,
+            boolean stableBoundaryState) {
+        boolean unstable = streaming
+                && stableBoundaryState
+                && (sample.overflowCount > 0L || sample.underflowCount > 0L);
+        if (!unstable) {
+            clearShadowWindow(state);
+            return;
+        }
+        if (state.shadowUnstableWindows > 0
+                && (state.shadowStreamSessionId != state.streamSessionId
+                || nowMs - state.lastShadowUnstableWindowMs > MAX_BQR_INTERVAL_MS)) {
+            clearShadowWindow(state);
+        }
+        if (state.shadowUnstableWindows == 0) {
+            state.shadowStreamSessionId = state.streamSessionId;
+        }
+        state.shadowUnstableWindows++;
+        state.lastShadowUnstableWindowMs = nowMs;
+        if (state.shadowUnstableWindows < REQUIRED_SHADOW_UNSTABLE_WINDOWS) return;
+
+        int fromKbps = effectiveCeiling(state);
+        int candidateKbps = fromKbps >= 1000 ? 900 : fromKbps == 900 ? 500 : 0;
+        boolean cooldownElapsed = state.lastShadowCandidateMs == 0L
+                || nowMs - state.lastShadowCandidateMs >= SHADOW_CANDIDATE_COOLDOWN_MS;
+        clearShadowWindow(state);
+        if (!cooldownElapsed) return;
+
+        state.lastShadowCandidateMs = nowMs;
+        state.lastShadowCandidateKbps = candidateKbps;
+        state.shadowCandidateCount++;
+        if (listener != null) {
+            listener.onBqrShadowCandidate(
+                    mac,
+                    fromKbps,
+                    candidateKbps,
+                    sample.overflowCount,
+                    sample.underflowCount,
+                    state.shadowCandidateCount,
+                    state.streamSessionId);
+        }
+    }
+
+    private static void clearShadowWindow(DeviceState state) {
+        state.shadowUnstableWindows = 0;
+        state.lastShadowUnstableWindowMs = 0L;
+        state.shadowStreamSessionId = 0L;
     }
 
     private static void clearBoundary(BoundaryState boundary) {
@@ -655,6 +1062,10 @@ final class LhdcLinkHealthController {
         state.healthyBqrWindows = 0;
         state.retransmissionsPerSecond = Double.NaN;
         state.noRxPerSecond = Double.NaN;
+        state.bqrFallbackEscalationLevel = 0;
+        state.bqrFallbackRecoveredMs = 0L;
+        state.bqrFastFailUntilMs = 0L;
+        state.bqrFastFailQueueSinceMs = 0L;
         state.lastCongestionMs = nowMs;
         state.lowQueueSinceMs = 0L;
         state.criticalQueueSinceMs = 0L;
@@ -664,6 +1075,16 @@ final class LhdcLinkHealthController {
         state.probeBadBqrWindows = 0;
         state.healthyDecaySinceMs = 0L;
         state.streaming = false;
+        state.lastRemoteChoppyLevel = 0;
+        state.lastRemoteChoppyMs = 0L;
+        state.remoteChoppyWindowStartMs = 0L;
+        state.remoteChoppyCount = 0;
+        state.lastBqrOverflowCount = 0L;
+        state.lastBqrUnderflowCount = 0L;
+        clearShadowWindow(state);
+        state.lastShadowCandidateMs = 0L;
+        state.shadowCandidateCount = 0;
+        state.lastShadowCandidateKbps = 0;
     }
 
     private static String probePhase(DeviceState state) {

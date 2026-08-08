@@ -1,5 +1,7 @@
 package xyz.melodylsp.codec.system;
 
+import xyz.melodylsp.codec.BuildConfig;
+
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.system.OsConstants;
@@ -61,6 +63,28 @@ final class NativeLhdcMemoryPatch {
                     4,
                     hex("1c000014")),
     };
+    /**
+     * ColorOS 16.0.3.401/.402 PJZ110 inlines A2DP codec equality but omits LHDC V5. The original
+     * block is the unsupported-codec logger reached with CodecId 0x4c35053aff; the replacement
+     * reproduces the older OPlus LHDC V5 equality mask. It accepts only a valid current LHDC V5
+     * CIE whose sample-rate/channel/feature fields match the target, while deliberately ignoring
+     * the quality/bitrate bits. Every other codec or material CIE change falls through to the
+     * original restart path.
+     *
+     * <p>This is intentionally an exact whole-block signature for the evidence build. An OTA that
+     * recompiles the function is unsupported instead of receiving a guessed patch.</p>
+     */
+    private static final CodeBlockSpec LHDC_V5_QUALITY_SWITCH_SPEC = new CodeBlockSpec(
+            "lhdcv5_quality_equals_pjz110_1609401_1609402",
+            hex("68ac805289b2ffd029613191a88316b8c8b1ffd008353e91a92102a9e8018052"
+                    + "a90302d11f2003d50aa60210a93900f9aaa107a929008052aa0301d141b0ff90"
+                    + "21b4139183b5ffd0638c2a91a26302d1a5c302d1c000805264038052a92900a9"
+                    + "a80900f99d2b17940a000014"),
+            hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa0359385f350071a1030054"
+                    + "aa2359385ffd037141030054aa3359b84ba780525f010b6bc1020054aa735978"
+                    + "ab8689525f010b6b41020054aa9359b8ab9240b84a010b4aabe680520b02b872"
+                    + "5f010b6a610100540c000014"),
+            0x14000024);
     private static final int MAX_RANGE_BYTES = 64 * 1024 * 1024;
     private static final int NATIVE_PATCH_OK = 0;
     private static final int NATIVE_PATCH_ALREADY_APPLIED = 1;
@@ -70,8 +94,14 @@ final class NativeLhdcMemoryPatch {
     private static volatile boolean nativeLoadAttempted;
     private static volatile boolean nativeLoaded;
     private static volatile PatchResult lastResult;
+    private static volatile PatchResult lastQualitySwitchResult;
     private static volatile boolean governorInstalled;
     private static volatile int governorPolicy = LhdcQualityPolicy.ADAPTIVE;
+    /**
+     * Java-side replay cache for the native probe ceiling. Updated before any install attempt so
+     * an early 900 kbps capability broadcast survives a late or failed governor install.
+     */
+    private static volatile int desiredGovernorProbeCeilingKbps = 1000;
 
     private NativeLhdcMemoryPatch() {
     }
@@ -113,6 +143,22 @@ final class NativeLhdcMemoryPatch {
         return lastResult;
     }
 
+    static synchronized PatchResult applyQualitySwitchGuard() {
+        PatchResult result;
+        try {
+            result = applyQualitySwitchGuardUnchecked();
+        } catch (Throwable t) {
+            result = PatchResult.failed("exception:" + t.getClass().getSimpleName()
+                    + ":" + t.getMessage());
+        }
+        lastQualitySwitchResult = result;
+        return result;
+    }
+
+    static PatchResult lastQualitySwitchResult() {
+        return lastQualitySwitchResult;
+    }
+
     /** Installs the fixed-bitrate encoder capture. Safe to call repeatedly. */
     static synchronized boolean installGovernor() {
         if (governorInstalled) return true;
@@ -132,10 +178,11 @@ final class NativeLhdcMemoryPatch {
         }
         governorInstalled = result > 0;
         MLog.event("lhdc.governor.install", "ok", governorInstalled, "result", result);
+        if (governorInstalled) replayGovernorProbeCeiling();
         return governorInstalled;
     }
 
-    static boolean setGovernorPolicy(int policy) {
+    static synchronized boolean setGovernorPolicy(int policy) {
         if (!ensureNativeLoaded()) return false;
         try {
             nativeSetGovernorPolicy(policy);
@@ -148,12 +195,59 @@ final class NativeLhdcMemoryPatch {
         }
     }
 
-    static void setGovernorProbeCeilingKbps(int ceilingKbps) {
-        if (!governorInstalled && !installGovernor()) return;
+    static String governorModeForDiagnostics() {
+        return BuildConfig.LHDC_GOVERNOR_MODE;
+    }
+
+    /** Normalizes any input to the supported probe-ceiling ladder; 0/negative means "unknown" -> 1000. */
+    static int normalizeProbeCeilingKbps(int ceilingKbps) {
+        if (ceilingKbps <= 0) return 1000;
+        if (ceilingKbps <= 500) return 500;
+        if (ceilingKbps <= 900) return 900;
+        return 1000;
+    }
+
+    /** Updates the desired ceiling cache and returns the previously cached value. */
+    static synchronized int cacheDesiredGovernorProbeCeilingKbps(int ceilingKbps) {
+        int previous = desiredGovernorProbeCeilingKbps;
+        desiredGovernorProbeCeilingKbps = normalizeProbeCeilingKbps(ceilingKbps);
+        return previous;
+    }
+
+    static int currentDesiredGovernorProbeCeilingKbps() {
+        return desiredGovernorProbeCeilingKbps;
+    }
+
+    static synchronized void setGovernorProbeCeilingKbps(int ceilingKbps) {
+        int previous = cacheDesiredGovernorProbeCeilingKbps(ceilingKbps);
+        int normalized = desiredGovernorProbeCeilingKbps;
+        if (!governorInstalled && !installGovernor()) {
+            // Value stays cached and is replayed by installGovernor() once it succeeds.
+            MLog.event("lhdc.governor.ceiling_cached",
+                    "ceilingKbps", normalized,
+                    "previousKbps", previous,
+                    "reason", "governor_not_installed");
+            return;
+        }
+        if (!governorInstalled) return;
         try {
-            nativeSetGovernorProbeCeilingKbps(ceilingKbps);
+            nativeSetGovernorProbeCeilingKbps(normalized);
+            MLog.event("lhdc.governor.ceiling_applied",
+                    "ceilingKbps", normalized,
+                    "previousKbps", previous);
         } catch (Throwable t) {
             MLog.w("lhdc governor probe ceiling update failed", t);
+        }
+    }
+
+    private static void replayGovernorProbeCeiling() {
+        int ceilingKbps = desiredGovernorProbeCeilingKbps;
+        try {
+            nativeSetGovernorProbeCeilingKbps(ceilingKbps);
+            MLog.event("lhdc.governor.ceiling_replayed_after_install",
+                    "ceilingKbps", ceilingKbps);
+        } catch (Throwable t) {
+            MLog.w("lhdc governor probe ceiling replay failed", t);
         }
     }
 
@@ -181,6 +275,39 @@ final class NativeLhdcMemoryPatch {
         } catch (Throwable t) {
             MLog.w("lhdc governor bitrate read failed", t);
             return 0;
+        }
+    }
+
+    static int currentGovernorRequestedBitrateKbps() {
+        if (!governorInstalled || !nativeLoaded) return 0;
+        try {
+            return nativeGetGovernorRequestedBitrateKbps();
+        } catch (Throwable t) {
+            MLog.w("lhdc governor requested bitrate read failed", t);
+            return 0;
+        }
+    }
+
+    static String currentGovernorVerification() {
+        if (!governorInstalled || !nativeLoaded) return "none";
+        try {
+            return verificationTextForNativeState(nativeGetGovernorVerificationState());
+        } catch (Throwable t) {
+            MLog.w("lhdc governor verification state read failed", t);
+            return "unknown";
+        }
+    }
+
+    static String verificationTextForNativeState(int state) {
+        switch (state) {
+            case 0: return "none";
+            case 1: return "pending";
+            case 2: return "getter_confirmed";
+            case 3: return "getter_unavailable";
+            case 4: return "getter_read_failed";
+            case 5: return "getter_mismatch";
+            case 6: return "setter_only";
+            default: return "unknown";
         }
     }
 
@@ -213,6 +340,80 @@ final class NativeLhdcMemoryPatch {
         }
     }
 
+    private static final int DYN_OBSERVE_MAX_PROBES = 5;
+    private static int dynObserveProbeCount;
+    private static long dynObserveLastEpoch = -1L;
+    private static long dynObserveLastProbeMs;
+
+    /**
+     * Observe-only dynamic adapter probe, retained from the DYN-A/B experiments for future
+     * ROM-family research. Debug builds only ({@code BuildConfig.LHDC_DYN_OBSERVE}) and
+     * intended to run while a diagnostic recording session is active: it scans the writable
+     * owner of {@code lhdcv5BT_adjust_bitrate} inside libbluetooth_jni and reports the slot
+     * structure relationship to the encode/free slots. Never writes a pointer; bounded to a
+     * few probes per Bluetooth process with per-epoch dedup.
+     */
+    static synchronized void probeAdjustOwnerIfEnabled() {
+        if (!BuildConfig.LHDC_DYN_OBSERVE) return;
+        if (!governorInstalled || !nativeLoaded) return;
+        long epoch = currentGovernorSessionEpoch();
+        long now = System.currentTimeMillis();
+        if (epoch == dynObserveLastEpoch && now - dynObserveLastProbeMs < 30_000L) return;
+        if (dynObserveProbeCount >= DYN_OBSERVE_MAX_PROBES) return;
+        dynObserveProbeCount++;
+        dynObserveLastEpoch = epoch;
+        dynObserveLastProbeMs = now;
+        int result;
+        try {
+            result = nativeProbeAdjustOwnerObserve();
+        } catch (Throwable t) {
+            MLog.w("lhdc dyn observe probe failed", t);
+            return;
+        }
+        long bits;
+        long slot;
+        long encodeSlot;
+        try {
+            bits = nativeGetAdjustObserveBits();
+            slot = nativeGetAdjustObserveSlotAddress();
+            encodeSlot = nativeGetEncodeObserveSlotAddress();
+        } catch (Throwable t) {
+            MLog.w("lhdc dyn observe probe state read failed", t);
+            return;
+        }
+        int adjustCandidates = (int) (bits & 0xffffL);
+        int encodeCandidates = (int) ((bits >>> 16) & 0xffffL);
+        int freeCandidates = (int) ((bits >>> 32) & 0xffffL);
+        int ownerSegment = (int) ((bits >>> 48) & 0xffL);
+        boolean sameRangeAsEncode = ((bits >>> 56) & 1L) != 0L;
+        MLog.event("lhdc.dyn.observe",
+                "mode", "observe_only",
+                "status", describeObserveProbeResult(result),
+                "result", result,
+                "adjustCandidates", adjustCandidates,
+                "encodeCandidates", encodeCandidates,
+                "freeCandidates", freeCandidates,
+                "ownerSlot", "0x" + Long.toHexString(slot),
+                "encodeSlot", "0x" + Long.toHexString(encodeSlot),
+                "ownerSegment", ownerSegment,
+                "sameRangeAsEncode", sameRangeAsEncode,
+                "streamEpoch", epoch,
+                "probeCount", dynObserveProbeCount,
+                "pid", android.os.Process.myPid());
+    }
+
+    static String describeObserveProbeResult(int result) {
+        switch (result) {
+            case 1: return "unique_owner";
+            case -2: return "not_enabled_or_arch";
+            case -3: return "encoder_not_loaded";
+            case -4: return "adjust_symbol_missing";
+            case -5: return "zero_owners";
+            case -6: return "ambiguous_multiple_owners";
+            default: return "unknown";
+        }
+    }
+
     static GovernorEvent consumeGovernorEvent() {
         if (!governorInstalled || !nativeLoaded) return null;
         try {
@@ -222,8 +423,17 @@ final class NativeLhdcMemoryPatch {
             int fromKbps = bitrateForNativeRate((int) ((packed >>> 8) & 0xffL));
             int toKbps = bitrateForNativeRate((int) ((packed >>> 16) & 0xffL));
             long detailMs = packed >>> 24;
+            int reasonId = nativeConsumeGovernorEventReasonId();
+            if (event == LhdcLinkHealthController.EVENT_PEER_CEILING_DETECTED) {
+                if (toKbps == 0) return null;
+                return new GovernorEvent(event, 0, toKbps, detailMs, reasonId);
+            }
+            if (event == LhdcLinkHealthController.EVENT_TRANSITION_APPLIED) {
+                if (toKbps == 0) return null;
+                return new GovernorEvent(event, fromKbps, toKbps, detailMs, reasonId);
+            }
             if (fromKbps == 0 || toKbps == 0) return null;
-            return new GovernorEvent(event, fromKbps, toKbps, detailMs);
+            return new GovernorEvent(event, fromKbps, toKbps, detailMs, reasonId);
         } catch (Throwable t) {
             MLog.w("lhdc governor event read failed", t);
             return null;
@@ -243,12 +453,14 @@ final class NativeLhdcMemoryPatch {
         final int fromKbps;
         final int toKbps;
         final long detailMs;
+        final int reasonId;
 
-        GovernorEvent(int type, int fromKbps, int toKbps, long detailMs) {
+        GovernorEvent(int type, int fromKbps, int toKbps, long detailMs, int reasonId) {
             this.type = type;
             this.fromKbps = fromKbps;
             this.toKbps = toKbps;
             this.detailMs = detailMs;
+            this.reasonId = reasonId;
         }
     }
 
@@ -349,6 +561,80 @@ final class NativeLhdcMemoryPatch {
                     Math.max(1, patchedCount), 0, original.spec.name);
         }
         return PatchResult.patched(patchAddress, patchedCount, originalCount, original.spec.name);
+    }
+
+    private static PatchResult applyQualitySwitchGuardUnchecked() throws Exception {
+        List<MapRange> ranges = readLibraryMaps();
+        if (ranges.isEmpty()) {
+            return PatchResult.pending("library_not_mapped");
+        }
+
+        CodeBlockSpec spec = LHDC_V5_QUALITY_SWITCH_SPEC;
+        long originalAddress = 0L;
+        int originalCount = 0;
+        int patchedCount = 0;
+        for (MapRange range : ranges) {
+            if (!range.executable) continue;
+            byte[] bytes = readRange(range);
+            if (bytes == null) continue;
+            int rangeOriginalCount = countMatches(bytes, spec.original);
+            originalCount += rangeOriginalCount;
+            patchedCount += countMatches(bytes, spec.patched);
+            if (originalAddress == 0L && rangeOriginalCount > 0) {
+                int index = indexOf(bytes, spec.original);
+                if (index >= 0) originalAddress = range.start + index;
+            }
+        }
+
+        if (patchedCount == 1 && originalCount == 0) {
+            return PatchResult.alreadyPatched(patchedCount, originalCount, spec.name);
+        }
+        if (originalCount != 1 || patchedCount != 0 || originalAddress == 0L) {
+            return PatchResult.unsupported(patchedCount, originalCount);
+        }
+
+        MapRange patchRange = findRange(ranges, originalAddress);
+        if (patchRange == null
+                || originalAddress + spec.original.length > patchRange.end) {
+            return PatchResult.failed("patch_block_outside_mapping");
+        }
+        if (!patchRange.executable) {
+            return PatchResult.failed("patch_mapping_not_executable");
+        }
+        if ((originalAddress & 3L) != 0L
+                || spec.original.length == 0
+                || (spec.original.length & 3) != 0
+                || spec.original.length != spec.patched.length) {
+            return PatchResult.failed("patch_block_not_aligned_arm64");
+        }
+        if (!ensureNativeLoaded()) {
+            return PatchResult.failed("native_helper_unavailable:" + nativeLoadError);
+        }
+
+        int nativeResult;
+        try {
+            nativeResult = nativePatchCodeBlock(
+                    originalAddress,
+                    spec.original,
+                    spec.patched,
+                    spec.safeGateInstruction,
+                    patchRange.protectionFlags());
+        } catch (Throwable t) {
+            return PatchResult.failed("native_patch_call_failed:" + describeThrowable(t));
+        }
+        if (nativeResult != NATIVE_PATCH_OK
+                && nativeResult != NATIVE_PATCH_ALREADY_APPLIED) {
+            return PatchResult.failed(describeNativePatchResult(nativeResult));
+        }
+
+        byte[] verify = readMemory(originalAddress, spec.patched.length);
+        if (!equalsBytes(verify, spec.patched)) {
+            return PatchResult.failed("verify_failed");
+        }
+        if (nativeResult == NATIVE_PATCH_ALREADY_APPLIED) {
+            return PatchResult.alreadyPatched(Math.max(1, patchedCount), 0, spec.name);
+        }
+        return PatchResult.patched(originalAddress, patchedCount, originalCount, spec.name);
     }
 
     /**
@@ -656,6 +942,13 @@ final class NativeLhdcMemoryPatch {
             int replacementInstruction,
             int originalProtection);
 
+    private static native int nativePatchCodeBlock(
+            long address,
+            byte[] expected,
+            byte[] replacement,
+            int safeGateInstruction,
+            int originalProtection);
+
     private static native int nativeInstallGovernor();
 
     private static native void nativeSetGovernorPolicy(int policy);
@@ -663,12 +956,25 @@ final class NativeLhdcMemoryPatch {
     private static native void nativeSetGovernorProbeCeilingKbps(int ceilingKbps);
 
     private static native long nativeConsumeGovernorEvent();
+    private static native int nativeConsumeGovernorEventReasonId();
 
     private static native int nativeGetGovernorBitrateKbps();
+
+    private static native int nativeGetGovernorRequestedBitrateKbps();
+
+    private static native int nativeGetGovernorVerificationState();
 
     private static native boolean nativeIsGovernorStreaming();
 
     private static native long nativeGetGovernorSessionEpoch();
+
+    private static native int nativeProbeAdjustOwnerObserve();
+
+    private static native long nativeGetAdjustObserveBits();
+
+    private static native long nativeGetAdjustObserveSlotAddress();
+
+    private static native long nativeGetEncodeObserveSlotAddress();
 
     private static native void nativeReportQueueLength(int length);
 
@@ -825,6 +1131,29 @@ final class NativeLhdcMemoryPatch {
             this.patchDelta = patchDelta;
             this.patchBytes = patchBytes;
         }
+    }
+
+    static final class CodeBlockSpec {
+        final String name;
+        final byte[] original;
+        final byte[] patched;
+        final int safeGateInstruction;
+
+        CodeBlockSpec(
+                String name,
+                byte[] original,
+                byte[] patched,
+                int safeGateInstruction) {
+            this.name = name;
+            this.original = original;
+            this.patched = patched;
+            this.safeGateInstruction = safeGateInstruction;
+        }
+    }
+
+    /** Visible for tests. */
+    static CodeBlockSpec qualitySwitchSpecForTest() {
+        return LHDC_V5_QUALITY_SWITCH_SPEC;
     }
 
     private static final class MapRange {

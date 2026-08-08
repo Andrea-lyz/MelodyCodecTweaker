@@ -21,15 +21,16 @@
           - 模块总开关 (KEY_ENABLED)
           - 隐藏桌面图标 (KEY_HIDE_LAUNCHER_ICON)
           - 反馈工具卡片（会话状态 / 记录按钮态 / 重抓 Melody 快照）
-          - 诊断状态 16 项 addStatusRow（scope.host / host.controller /
+           - 诊断状态 20 项 addStatusRow（scope.host / host.controller /
             hook.host / inject.detail / inject.onespace / scope.bluetooth /
             bridge.codec / bridge.le.bt / scope.wirelesssettings /
-            bridge.le.ws / native.patch / codec.write / remember.write /
+             bridge.le.ws / native.patch / lhdc.link.bqr / lhdc.link.choppy /
+             lhdc.link.queue / lhdc.link.shadow / codec.write / remember.write /
             remember.replay / last.warning / last.error）
           - 环境信息 5 项（模块版本 / 系统 / 三个宿主包版本）
           - 记忆信息（当前 Melody 真实记忆 + 上次记忆恢复链路）
           - 最近事件 12 行
-          - LHDC BQR 实时环境 4 个 KPI + 边界状态 + 13 个 reason
+           - LHDC BQR 实时环境 6 个 KPI + 边界状态 + reason
           - LHDC BQR 历史窗口 sparkline
        ───────────────────────────────────────────────────────────── */
     :root {
@@ -224,8 +225,11 @@
     /* environment gauge */
     .env-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; align-items: center; padding: 8px 0; }
     .env-row .name { color: var(--subtext); font-size: 13px; }
+    .env-row .bar-wrap {
+      position: relative; height: 20px; display: flex; align-items: center;
+    }
     .env-row .bar {
-      height: 8px; border-radius: 999px; background: var(--line); overflow: hidden;
+      height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; flex: 1;
     }
     .env-row .bar > i {
       display: block; height: 100%;
@@ -234,7 +238,17 @@
     .env-row .bar > i.warn { background: linear-gradient(90deg, var(--orange), var(--red)); }
     .env-row .bar > i.blocked { background: var(--muted); opacity: .45; }
     .env-row .bar > i.testing { background: linear-gradient(90deg, var(--blue), #72b7ff); }
+    .env-row .bar > i.unsupported {
+      background: var(--muted); opacity: .55;
+    }
     .env-row .val { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--subtext); }
+    .env-row .lock-icon {
+      position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      width: 20px; height: 20px; pointer-events: none; z-index: 2;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted);
+    }
+    .env-row .lock-icon svg { width: 16px; height: 16px; }
 
     /* history trend chart */
     .history {
@@ -461,7 +475,21 @@
         <div class="l">可用 AFH</div>
         <div class="u">健康 ≥ 30</div>
       </div>
+      <div class="kpi">
+        <div class="v" id="bqr-queue">—</div>
+        <div class="l">编码队列</div>
+        <div class="u">占用 0–45</div>
+      </div>
+      <div class="kpi">
+        <div class="v" id="bqr-choppy-capability">未知</div>
+        <div class="l">Remote choppy</div>
+        <div class="u">按当前蓝牙进程观察</div>
+      </div>
     </div>
+
+    <p class="hint" id="bqr-evidence" style="margin-top:14px">
+      等待有效 BQR；取证版不会根据这些字段修改实际码率。
+    </p>
 
     <div class="section-head" style="margin-top:18px">
       <h3>边界状态</h3>
@@ -470,12 +498,12 @@
 
     <div class="env-row">
       <div class="name">500 → 900</div>
-      <div class="bar"><i id="boundary-500-900-bar" style="width:0%"></i></div>
+      <div class="bar-wrap"><div class="bar"><i id="boundary-500-900-bar" style="width:0%"></i></div><span class="lock-icon" id="boundary-500-900-lock" style="display:none"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg></span></div>
       <span class="val" id="boundary-500-900-value">未知</span>
     </div>
     <div class="env-row">
       <div class="name">900 → 1000</div>
-      <div class="bar"><i id="boundary-900-1000-bar" style="width:0%"></i></div>
+      <div class="bar-wrap"><div class="bar"><i id="boundary-900-1000-bar" style="width:0%"></i></div><span class="lock-icon" id="boundary-900-1000-lock" style="display:none"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg></span></div>
       <span class="val" id="boundary-900-1000-value">未知</span>
     </div>
 
@@ -727,7 +755,8 @@
   const HISTORY_BUCKETS = 24;
   const REASONS = [
     ['healthy_recovery_probe', '主动试探', 'active', '健康窗口与低队列达标，开放下一档码率上限'],
-    ['native_upgrade_applied', '实际升档', 'active', 'native 已成功写入更高的目标码率，进入稳定性验证'],
+    ['native_upgrade_applied', '实际升档', 'active', 'getter 已确认实际到达更高的目标码率，进入稳定性验证'],
+    ['peer_ceiling_detected', '能力检测', 'stable', 'getter 确认设备无法到达目标档位，已按实际能力收敛上限'],
     ['probe_bqr_severe', '环境严重恶化', 'locked', 'BQR 出现严重重传、No-Rx 或 AFH 信道不足，立即撤回'],
     ['probe_bqr_sustained_bad', '环境持续恶化', 'queued', '连续多个 BQR 窗口变差，完成迟滞判断后撤回'],
     ['probe_queue_full', '队列打满', 'locked', '蓝牙缓冲队列达到硬上限，立即保护降档'],
@@ -738,7 +767,16 @@
     ['boundary_stable', '升级门槛解除', 'stable', '实际升档后稳定运行，清除该边界的失败证据'],
     ['quick_failure', '快速失败', 'queued', '升档后很快发生拥塞，进入对应 native 退避'],
     ['stream_session', '播放会话更新', 'stable', 'native 捕获到新的编码器代际，临时证据已重置'],
-    ['device_active', '设备激活', 'stable', '当前活动耳机切换，加载该设备的链路学习状态']
+    ['device_active', '设备激活', 'stable', '当前活动耳机切换，加载该设备的链路学习状态'],
+    ['remote_choppy', '耳机侧卡顿上报', 'locked', '耳机主动上报可闻卡顿，治理器据此保护'],
+    ['native_quality_start_retry_', '会话启动重试', 'queued', '首写未生效后的重试写入'],
+    ['native_quality_start_', '会话启动写档', 'stable', '流会话建立时 native 写入初始档位'],
+    ['native_probe_ceiling_restore_', '实际恢复', 'stable', 'native 已把码率写回目标档位'],
+    ['native_probe_ceiling_', '实际降档', 'locked', 'native 已把码率写入更低档位'],
+    ['native_remote_choppy_', '实际降档(choppy)', 'locked', 'choppy 触发的 native 实际降档'],
+    ['native_queue_full_', '实际降档(队列满)', 'locked', '队列打满触发的 native 实际降档'],
+    ['native_queue_critical_', '实际降档(队列积压)', 'locked', '队列积压触发的 native 实际降档'],
+    ['native_stable_upgrade_', '实际升档', 'active', '稳定升档已写入并确认']
   ];
   let lastSnapshot = null;
   let historyWindowMs = 300000;
@@ -786,9 +824,9 @@
   function statusTier(status) {
     const normalized = String(status || '').trim().toLowerCase();
     if (status === '未发现'
-        || ['ok','ready','loaded','hooked','injected','registered','patched','active'].includes(normalized)) return 'ok';
+        || ['ok','ready','loaded','hooked','injected','registered','patched','active','armed'].includes(normalized)) return 'ok';
     if (['attention','error','failed'].includes(normalized)) return 'err';
-    if (['pending','warning'].includes(normalized)) return 'warn';
+    if (['pending','warning','would_protect'].includes(normalized)) return 'warn';
     return 'idle';
   }
 
@@ -857,6 +895,7 @@
   function renderBoundary(prefix, state) {
     const bar = byId(prefix + '-bar');
     const value = byId(prefix + '-value');
+    const lock = byId(prefix + '-lock');
     if (!bar || !value) return;
     const states = {
       unknown:   ['未知', 'var(--muted)', ''],
@@ -864,11 +903,23 @@
       blocked:   ['等待低档恢复', 'var(--muted)', 'blocked'],
       probing:   ['试探中', 'var(--blue)', 'testing'],
       verifying: ['验证中', 'var(--blue)', 'testing'],
-      available: ['可尝试', 'var(--green)', '']
+      available: ['可尝试', 'var(--green)', ''],
+      unsupported: ['不支持', 'var(--muted)', 'unsupported']
     };
     const current = states[state] || states.unknown;
     bar.style.width = state === 'unknown' ? '0%' : '100%';
     bar.className = current[2];
+    if (lock) lock.style.display = state === 'unsupported' ? '' : 'none';
+    const aria = {
+      unknown: '状态未知',
+      locked: '已锁定',
+      blocked: '等待低档恢复',
+      probing: '试探中',
+      verifying: '验证中',
+      available: '可尝试',
+      unsupported: '不支持 1000 kbps'
+    }[state] || '状态未知';
+    bar.setAttribute('aria-label', aria);
     value.textContent = current[0];
     value.style.color = current[1];
   }
@@ -883,6 +934,10 @@
       setKpi('bqr-norx', '—', 'idle');
       setKpi('bqr-unused-afh', '— / 79', 'idle');
       setKpi('bqr-usable-afh', '— / 79', 'idle');
+      setKpi('bqr-queue', '—', 'idle');
+      setKpi('bqr-choppy-capability', '未知', 'idle');
+      byId('bqr-evidence').textContent =
+        '等待有效 BQR；取证版不会根据这些字段修改实际码率。';
       byId('bqr-ceiling').textContent = '当前上限 —';
       renderBoundary('boundary-500-900', 'unknown');
       renderBoundary('boundary-900-1000', 'unknown');
@@ -897,30 +952,82 @@
       const norx = number(latest.noRxPerSec, NaN);
       const unused = number(latest.unusedAfh, 0);
       const usable = number(latest.usableAfh, 0);
+      const queue = Math.max(0, number(latest.queue, 0));
+      const queueCapacity = Math.max(1, number(latest.queueCapacity, 45));
+      const choppyCapability = latest.choppyCapabilityState || 'UNKNOWN';
       setKpi('bqr-retx', fmtRate(retx), !Number.isFinite(retx) ? 'idle' : retx <= 30 ? 'good' : retx <= 60 ? 'warn' : 'bad');
       setKpi('bqr-norx', fmtRate(norx), !Number.isFinite(norx) ? 'idle' : norx <= 30 ? 'good' : norx <= 60 ? 'warn' : 'bad');
       setKpi('bqr-unused-afh', unused + ' / 79', unused <= 22 ? 'good' : unused <= 49 ? 'warn' : 'bad');
       setKpi('bqr-usable-afh', usable + ' / 79', usable >= 30 ? 'good' : usable >= 20 ? 'warn' : 'bad');
+      const queueRatio = queue / queueCapacity;
+      setKpi('bqr-queue', queue + ' / ' + queueCapacity,
+        queueRatio >= 1 ? 'bad' : queueRatio >= 0.9 ? 'warn' : 'good');
+      setKpi('bqr-choppy-capability',
+        choppyCapability === 'OBSERVED' ? '已观察到' : '未知',
+        choppyCapability === 'OBSERVED' ? 'good' : 'idle');
+      const bqrFallbackCapKbps = number(latest.bqrFallbackCapKbps, 0);
+      if (bqrFallbackCapKbps > 0) {
+        byId('bqr-evidence').textContent =
+          '链路压力持续偏高，BQR 保护降档已生效，当前上限钳制在 ' + bqrFallbackCapKbps + ' kbps；需续 6 个健康窗口 + 60s~5min 驻留（连续失败后递增）后自动恢复。';
+      } else if (retx > 60 || norx > 60 || unused > 49 || queueRatio >= 0.9) {
+        byId('bqr-evidence').textContent =
+          '链路压力较高，尚无保护降档证据；RF-only 不会触发强制降档。';
+      } else {
+        byId('bqr-evidence').textContent =
+          '链路与编码队列均正常，保持当前码率治理行为。';
+      }
       const ceiling = number(latest.ceilingKbps);
+      const effectiveCeiling = number(latest.effectiveCeilingKbps, ceiling);
+      const peerCeiling = number(latest.peerCeilingKbps, 0);
       const phase = latest.probePhase || 'stable';
-      const phaseLabel = {
+      const bitrateVerification = latest.bitrateVerification || 'none';
+      let phaseLabel = {
         locked: '已受限',
         probing: '正在试探',
         verifying: '正在验证',
         stable: '状态稳定'
       }[phase] || '状态更新中';
-      byId('bqr-ceiling').textContent = '当前上限 ' + ceiling + ' kbps · ' + phaseLabel;
+      // BQR fallback: probePhase=stable but ceiling is capped below normal
+      if (phase === 'stable' && bqrFallbackCapKbps > 0 && ceiling <= bqrFallbackCapKbps) {
+        phaseLabel = '降档';
+      }
+      if (bitrateVerification === 'pending') phaseLabel = '正在验证';
+      else if (bitrateVerification === 'getter_mismatch') phaseLabel = '能力受限';
+      else if (bitrateVerification === 'getter_unavailable'
+          || bitrateVerification === 'getter_read_failed') phaseLabel = '状态未核验';
+      // A confirmed peer ceiling (e.g. 900) must cap the displayed value even when a stale or
+      // racing payload still carries ceilingKbps=1000.
+      const displayCeiling = peerCeiling > 0
+        ? Math.min(effectiveCeiling, peerCeiling) : effectiveCeiling;
+      byId('bqr-ceiling').textContent =
+        '当前上限 ' + displayCeiling + ' kbps · ' + phaseLabel;
 
       const lowerLocked = !!latest.lock500to900;
       const upperLocked = !!latest.lock900to1000;
+      const peerKnown = peerCeiling > 0;
+      const upperSupported = !!latest.boundary900To1000Supported;
       const probeState = phase === 'verifying' ? 'verifying' : 'probing';
       const lowerTesting = (phase === 'probing' || phase === 'verifying') && ceiling === 900;
       const upperTesting = (phase === 'probing' || phase === 'verifying') && ceiling === 1000;
-      renderBoundary('boundary-500-900', lowerLocked
+      let upperState;
+      if (peerKnown && !upperSupported) {
+        upperState = 'unsupported';
+      } else if (upperLocked) {
+        upperState = 'locked';
+      } else if (bqrFallbackCapKbps > 0) {
+        upperState = 'blocked';
+      } else if (lowerLocked || lowerTesting) {
+        upperState = 'blocked';
+      } else if (upperTesting) {
+        upperState = probeState;
+      } else if (peerKnown && upperSupported) {
+        upperState = 'available';
+      } else {
+        upperState = 'unknown';
+      }
+      renderBoundary('boundary-500-900', (lowerLocked || bqrFallbackCapKbps > 0)
         ? 'locked' : lowerTesting ? probeState : 'available');
-      renderBoundary('boundary-900-1000', upperLocked
-        ? 'locked' : (lowerLocked || lowerTesting) ? 'blocked'
-          : upperTesting ? probeState : 'available');
+      renderBoundary('boundary-900-1000', upperState);
     }
     renderReasons(data.reasonCounts || {}, data.reasonTimes || {});
     renderHistory(data.history || []);
@@ -929,15 +1036,26 @@
   function renderReasons(counts, times) {
     const holder = byId('reason-list');
     clear(holder);
+    const entries = Object.keys(counts).concat(Object.keys(times));
     const occurred = REASONS
-      .filter(entry => number(counts[entry[0]], 0) > 0 || number(times[entry[0]], 0) > 0)
-      .sort((a, b) => number(times[b[0]], 0) - number(times[a[0]], 0));
+      .filter(entry => entries.some(key => key === entry[0] || key.startsWith(entry[0])))
+      .sort((a, b) => {
+        const ta = Object.keys(times).filter(k => k === a[0] || k.startsWith(a[0]))
+          .map(k => number(times[k], 0)).sort((x, y) => y - x)[0] || 0;
+        const tb = Object.keys(times).filter(k => k === b[0] || k.startsWith(b[0]))
+          .map(k => number(times[k], 0)).sort((x, y) => y - x)[0] || 0;
+        return tb - ta;
+      });
     if (!occurred.length) {
       empty(holder, '本次蓝牙运行尚未出现拥塞治理事件');
       return;
     }
     occurred.forEach(entry => {
       const [key, label, tier, desc] = entry;
+      const matched = entries.filter(k => k === key || k.startsWith(key));
+      const count = matched.reduce((sum, k) => sum + number(counts[k], 0), 0);
+      const lastTime = matched.map(k => number(times[k], 0))
+        .sort((x, y) => y - x)[0] || 0;
       const row = document.createElement('div');
       row.className = 'reason-row';
       const head = document.createElement('div');
@@ -955,10 +1073,10 @@
       const when = document.createElement('div');
       when.className = 'when';
       const strong = document.createElement('strong');
-      strong.textContent = fmtRelative(times[key]);
+      strong.textContent = fmtRelative(lastTime);
       when.appendChild(strong);
-      when.appendChild(document.createTextNode(counts[key]
-        ? '本次运行 ' + counts[key] + ' 次' : '已发生'));
+      when.appendChild(document.createTextNode(count
+        ? '本次运行 ' + count + ' 次' : '已发生'));
       row.append(head, detail, when);
       holder.appendChild(row);
     });

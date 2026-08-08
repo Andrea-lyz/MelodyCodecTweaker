@@ -1099,7 +1099,7 @@ public final class ConnectionStateReplayer {
         return true;
     }
 
-    private boolean isUserCodecWriteQuiet(String mac) {
+    boolean isUserCodecWriteQuiet(String mac) {
         String key = A2dpRouteReadiness.normalizeMac(mac);
         return key != null && userCodecWriteQuietRemainingMs(key) > 0L;
     }

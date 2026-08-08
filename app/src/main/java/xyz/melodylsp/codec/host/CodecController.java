@@ -2773,6 +2773,7 @@ public final class CodecController {
                 return;
             }
             cacheSnapshot(snapshot);
+            syncLhdcSelectionFromConfirmedSnapshot(snapshot);
             maybeInitializeRememberedSnapshot(snapshot, "status_publish");
             rememberHighQualitySnapshot(snapshot);
         }
@@ -2788,6 +2789,7 @@ public final class CodecController {
         if (snapshot == null || snapshot.mac == null) return;
         mainHandler.post(() -> {
             cacheSnapshot(snapshot);
+            syncLhdcSelectionFromConfirmedSnapshot(snapshot);
             maybeInitializeRememberedSnapshot(snapshot, "bridge_push");
             rememberHighQualitySnapshot(snapshot);
             for (Subscription sub : subscriptions.values()) {
@@ -2798,6 +2800,59 @@ public final class CodecController {
                 }
             }
         });
+    }
+
+    /**
+     * Host-side codec writes (e.g. the OPlus panel quality switch) are applied by the host and
+     * confirmed through codec status, not through this controller's write path. Without this
+     * reconciliation the in-memory policy cache and the remember store keep the stale value,
+     * so a later host-process rebuild shows the wrong selected quality. The stack-confirmed
+     * snapshot is the source of truth: LHDC remember values are stored with the transport
+     * low byte (1000 -> 0x8008, 900-capable -> 0x8007), exactly what {@link #writeSnapshot}
+     * would persist for the same selection.
+     */
+    private void syncLhdcSelectionFromConfirmedSnapshot(CodecSnapshot snapshot) {
+        if (snapshot == null || snapshot.mac == null) return;
+        String mac = snapshot.mac;
+        if (!CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+            Integer previous = lhdcPoliciesByMac.remove(mac);
+            if (previous != null) {
+                MLog.event("lhdc.policy.session_cleared",
+                        "mac", A2dpRouteReadiness.redactMac(mac),
+                        "policy", previous,
+                        "reason", "codec_switched");
+            }
+            return;
+        }
+        int policy = LhdcQualityPolicy.fromSpecific1(snapshot.activeCodecSpecific1);
+        Integer previous = lhdcPoliciesByMac.put(mac, policy);
+        if (previous == null || previous != policy) {
+            MLog.event("lhdc.policy.session_synced",
+                    "mac", A2dpRouteReadiness.redactMac(mac),
+                    "policy", policy,
+                    "previous", previous == null ? "none" : previous,
+                    "specific1", snapshot.activeCodecSpecific1,
+                    "source", "confirmed_snapshot");
+        }
+        if (!prefs.isRemembered(mac)) return;
+        // Only persist a stack-confirmed selection while a user write is still inside its quiet
+        // window (20 s after the host/panel codec write). Outside that window the snapshot is
+        // not evidence of a user choice: a fresh connection or reconnect shows the stack default
+        // (adaptive + 48 kHz) before replay lands, and writing that into the remember store
+        // would wipe the user's saved quality.
+        if (!replayer.isUserCodecWriteQuiet(mac)) return;
+        PreferenceStore.RememberedValue remembered = prefs.readSnapshot(mac);
+        if (remembered != null
+                && remembered.codecType == snapshot.activeCodecType
+                && remembered.codecSpecific1 == snapshot.activeCodecSpecific1
+                && remembered.sampleRate == snapshot.activeSampleRate) {
+            return;
+        }
+        prefs.writeSnapshot(
+                mac,
+                snapshot.activeCodecType,
+                snapshot.activeCodecSpecific1,
+                snapshot.activeSampleRate);
     }
 
     private void renderUnknown(Subscription sub) {
