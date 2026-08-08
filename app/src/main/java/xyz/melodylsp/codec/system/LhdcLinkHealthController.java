@@ -296,6 +296,8 @@ final class LhdcLinkHealthController {
         final long shadowStreamSessionId;
         /** BQR fallback cap in kbps; 0 when inactive. */
         final int bqrFallbackCapKbps;
+        /** Leaky-bucket fallback cap in kbps; 0 when inactive. */
+        final int leakyFallbackCapKbps;
 
         Snapshot(
                 int ceilingKbps,
@@ -332,7 +334,8 @@ final class LhdcLinkHealthController {
                 int lastShadowCandidateKbps,
                 long lastShadowCandidateAgoMs,
                 long shadowStreamSessionId,
-                int bqrFallbackCapKbps) {
+                int bqrFallbackCapKbps,
+                int leakyFallbackCapKbps) {
             this.ceilingKbps = ceilingKbps;
             this.healthyBqrWindows = healthyBqrWindows;
             this.usableAfhChannels = usableAfhChannels;
@@ -368,6 +371,7 @@ final class LhdcLinkHealthController {
             this.lastShadowCandidateAgoMs = lastShadowCandidateAgoMs;
             this.shadowStreamSessionId = shadowStreamSessionId;
             this.bqrFallbackCapKbps = bqrFallbackCapKbps;
+            this.leakyFallbackCapKbps = leakyFallbackCapKbps;
         }
     }
 
@@ -989,7 +993,7 @@ final class LhdcLinkHealthController {
                     false, false, 0, 0L, -1, 0, 0L, -1L,
                     "stable", 0L, 0, 0L, 0L, "none", 0L,
                     0, false, -1L, 0, -1L, 0,
-                    choppyCapabilityState, 0L, 0L, 0, 0, 0, -1L, 0L, 0);
+                    choppyCapabilityState, 0L, 0L, 0, 0, 0, -1L, 0L, 0, 0);
         }
         BoundaryState probe = inFlightBoundary(state);
         BoundaryState blocked = probe != null ? probe : firstBlockedBoundary(state);
@@ -1045,7 +1049,8 @@ final class LhdcLinkHealthController {
                 state.lastShadowCandidateKbps,
                 lastShadowCandidateAgoMs,
                 state.shadowStreamSessionId,
-                state.bqrFallbackCapKbps);
+                state.bqrFallbackCapKbps,
+                state.leakyFallbackCapKbps);
     }
 
     private DeviceState stateFor(String mac) {

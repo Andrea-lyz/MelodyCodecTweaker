@@ -506,6 +506,10 @@
       <div class="bar-wrap"><div class="bar"><i id="boundary-900-1000-bar" style="width:0%"></i></div><span class="lock-icon" id="boundary-900-1000-lock" style="display:none"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg></span></div>
       <span class="val" id="boundary-900-1000-value">未知</span>
     </div>
+    <p class="hint" style="margin-top:10px">
+      已恢复 = 该档位当前可达；恢复中 = 正在积累健康窗口向该档恢复；
+      等待低档恢复 = 需先恢复低一档；已锁定 = 历史学习锁定的边界；试探中/验证中 = 升档试探进行中。
+    </p>
 
     <div class="section-head" style="margin-top:18px">
       <h3>最近事件理由</h3>
@@ -904,7 +908,7 @@
       recovering: ['恢复中', 'var(--blue)', 'testing'],
       probing:   ['试探中', 'var(--blue)', 'testing'],
       verifying: ['验证中', 'var(--blue)', 'testing'],
-      available: ['可尝试', 'var(--green)', ''],
+      restored:  ['已恢复', 'var(--green)', ''],
       unsupported: ['不支持', 'var(--muted)', 'unsupported']
     };
     const current = states[state] || states.unknown;
@@ -918,7 +922,7 @@
       recovering: '恢复中',
       probing: '试探中',
       verifying: '验证中',
-      available: '可尝试',
+      restored: '已恢复',
       unsupported: '不支持 1000 kbps'
     }[state] || '状态未知';
     bar.setAttribute('aria-label', aria);
@@ -1016,31 +1020,47 @@
       const peerKnown = peerCeiling > 0;
       const upperSupported = !!latest.boundary900To1000Supported;
       const probeState = phase === 'verifying' ? 'verifying' : 'probing';
-      const lowerTesting = (phase === 'probing' || phase === 'verifying') && ceiling === 900;
-      const upperTesting = (phase === 'probing' || phase === 'verifying') && ceiling === 1000;
+      const leakyCapKbps = number(latest.leakyFallbackCapKbps, 0);
+      // Most restrictive active protective cap (BQR or leaky bucket); 0 = none.
+      const activeCapKbps = bqrFallbackCapKbps > 0 && leakyCapKbps > 0
+        ? Math.min(bqrFallbackCapKbps, leakyCapKbps)
+        : Math.max(bqrFallbackCapKbps, leakyCapKbps);
+      const probing900 = (phase === 'probing' || phase === 'verifying') && ceiling === 900;
+      const probing1000 = (phase === 'probing' || phase === 'verifying') && ceiling === 1000;
+      // 500 -> 900 bar = status of the 900 tier (first match wins).
+      let lowerState;
+      if (peerKnown && peerCeiling <= 500) {
+        lowerState = 'unsupported';       // device max confirmed at 500
+      } else if (lowerLocked) {
+        lowerState = 'locked';            // learned boundary lock
+      } else if (probing900) {
+        lowerState = probeState;          // probe toward 900 in flight
+      } else if (activeCapKbps === 500) {
+        lowerState = 'recovering';        // 500->900 is the active recovery path
+      } else if (activeCapKbps === 400) {
+        lowerState = 'blocked';           // must recover 400->500 first
+      } else {
+        lowerState = 'restored';          // ceiling >= 900: the 900 tier is already there
+      }
+      // 900 -> 1000 bar = status of the 1000 tier (first match wins).
       let upperState;
       if (peerKnown && !upperSupported) {
-        upperState = 'unsupported';
+        upperState = 'unsupported';       // device max confirmed below 1000
       } else if (upperLocked) {
-        upperState = 'locked';
-      } else if (bqrFallbackCapKbps > 0) {
-        // Phase N-4: the 900 tier is itself recovering to 1000; only lower caps wait for
-        // the tier below to recover first.
-        upperState = bqrFallbackCapKbps >= 900 ? 'recovering' : 'blocked';
-      } else if (lowerLocked || lowerTesting) {
-        upperState = 'blocked';
-      } else if (upperTesting) {
-        upperState = probeState;
+        upperState = 'locked';            // learned boundary lock
+      } else if (activeCapKbps === 900) {
+        upperState = 'recovering';        // 900->1000 is the active recovery path
+      } else if (activeCapKbps === 500 || activeCapKbps === 400
+          || lowerLocked || probing900) {
+        upperState = 'blocked';           // must recover the 900 tier first
+      } else if (probing1000) {
+        upperState = probeState;          // probe toward 1000 in flight
       } else if (peerKnown && upperSupported) {
-        upperState = 'available';
+        upperState = 'restored';          // ceiling >= 1000: the 1000 tier is already there
       } else {
         upperState = 'unknown';
       }
-      // Phase N-4: a BQR fallback cap is a governor state, not a boundary lock — the
-      // 500->900 bar reflects only the learned boundary state, and the cap is already
-      // shown by the ceiling pill and the evidence text.
-      renderBoundary('boundary-500-900',
-        lowerLocked ? 'locked' : lowerTesting ? probeState : 'available');
+      renderBoundary('boundary-500-900', lowerState);
       renderBoundary('boundary-900-1000', upperState);
     }
     renderReasons(data.reasonCounts || {}, data.reasonTimes || {});
