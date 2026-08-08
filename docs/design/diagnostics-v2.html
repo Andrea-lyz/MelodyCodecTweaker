@@ -508,7 +508,8 @@
     </div>
     <p class="hint" style="margin-top:10px">
       已恢复 = 该档位当前可达；恢复中 = 正在积累健康窗口向该档恢复；
-      等待低档恢复 = 需先恢复低一档；已锁定 = 历史学习锁定的边界；试探中/验证中 = 升档试探进行中。
+      等待低档恢复 = 需先恢复低一档；已锁定 = 历史学习锁定的边界；
+      试探中/验证中 = 升档试探进行中；不支持 = 设备能力确认达不到该档。
     </p>
 
     <div class="section-head" style="margin-top:18px">
@@ -972,15 +973,22 @@
         choppyCapability === 'OBSERVED' ? '已观察到' : '未知',
         choppyCapability === 'OBSERVED' ? 'good' : 'idle');
       const bqrFallbackCapKbps = number(latest.bqrFallbackCapKbps, 0);
-      if (bqrFallbackCapKbps > 0) {
+      const leakyCapKbps = number(latest.leakyFallbackCapKbps, 0);
+      // Most restrictive active protective cap (BQR fallback or leaky bucket); 0 = none.
+      const activeCapKbps = bqrFallbackCapKbps > 0 && leakyCapKbps > 0
+        ? Math.min(bqrFallbackCapKbps, leakyCapKbps)
+        : Math.max(bqrFallbackCapKbps, leakyCapKbps);
+      if (activeCapKbps > 0) {
         // Phase N-4 tiered recovery (6.8.5): the evidence text follows the tier.
-        const tierText = bqrFallbackCapKbps <= 400
+        const tierText = activeCapKbps <= 400
           ? '连续 5 个健康窗口 + 30s 驻留'
-          : bqrFallbackCapKbps <= 500
+          : activeCapKbps <= 500
           ? '连续 6 个健康窗口 + 60s~5min 驻留（连续失败后递增）'
           : '连续 8 个健康窗口 + 2min 驻留';
+        const sourceText = bqrFallbackCapKbps > 0
+          ? 'BQR 保护' : '链路波动保护（漏桶）';
         byId('bqr-evidence').textContent =
-          '链路压力持续偏高，BQR 保护降档已生效，当前上限钳制在 ' + bqrFallbackCapKbps
+          sourceText + '降档已生效，当前上限钳制在 ' + activeCapKbps
           + ' kbps；需' + tierText + '后自动恢复。';
       } else if (retx > 60 || norx > 60 || unused > 49 || queueRatio >= 0.9) {
         byId('bqr-evidence').textContent =
@@ -1000,8 +1008,8 @@
         verifying: '正在验证',
         stable: '状态稳定'
       }[phase] || '状态更新中';
-      // BQR fallback: probePhase=stable but ceiling is capped below normal
-      if (phase === 'stable' && bqrFallbackCapKbps > 0 && ceiling <= bqrFallbackCapKbps) {
+      // Protective cap: probePhase=stable but ceiling is capped below normal
+      if (phase === 'stable' && activeCapKbps > 0 && ceiling <= activeCapKbps) {
         phaseLabel = '降档';
       }
       if (bitrateVerification === 'pending') phaseLabel = '正在验证';
@@ -1020,11 +1028,6 @@
       const peerKnown = peerCeiling > 0;
       const upperSupported = !!latest.boundary900To1000Supported;
       const probeState = phase === 'verifying' ? 'verifying' : 'probing';
-      const leakyCapKbps = number(latest.leakyFallbackCapKbps, 0);
-      // Most restrictive active protective cap (BQR or leaky bucket); 0 = none.
-      const activeCapKbps = bqrFallbackCapKbps > 0 && leakyCapKbps > 0
-        ? Math.min(bqrFallbackCapKbps, leakyCapKbps)
-        : Math.max(bqrFallbackCapKbps, leakyCapKbps);
       const probing900 = (phase === 'probing' || phase === 'verifying') && ceiling === 900;
       const probing1000 = (phase === 'probing' || phase === 'verifying') && ceiling === 1000;
       // 500 -> 900 bar = status of the 900 tier (first match wins).
