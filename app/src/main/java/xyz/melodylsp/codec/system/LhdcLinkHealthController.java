@@ -630,11 +630,21 @@ final class LhdcLinkHealthController {
                     // Phase N-3 transitional recovery: 6 healthy windows plus the base hold
                     // restore the rung. Phase 4 replaces this with the full asymmetric
                     // recovery (fast 400->500, long 500->900, strictest 900->1000).
-                    // Note (review P2-4): this uses strictlyHealthy (<=60/s) which is wider
-                    // than the bqrFallback recovery evidence (retx<24/noRx<21); the single-
-                    // rung cap is intentionally easier to leave. Phase 4 unifies the evidence.
-                    state.leakyFallbackHealthyWindows =
-                            strictlyHealthy ? state.leakyFallbackHealthyWindows + 1 : 0;
+                    // Phase 3 device fix (feedback 205714): recovery evidence is aligned with
+                    // the BQR fallback recovery (retx<24 && noRx<21, no AFH gate). The earlier
+                    // strictlyHealthy gate required unusedAfh<=49, which X3 never meets
+                    // (AFH 51-54 in normal use) and stranded the 900 rung forever.
+                    if (streaming && legalWindow) {
+                        // Only decision-eligible windows participate (review P2-1): a
+                        // suspended or illegal window keeps the streak instead of resetting
+                        // it, matching the BQR fallback early-return semantics.
+                        state.leakyFallbackHealthyWindows =
+                                state.retransmissionsPerSecond
+                                                < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
+                                        && state.noRxPerSecond
+                                                < BQR_FALLBACK_HEALTHY_NO_RX_PER_SEC
+                                ? state.leakyFallbackHealthyWindows + 1 : 0;
+                    }
                     if (state.leakyFallbackHealthyWindows >= BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS
                             && nowMs - state.leakyFallbackSinceMs >= BQR_FALLBACK_HOLD_MS[0]) {
                         state.leakyFallbackCapKbps = 0;
