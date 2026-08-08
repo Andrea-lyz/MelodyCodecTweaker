@@ -602,6 +602,51 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
+    public void midTierCountsRelaxedNoRxButKeepsRetxAndOneSidedHotGates() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
+        assertEquals(500, controller.snapshot(MAC, 10_000L).ceilingKbps);
+
+        // Decision 44 (feedback 233639): X3-family noRx 21-25 windows now count for the
+        // 500->900 tier; retx stays strict <24 and a one-sided hot noRx >= 25 resets.
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 26_000L + i * 6_000L);  // 32..62
+        }
+        assertEquals(500, controller.snapshot(MAC, 62_000L).ceilingKbps);  // hold not elapsed
+        for (int i = 7; i <= 9; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 26_000L + i * 6_000L);  // 68..80
+        }
+        assertEquals(900, controller.snapshot(MAC, 80_000L).ceilingKbps);  // hold done at 70s
+        // 74s window: 8 consecutive relaxed windows (32..74), hold (10s trigger + 60s) elapsed.
+        assertTrue(recorder.fallbackEvents.contains("900:recovered:0:8"));
+
+        // One-sided hot noRx (23/26) resets the streak even after the hold.
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 100_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 110_000L);  // baseline
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 116_000L + i * 6_000L);  // 122..152
+        }
+        controller.onBqrSample(MAC, oneSidedNoRxBqr(), 158_000L);  // resets streak
+        assertEquals(500, controller.snapshot(MAC, 164_000L).ceilingKbps);
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 164_000L + i * 6_000L);  // 170..200
+        }
+        assertEquals(900, controller.snapshot(MAC, 200_000L).ceilingKbps);  // hold from 100s
+
+        // retx >= 24 still resets for the mid tier (strict <24 gate kept): the X3
+        // mid-band 26/23 sample counts for the strict 900 tier but not for 500->900.
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 220_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 230_000L);  // baseline
+        for (int i = 1; i <= 10; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 236_000L + i * 6_000L);  // 242..296
+        }
+        assertEquals(500, controller.snapshot(MAC, 296_000L).ceilingKbps);
+    }
+
+    @Test
     public void bqrFallbackSingleBadWindowDoesNotClamp() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
@@ -1887,6 +1932,18 @@ public final class LhdcLinkHealthControllerTest {
     private static LhdcLinkHealthController.BqrSample midBandBqr() {
         return new LhdcLinkHealthController.BqrSample(
                 30, 0, 156, 138, 0, -45, 10, 0, 0);
+    }
+
+    /** 6 s window: retx 23.0/noRx 23.0 — decision 44 relaxed band for the 500->900 tier. */
+    private static LhdcLinkHealthController.BqrSample midTierRelaxedBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, 138, 138, 0, -45, 10, 0, 0);
+    }
+
+    /** 6 s window: retx 23.0/noRx 26.0 — one-sided hot noRx: never recovery evidence. */
+    private static LhdcLinkHealthController.BqrSample oneSidedNoRxBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, 138, 156, 0, -45, 10, 0, 0);
     }
 
     /** 6 s window: retx=32/noRx=10 — single-sided hot: not a bad window, not recovery. */
