@@ -217,10 +217,6 @@ final class NativeLhdcMemoryPatch {
     private static final AtomicInteger GOVERNOR_REQUEST_COUNTER = new AtomicInteger();
     private static volatile int lastIssuedGovernorRequestId;
 
-    static int lastIssuedGovernorRequestId() {
-        return lastIssuedGovernorRequestId;
-    }
-
     /** requestId 0 means the event is not bound to a Java request (native init path). */
     static boolean isGovernorEventCurrent(GovernorEvent event) {
         if (event == null || event.requestId == 0) return true;
@@ -238,7 +234,30 @@ final class NativeLhdcMemoryPatch {
         return desiredGovernorProbeCeilingKbps;
     }
 
-    static synchronized void setGovernorProbeCeilingKbps(int ceilingKbps) {
+    /** Last rung actually applied to native (0 = unknown). Guards against same-value re-writes
+     *  that would open a phantom transaction with no native event to confirm it. */
+    private static volatile int lastAppliedGovernorTargetKbps;
+
+    /**
+     * Applies a Target_Cap write and returns the requestId of the new transaction, or 0 when
+     * nothing was issued (governor unavailable, or the same rung is already applied). Callers
+     * only register a switch transaction when the return value is &gt; 0.
+     */
+    static synchronized int setGovernorProbeCeilingKbps(int ceilingKbps) {
+        return setGovernorProbeCeilingKbpsInternal(ceilingKbps, true);
+    }
+
+    /**
+     * Bypass writes (peer-ceiling sync, session cleanup, policy broadcast) must not advance the
+     * transaction id: an in-flight controller transaction keeps its id so its events stay
+     * confirmable, and no phantom transaction is registered.
+     */
+    static synchronized int setGovernorProbeCeilingKbpsQuiet(int ceilingKbps) {
+        return setGovernorProbeCeilingKbpsInternal(ceilingKbps, false);
+    }
+
+    private static int setGovernorProbeCeilingKbpsInternal(
+            int ceilingKbps, boolean transaction) {
         int previous = cacheDesiredGovernorProbeCeilingKbps(ceilingKbps);
         int normalized = desiredGovernorProbeCeilingKbps;
         if (!governorInstalled && !installGovernor()) {
@@ -247,31 +266,42 @@ final class NativeLhdcMemoryPatch {
                     "ceilingKbps", normalized,
                     "previousKbps", previous,
                     "reason", "governor_not_installed");
-            return;
+            return 0;
         }
-        if (!governorInstalled) return;
+        if (!governorInstalled) return 0;
+        if (normalized == lastAppliedGovernorTargetKbps) {
+            // Same rung already applied: native set_rate would be a no-op and emit no
+            // TRANSITION_APPLIED, so a transaction opened here could never be confirmed.
+            MLog.event("lhdc.governor.ceiling_unchanged",
+                    "ceilingKbps", normalized,
+                    "previousKbps", previous);
+            return 0;
+        }
         try {
-            int requestId = GOVERNOR_REQUEST_COUNTER.incrementAndGet();
-            lastIssuedGovernorRequestId = requestId;
+            int requestId = transaction ? GOVERNOR_REQUEST_COUNTER.incrementAndGet() : 0;
+            if (transaction) lastIssuedGovernorRequestId = requestId;
             nativeSetGovernorTargetKbps(normalized, requestId);
+            lastAppliedGovernorTargetKbps = normalized;
             MLog.event("lhdc.governor.ceiling_applied",
                     "ceilingKbps", normalized,
                     "previousKbps", previous,
                     "requestId", requestId);
+            return requestId;
         } catch (Throwable t) {
             MLog.w("lhdc governor probe ceiling update failed", t);
+            return 0;
         }
     }
 
     private static void replayGovernorProbeCeiling() {
         int ceilingKbps = desiredGovernorProbeCeilingKbps;
         try {
-            int requestId = GOVERNOR_REQUEST_COUNTER.incrementAndGet();
-            lastIssuedGovernorRequestId = requestId;
-            nativeSetGovernorTargetKbps(ceilingKbps, requestId);
-            MLog.event("lhdc.governor.ceiling_replayed_after_install",
-                    "ceilingKbps", ceilingKbps,
-                    "requestId", requestId);
+            int requestId = setGovernorProbeCeilingKbpsInternal(ceilingKbps, true);
+            if (requestId > 0) {
+                MLog.event("lhdc.governor.ceiling_replayed_after_install",
+                        "ceilingKbps", ceilingKbps,
+                        "requestId", requestId);
+            }
         } catch (Throwable t) {
             MLog.w("lhdc governor probe ceiling replay failed", t);
         }

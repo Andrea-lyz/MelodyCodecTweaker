@@ -936,6 +936,17 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
+    public void zeroRequestIdIssueIsIgnoredWithoutTransaction() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        // Same-rung or governor-unavailable writes return requestId 0; they must not open
+        // a transaction that could never be confirmed (Phase N-1 review P1-1/P2-5).
+        controller.onTargetCapIssued(MAC, 500, 0, 1_000L);
+        assertNull(controller.tickSwitchTransactions(MAC, 10_000L));
+    }
+
+    @Test
     public void matchingTransitionConfirmationClosesTransactionBeforeTimeout() {
         LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
         controller.activate(MAC, 100L);

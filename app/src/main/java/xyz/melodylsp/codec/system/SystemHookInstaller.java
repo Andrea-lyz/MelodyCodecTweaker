@@ -402,13 +402,16 @@ public final class SystemHookInstaller {
     }
 
     private void handleProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
-        NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+        int requestId = NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
         // Phase N-1 requestId transaction: register the issued Target_Cap so native
         // confirmations with the same requestId close the switch and timeouts fall back
-        // to the getter.
-        linkHealthController.onTargetCapIssued(
-                mac, ceilingKbps, NativeLhdcMemoryPatch.lastIssuedGovernorRequestId(),
-                SystemClock.elapsedRealtime());
+        // to the getter. requestId == 0 means nothing was written (governor unavailable or the
+        // same rung already applied): no transaction, no phantom timeout.
+        if (requestId > 0) {
+            linkHealthController.onTargetCapIssued(
+                    mac, NativeLhdcMemoryPatch.currentDesiredGovernorProbeCeilingKbps(),
+                    requestId, SystemClock.elapsedRealtime());
+        }
         MLog.event("lhdc.link.probe_ceiling",
                 "mac", redactMac(mac),
                 "ceilingKbps", ceilingKbps,
@@ -869,7 +872,9 @@ public final class SystemHookInstaller {
         boolean nativeApplied = key.equals(activeLhdcMac)
                 || key.equals(linkHealthController.activeMac());
         if (nativeApplied) {
-            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(normalizedCeiling);
+            // Bypass write: capability sync must not advance the transaction id of an
+            // in-flight controller decision (Phase N-1 decision 33).
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(normalizedCeiling);
         }
         MLog.event("lhdc.link.peer_ceiling_sync",
                 "mac", redactMac(key),
@@ -891,7 +896,7 @@ public final class SystemHookInstaller {
         if (cached != null && cached > 0) {
             linkHealthController.setPeerCeilingKbps(
                     key, cached, SystemClock.elapsedRealtime(), "bqr_activate");
-            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(cached);
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(cached);
             MLog.event("lhdc.link.peer_ceiling_restored",
                     "mac", redactMac(key),
                     "ceilingKbps", cached,
@@ -931,7 +936,7 @@ public final class SystemHookInstaller {
                 key, SystemClock.elapsedRealtime(), reason);
         if (nativeSessionActive) activeLhdcMac = null;
         if (nativeSessionActive && !controllerWasActive) {
-            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(1000);
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(1000);
         }
         if (nativeSessionActive || controllerWasActive) {
             MLog.event("lhdc.link.session_reset",
@@ -1061,7 +1066,7 @@ public final class SystemHookInstaller {
             // already 900 (or the queried stack config) instead of a 1000 flash.
             if (!restorePeerCeilingForActive(mac)) {
                 // Do not leak a previous headset's 900 ceiling into an unknown new device.
-                NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(1000);
+                NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(1000);
                 MLog.event("lhdc.link.peer_ceiling_restored",
                         "mac", redactMac(mac),
                         "ceilingKbps", 1000,
@@ -1458,19 +1463,22 @@ public final class SystemHookInstaller {
                         if (NativeLhdcMemoryPatch.isGovernorStreaming()) {
                             linkHealthController.onQueueSample(
                                     mac, length, LHDC_QUEUE_CAPACITY, nowMs);
-                        }
-                        LhdcLinkHealthController.PendingTransaction switchTimedOut =
-                                linkHealthController.tickSwitchTransactions(mac, nowMs);
-                        if (switchTimedOut != null) {
-                            MLog.event("lhdc.governor.switch_timeout",
-                                    "mac", redactMac(mac),
-                                    "targetKbps", switchTimedOut.targetKbps,
-                                    "requestId", switchTimedOut.requestId,
-                                    "sinceMs", switchTimedOut.sinceMs,
-                                    "actualBitrateKbps",
-                                    NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
-                                    "bitrateVerification",
-                                    NativeLhdcMemoryPatch.currentGovernorVerification());
+                            // Transactions can only be confirmed while the native sampler runs;
+                            // when streaming is suspended no event can arrive, so defer the
+                            // timeout check instead of reporting a getter=0 phantom timeout.
+                            LhdcLinkHealthController.PendingTransaction switchTimedOut =
+                                    linkHealthController.tickSwitchTransactions(mac, nowMs);
+                            if (switchTimedOut != null) {
+                                MLog.event("lhdc.governor.switch_timeout",
+                                        "mac", redactMac(mac),
+                                        "targetKbps", switchTimedOut.targetKbps,
+                                        "requestId", switchTimedOut.requestId,
+                                        "sinceMs", switchTimedOut.sinceMs,
+                                        "actualBitrateKbps",
+                                        NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                                        "bitrateVerification",
+                                        NativeLhdcMemoryPatch.currentGovernorVerification());
+                            }
                         }
                         if (event != null) {
                             LhdcLinkHealthController.Snapshot snapshot =

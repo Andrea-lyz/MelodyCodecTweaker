@@ -124,7 +124,7 @@ public final class CodecBroadcastBridge {
                 if (ceilingKbps > 0) {
                     // Cache and apply the peer ceiling even when the governor is not installed
                     // yet; the desired value is replayed after a later successful install.
-                    NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+                    NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(ceilingKbps);
                 }
                 boolean applied = NativeLhdcMemoryPatch.setGovernorPolicy(policy);
                 if (applied) scheduleGovernorInstallRetries();
