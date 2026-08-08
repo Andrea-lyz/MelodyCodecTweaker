@@ -201,6 +201,33 @@ public final class SystemHookInstaller {
                                 "noRxPerSec", rateText(noRxPerSecond),
                                 "nowMs", nowMs);
                     }
+
+                    @Override
+                    public void onShadowTrigger(
+                            String mac,
+                            String kind,
+                            int fromKbps,
+                            int toKbps,
+                            long nowMs,
+                            double retransmissionsPerSecond,
+                            double noRxPerSecond,
+                            int queueLength,
+                            long queueHighAccumMs,
+                            int choppyCount5s,
+                            String snapshot) {
+                        // Phase N-3 shadow sentinels: calibration evidence only, never applied.
+                        MLog.event("lhdc.link.shadow_trigger",
+                                "mac", redactMac(mac),
+                                "kind", kind,
+                                "fromKbps", fromKbps,
+                                "toKbps", toKbps,
+                                "retxPerSec", rateText(retransmissionsPerSecond),
+                                "noRxPerSec", rateText(noRxPerSecond),
+                                "queue", queueLength,
+                                "queueHighAccumMs", queueHighAccumMs,
+                                "choppyCount5s", choppyCount5s,
+                                "snapshot", snapshot);
+                    }
                 });
     }
 

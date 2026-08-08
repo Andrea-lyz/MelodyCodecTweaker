@@ -1,6 +1,7 @@
 package xyz.melodylsp.codec.system;
 
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 
 import xyz.melodylsp.codec.BuildConfig;
@@ -99,6 +100,29 @@ final class LhdcLinkHealthController {
      */
     static final long[] BQR_FALLBACK_HOLD_MS = {60_000L, 120_000L, 300_000L};
     static final long BQR_FALLBACK_SUCCESS_WINDOW_MS = 2 * 60_000L;
+
+    // Phase N-3 leaky bucket (6.8.3/6.8.9): the deduped choppy soft signal integrates at
+    // +10 per event with a linear -0.5/s decay; threshold 15 ≈ 2 events within ~8-10 s
+    // (calibrated from the 05:44:34/42 double-burst evidence). Filling downgrades one rung.
+    static final double LEAKY_BUCKET_FILL_PER_EVENT = 10.0;
+    static final double LEAKY_BUCKET_DECAY_PER_SEC = 0.5;
+    static final double LEAKY_BUCKET_THRESHOLD = 15.0;
+
+    // Phase N-3 8 s leap window (6.8.3): a consistent triple alignment (deduped choppy +
+    // sustained high queue + BQR bad window, queue not draining) within 8 s would cross
+    // 1000 -> 500 on A devices. Shadow-first: candidates are logged, never applied.
+    static final long LEAP_LOOKBACK_MS = 8_000L;
+    static final long LEAP_QUEUE_HIGH_ACCUM_MS = 300L;
+    static final int LEAP_QUEUE_HIGH_THRESHOLD = 40;
+
+    // Phase N-3 disaster circuit breaker (6.8.3): noRx >= 110/s (single valid window) AND
+    // local queue >= 90% for >= 300 ms is a physical block -> 1000->400; retx >= 110/s with
+    // low noRx -> 1000->500 (semantic split). No real 110/s samples exist yet, so this runs
+    // as a shadow sentinel: hit line + 10 s snapshot, no action.
+    static final double DISASTER_NO_RX_PER_SEC = 110.0;
+    static final double DISASTER_RETX_PER_SEC = 110.0;
+    static final int DISASTER_SNAPSHOT_WINDOWS = 4;
+    static final long DISASTER_SHADOW_COOLDOWN_MS = 15_000L;
     /**
      * Queue fast-fail (2026-08-07, probe window only). Calibrated from X3 healthy sessions
      * (sampled queue p99 <= 36, max 40) versus Buds Ace 3 bad 900 phases (queue pegged at 45
@@ -150,6 +174,24 @@ final class LhdcLinkHealthController {
                 double retransmissionsPerSecond,
                 double noRxPerSecond,
                 long nowMs) {
+        }
+
+        /**
+         * Phase N-3: a shadow-only decision fired (kind = leap_8s / disaster_noRx / disaster_retx).
+         * The controller never applies the downgrade; implementations only log for calibration.
+         */
+        default void onShadowTrigger(
+                String mac,
+                String kind,
+                int fromKbps,
+                int toKbps,
+                long nowMs,
+                double retransmissionsPerSecond,
+                double noRxPerSecond,
+                int queueLength,
+                long queueHighAccumMs,
+                int choppyCount5s,
+                String snapshot) {
         }
     }
 
@@ -384,6 +426,24 @@ final class LhdcLinkHealthController {
         long postSwitchGuardUntilMs;
         /** Count of decision-eligible (valid interval) BQR windows since the last session reset. */
         int validBqrWindowCount;
+        // Phase N-3 leaky bucket state.
+        double choppyBucket;
+        long choppyBucketLastDecayMs;
+        int leakyFallbackCapKbps;
+        long leakyFallbackSinceMs;
+        int leakyFallbackHealthyWindows;
+        // Phase N-3 8 s leap window state (shadow): high-queue accumulation is sampled on the
+        // 200 ms queue tick, so only continuous segments accumulate.
+        long lastQueueSampleMs;
+        long queueHighAccumMs;
+        long lastQueueHighMs;
+        long lastLeapShadowMs;
+        // Phase N-3 disaster shadow: rolling BQR snapshot for the 10 s pre-trigger record.
+        final double[] bqrSnapshotRetx = new double[DISASTER_SNAPSHOT_WINDOWS];
+        final double[] bqrSnapshotNoRx = new double[DISASTER_SNAPSHOT_WINDOWS];
+        final long[] bqrSnapshotTimes = new long[DISASTER_SNAPSHOT_WINDOWS];
+        int bqrSnapshotIndex;
+        long lastDisasterShadowMs;
     }
 
     private final Map<String, DeviceState> devices = new HashMap<>();
@@ -463,6 +523,10 @@ final class LhdcLinkHealthController {
             state.bqrFallbackRecoveredMs = 0L;
             state.bqrFastFailUntilMs = nowMs + BQR_FAST_FAIL_PROBE_WINDOW_MS;
             state.bqrFastFailQueueSinceMs = 0L;
+            // A user codec write is an explicit attempt: drop any active leaky-bucket cap
+            // the same way the BQR fallback cap is dropped.
+            state.leakyFallbackCapKbps = 0;
+            state.leakyFallbackHealthyWindows = 0;
         }
         if (ceilingKbps <= 900) {
             if (state.to1000.probeInFlight) {
@@ -552,6 +616,22 @@ final class LhdcLinkHealthController {
             state.healthyBqrWindows = strictlyHealthy ? state.healthyBqrWindows + 1 : 0;
             if (BuildConfig.LHDC_BQR_FALLBACK) {
                 evaluateBqrFallback(mac, state, nowMs, streaming, legalWindow);
+                recordBqrSnapshot(state, nowMs);
+                evaluateDisasterShadow(mac, state, nowMs);
+                if (state.leakyFallbackCapKbps > 0) {
+                    // Phase N-3 transitional recovery: 6 healthy windows plus the base hold
+                    // restore the rung. Phase 4 replaces this with the full asymmetric
+                    // recovery (fast 400->500, long 500->900, strictest 900->1000).
+                    state.leakyFallbackHealthyWindows =
+                            strictlyHealthy ? state.leakyFallbackHealthyWindows + 1 : 0;
+                    if (state.leakyFallbackHealthyWindows >= BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS
+                            && nowMs - state.leakyFallbackSinceMs >= BQR_FALLBACK_HOLD_MS[0]) {
+                        state.leakyFallbackCapKbps = 0;
+                        state.leakyFallbackHealthyWindows = 0;
+                        publishCeiling(mac, state, "leaky_bucket_recovered", nowMs);
+                    }
+                }
+                evaluateLeapWindow(mac, state, nowMs);
             }
 
             BoundaryState probe = inFlightBoundary(state);
@@ -652,6 +732,23 @@ final class LhdcLinkHealthController {
         }
         if (BuildConfig.LHDC_BQR_FALLBACK) {
             evaluateBqrQueueFastFail(mac, state, length, nowMs);
+            // Phase N-3: 8 s leap window accumulates sustained high queue (continuous
+            // segments only, so the startup fill-and-drain transient cannot accumulate).
+            if (state.lastQueueSampleMs != 0L) {
+                long gapMs = nowMs - state.lastQueueSampleMs;
+                if (length >= LEAP_QUEUE_HIGH_THRESHOLD) {
+                    if (gapMs <= 1_000L) {
+                        state.queueHighAccumMs += gapMs;
+                    } else {
+                        state.queueHighAccumMs = 0L;
+                    }
+                    state.lastQueueHighMs = nowMs;
+                } else if (gapMs > LEAP_LOOKBACK_MS) {
+                    state.queueHighAccumMs = 0L;
+                }
+            }
+            state.lastQueueSampleMs = nowMs;
+            decayLeakyBucket(state, nowMs);
         }
         if (mac.equals(activeMac)) maybeOpenRecoveryProbe(mac, state, nowMs);
     }
@@ -689,6 +786,13 @@ final class LhdcLinkHealthController {
             // count as congestion. Hard evidence paths (queue fast-fail, Phase 3 disaster)
             // are not blocked here.
             return;
+        }
+        if (BuildConfig.LHDC_BQR_FALLBACK) {
+            // Phase N-3 leaky bucket: decay first, then fill (+10 per deduped event). A full
+            // bucket downgrades one rung (decision 30 keeps choppy independently effective).
+            decayLeakyBucket(state, nowMs);
+            state.choppyBucket += LEAKY_BUCKET_FILL_PER_EVENT;
+            evaluateLeakyBucket(mac, state, nowMs);
         }
         onCongestion(mac, nowMs);
     }
@@ -977,6 +1081,9 @@ final class LhdcLinkHealthController {
         if (state.bqrFallbackCapKbps > 0 && state.bqrFallbackCapKbps < ceiling) {
             ceiling = state.bqrFallbackCapKbps;
         }
+        if (state.leakyFallbackCapKbps > 0 && state.leakyFallbackCapKbps < ceiling) {
+            ceiling = state.leakyFallbackCapKbps;
+        }
         return ceiling;
     }
 
@@ -1064,6 +1171,140 @@ final class LhdcLinkHealthController {
             publishCeiling(mac, state, "bqr_fallback_recovered", nowMs);
             notifyBqrFallback(mac, state, "recovered", 0, windows);
         }
+    }
+
+    /**
+     * Phase N-3 leaky bucket: linear decay -0.5/s, driven by choppy events and the 200 ms
+     * queue tick so a burst that stops decays back to zero instead of lingering.
+     */
+    private void decayLeakyBucket(DeviceState state, long nowMs) {
+        if (state.choppyBucket <= 0.0) {
+            state.choppyBucket = 0.0;
+            state.choppyBucketLastDecayMs = nowMs;
+            return;
+        }
+        if (state.choppyBucketLastDecayMs == 0L) {
+            state.choppyBucketLastDecayMs = nowMs;
+            return;
+        }
+        long elapsedMs = nowMs - state.choppyBucketLastDecayMs;
+        if (elapsedMs <= 0L) return;
+        state.choppyBucket = Math.max(0.0,
+                state.choppyBucket - elapsedMs / 1000.0 * LEAKY_BUCKET_DECAY_PER_SEC);
+        state.choppyBucketLastDecayMs = nowMs;
+    }
+
+    /**
+     * Phase N-3 leaky bucket trigger: a full bucket downgrades one rung (1000 -> 900, or
+     * 900 -> 500 on a peer-capped device). 400 stays reserved for the disaster tier. The
+     * transitional recovery (healthy windows + base hold) lives in onBqrSample; Phase 4
+     * replaces it with the full asymmetric recovery.
+     */
+    private void evaluateLeakyBucket(String mac, DeviceState state, long nowMs) {
+        if (state.choppyBucket < LEAKY_BUCKET_THRESHOLD) return;
+        if (state.leakyFallbackCapKbps > 0) return;
+        int ceiling = effectiveCeiling(state);
+        if (ceiling <= 500) return;
+        int target = ceiling >= 1000 ? 900 : 500;
+        state.leakyFallbackCapKbps = target;
+        state.leakyFallbackSinceMs = nowMs;
+        state.leakyFallbackHealthyWindows = 0;
+        state.choppyBucket = 0.0;
+        publishCeiling(mac, state, "leaky_bucket_triggered", nowMs);
+    }
+
+    private void recordBqrSnapshot(DeviceState state, long nowMs) {
+        int i = state.bqrSnapshotIndex % DISASTER_SNAPSHOT_WINDOWS;
+        state.bqrSnapshotTimes[i] = nowMs;
+        state.bqrSnapshotRetx[i] = state.retransmissionsPerSecond;
+        state.bqrSnapshotNoRx[i] = state.noRxPerSecond;
+        state.bqrSnapshotIndex++;
+    }
+
+    /**
+     * Phase N-3 disaster circuit breaker (shadow sentinel): noRx >= 110/s AND queue >= 90%
+     * for >= 300 ms -> 1000->400 (receiver deaf); retx >= 110/s with low noRx -> 1000->500
+     * (still talking). No real 110/s samples exist, so this only hits the line and records
+     * the pre-trigger snapshot for threshold calibration.
+     */
+    private void evaluateDisasterShadow(String mac, DeviceState state, long nowMs) {
+        if (state.bqrSnapshotIndex == 0) return;
+        if (state.lastDisasterShadowMs != 0L
+                && nowMs - state.lastDisasterShadowMs < DISASTER_SHADOW_COOLDOWN_MS) return;
+        boolean queueSustainedCritical = state.criticalQueueSinceMs != 0L
+                && nowMs - state.criticalQueueSinceMs >= CRITICAL_QUEUE_HOLD_MS;
+        if (!queueSustainedCritical) return;
+        if (effectiveCeiling(state) < 1000) return;
+        String kind = null;
+        int toKbps = 0;
+        if (state.noRxPerSecond >= DISASTER_NO_RX_PER_SEC) {
+            kind = "disaster_noRx";
+            toKbps = 400;
+        } else if (state.retransmissionsPerSecond >= DISASTER_RETX_PER_SEC
+                && state.noRxPerSecond < BQR_FALLBACK_BAD_NO_RX_PER_SEC) {
+            kind = "disaster_retx";
+            toKbps = 500;
+        }
+        if (kind == null) return;
+        state.lastDisasterShadowMs = nowMs;
+        if (listener != null) {
+            listener.onShadowTrigger(
+                    mac, kind, 1000, toKbps, nowMs,
+                    state.retransmissionsPerSecond, state.noRxPerSecond,
+                    state.currentQueueLength, state.queueHighAccumMs,
+                    remoteChoppyCount5s(state, nowMs),
+                    bqrSnapshotText(state, nowMs));
+        }
+    }
+
+    /**
+     * Phase N-3 8 s leap window (shadow-first): a BQR bad window aligned within 8 s with a
+     * deduped choppy event AND >= 300 ms of sustained high queue AND the queue still not
+     * draining would cross 1000 -> 500 on A devices. Only logged for calibration.
+     */
+    private void evaluateLeapWindow(String mac, DeviceState state, long nowMs) {
+        if (nowMs < state.startGuardUntilMs) return;
+        if (state.lastLeapShadowMs != 0L
+                && nowMs - state.lastLeapShadowMs < SHADOW_CANDIDATE_COOLDOWN_MS) return;
+        double retx = state.retransmissionsPerSecond;
+        double noRx = state.noRxPerSecond;
+        if (Double.isNaN(retx) || Double.isNaN(noRx)) return;
+        if (retx < BQR_FALLBACK_BAD_RETX_PER_SEC || noRx < BQR_FALLBACK_BAD_NO_RX_PER_SEC) return;
+        if (effectiveCeiling(state) < 1000) return;  // A devices only
+        long choppyAgoMs = state.lastRemoteChoppyMs == 0L
+                ? -1L : nowMs - state.lastRemoteChoppyMs;
+        boolean choppyRecent = choppyAgoMs >= 0L && choppyAgoMs <= LEAP_LOOKBACK_MS;
+        boolean queueHighRecent = state.queueHighAccumMs >= LEAP_QUEUE_HIGH_ACCUM_MS
+                && state.lastQueueHighMs != 0L
+                && nowMs - state.lastQueueHighMs <= 2_000L;
+        boolean queueNotDraining = state.currentQueueLength >= LEAP_QUEUE_HIGH_THRESHOLD;
+        if (!choppyRecent || !queueHighRecent || !queueNotDraining) return;
+        state.lastLeapShadowMs = nowMs;
+        if (listener != null) {
+            listener.onShadowTrigger(
+                    mac, "leap_8s", 1000, 500, nowMs, retx, noRx,
+                    state.currentQueueLength, state.queueHighAccumMs,
+                    remoteChoppyCount5s(state, nowMs), "");
+        }
+    }
+
+    private static int remoteChoppyCount5s(DeviceState state, long nowMs) {
+        return state.remoteChoppyWindowStartMs != 0L
+                && nowMs - state.remoteChoppyWindowStartMs <= 5_000L
+                ? state.remoteChoppyCount : 0;
+    }
+
+    private String bqrSnapshotText(DeviceState state, long nowMs) {
+        StringBuilder sb = new StringBuilder();
+        int count = Math.min(state.bqrSnapshotIndex, DISASTER_SNAPSHOT_WINDOWS);
+        for (int i = 0; i < count; i++) {
+            int idx = (state.bqrSnapshotIndex - count + i) % DISASTER_SNAPSHOT_WINDOWS;
+            if (sb.length() > 0) sb.append(';');
+            sb.append(String.format(Locale.ROOT, "r%.1f/n%.1f@%d",
+                    state.bqrSnapshotRetx[idx], state.bqrSnapshotNoRx[idx],
+                    state.bqrSnapshotTimes[idx]));
+        }
+        return sb.toString();
     }
 
     private void triggerBqrFallback(
@@ -1166,7 +1407,11 @@ final class LhdcLinkHealthController {
     private static void noteCongestion(DeviceState state, long nowMs) {
         state.lastCongestionMs = nowMs;
         state.lowQueueSinceMs = 0L;
-        state.criticalQueueSinceMs = 0L;
+        // Phase N-3: do NOT reset the sustained-critical timer here. Congestion events
+        // (choppy, full queue) are exactly the conditions the disaster circuit breaker
+        // needs to keep accumulating; the timer is queue-driven and reset only when the
+        // queue leaves the critical band or the stream idles (review: pre-existing bug
+        // exposed by the Phase 3 disaster path).
         state.healthyBqrWindows = 0;
         state.healthyDecaySinceMs = 0L;
     }
@@ -1265,6 +1510,17 @@ final class LhdcLinkHealthController {
         state.startGuardUntilMs = nowMs + START_GUARD_MS;
         state.postSwitchGuardUntilMs = 0L;
         state.validBqrWindowCount = 0;
+        state.choppyBucket = 0;
+        state.choppyBucketLastDecayMs = nowMs;
+        state.leakyFallbackCapKbps = 0;
+        state.leakyFallbackSinceMs = 0L;
+        state.leakyFallbackHealthyWindows = 0;
+        state.lastQueueSampleMs = 0L;
+        state.queueHighAccumMs = 0L;
+        state.lastQueueHighMs = 0L;
+        state.lastLeapShadowMs = 0L;
+        state.bqrSnapshotIndex = 0;
+        state.lastDisasterShadowMs = 0L;
         state.lastBqrMs = 0L;
         state.lastValidBqrMs = 0L;
         state.healthyBqrWindows = 0;

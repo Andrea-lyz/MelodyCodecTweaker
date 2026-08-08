@@ -1159,6 +1159,127 @@ public final class LhdcLinkHealthControllerTest {
         assertTrue(recorder.skippedBqrWindows.contains("suspect_invalid"));
     }
 
+    @Test
+    public void leakyBucketFillsAndDowngradesOneRung() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        // Two deduped choppy events 8 s apart: 10 -> (10 - 4) + 10 = 16 >= 15 -> 1000 -> 900.
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        assertEquals(1000, controller.snapshot(MAC, 16_000L).ceilingKbps);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);
+        assertEquals(900, controller.snapshot(MAC, 24_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("900:leaky_bucket_triggered"));
+    }
+
+    @Test
+    public void leakyBucketDecaysBelowThresholdWithoutTrigger() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);  // +10
+        controller.onRemoteChoppyReport(MAC, 1, 40_000L);  // 24 s decay -> 0, then +10 < 15
+        assertEquals(1000, controller.snapshot(MAC, 40_000L).ceilingKbps);
+    }
+
+    @Test
+    public void leakyBucketOnPeerCappedDeviceTargets500() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);
+        assertEquals(500, controller.snapshot(MAC, 24_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("500:leaky_bucket_triggered"));
+    }
+
+    @Test
+    public void leakyBucketRecoversAfterHealthyWindowsAndHold() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);
+        assertEquals(900, controller.snapshot(MAC, 24_000L).ceilingKbps);
+
+        // 7 healthy windows (36..78 s): 6 complete by 66 s but the 60 s hold from the
+        // trigger (24 s) has not elapsed, so the cap stays.
+        for (int i = 1; i <= 7; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 30_000L + i * 6_000L);
+        }
+        assertEquals(900, controller.snapshot(MAC, 78_000L).ceilingKbps);
+
+        // The 84 s window satisfies both the hold and the healthy-window count.
+        for (int i = 8; i <= 9; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 30_000L + i * 6_000L);
+        }
+        assertEquals(1000, controller.snapshot(MAC, 84_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("1000:leaky_bucket_recovered"));
+    }
+
+    @Test
+    public void leap8sShadowFiresButKeepsCeiling() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);   // baseline
+        controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L);   // bad, no choppy yet
+        controller.onRemoteChoppyReport(MAC, 1, 17_000L);         // choppy within 8 s window
+        controller.onQueueSample(MAC, 45, 45, 21_500L);           // high-queue segment starts
+        controller.onQueueSample(MAC, 45, 45, 21_700L);
+        controller.onQueueSample(MAC, 45, 45, 21_900L);           // >= 300 ms accumulated
+        controller.onBqrSample(MAC, bqrFallbackBad(), 22_000L);   // aligned -> shadow fires
+
+        assertTrue(recorder.shadowTriggers.contains("leap_8s:1000:500"));
+        assertEquals(1000, controller.snapshot(MAC, 22_000L).ceilingKbps);
+    }
+
+    @Test
+    public void disasterNoRxShadowFiresWithSnapshotButKeepsCeiling() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);       // baseline
+        controller.onQueueSample(MAC, 45, 45, 15_000L);           // critical queue
+        controller.onQueueSample(MAC, 45, 45, 15_300L);           // >= 300 ms
+        controller.onBqrSample(MAC, disasterNoRxBqr(), 16_000L);  // noRx = 110/s
+
+        assertTrue(recorder.shadowTriggers.contains("disaster_noRx:1000:400"));
+        assertFalse(recorder.shadowSnapshots.isEmpty());
+        assertTrue(recorder.shadowSnapshots.get(0).startsWith("r110.0/n110.0@"));
+        assertEquals(1000, controller.snapshot(MAC, 16_000L).ceilingKbps);
+    }
+
+    @Test
+    public void disasterRetxShadowFiresWhenNoRxLow() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);
+        controller.onQueueSample(MAC, 45, 45, 15_000L);
+        controller.onQueueSample(MAC, 45, 45, 15_300L);
+        controller.onBqrSample(MAC, disasterRetxBqr(), 16_000L);   // retx = 110/s, noRx = 20/s
+
+        assertTrue(recorder.shadowTriggers.contains("disaster_retx:1000:500"));
+        assertEquals(1000, controller.snapshot(MAC, 16_000L).ceilingKbps);
+    }
+
+    @Test
+    public void resetDeviceClearsPendingTransaction() {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        controller.activate(MAC, 100L);
+        controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
+        controller.resetDevice(MAC, 2_000L, "policy_adaptive");
+        assertNull(controller.tickSwitchTransactions(MAC, 10_000L));
+    }
+
     private static long openHealthyProbe(LhdcLinkHealthController controller) {
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
         controller.onQueueSample(MAC, 0, 45, 10_100L);
@@ -1217,6 +1338,18 @@ public final class LhdcLinkHealthControllerTest {
                 50, 0, 660, 0, 0, -45, 0, 0, 0);
     }
 
+    /** 6 s window: 660 retx / 660 noRx -> 110/s each: the disaster noRx branch. */
+    private static LhdcLinkHealthController.BqrSample disasterNoRxBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                50, 0, 660, 660, 0, -45, 0, 0, 0);
+    }
+
+    /** 6 s window: 660 retx -> 110/s with noRx 20/s: the disaster retx branch. */
+    private static LhdcLinkHealthController.BqrSample disasterRetxBqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                50, 0, 660, 120, 0, -45, 0, 0, 0);
+    }
+
     private static LhdcLinkHealthController.BqrSample unstableBqr() {
         return new LhdcLinkHealthController.BqrSample(
                 59, 0, 420, 405, 10, -42, 0, 1, 0);
@@ -1229,6 +1362,8 @@ public final class LhdcLinkHealthControllerTest {
         final List<String> fallbackEvents = new ArrayList<>();
         final List<String> fallbackDetails = new ArrayList<>();
         final List<String> skippedBqrWindows = new ArrayList<>();
+        final List<String> shadowTriggers = new ArrayList<>();
+        final List<String> shadowSnapshots = new ArrayList<>();
 
         @Override
         public void onProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
@@ -1277,6 +1412,25 @@ public final class LhdcLinkHealthControllerTest {
                 double noRxPerSecond,
                 long nowMs) {
             skippedBqrWindows.add(reason);
+        }
+
+        @Override
+        public void onShadowTrigger(
+                String mac,
+                String kind,
+                int fromKbps,
+                int toKbps,
+                long nowMs,
+                double retransmissionsPerSecond,
+                double noRxPerSecond,
+                int queueLength,
+                long queueHighAccumMs,
+                int choppyCount5s,
+                String snapshot) {
+            shadowTriggers.add(kind + ":" + fromKbps + ":" + toKbps);
+            if (snapshot != null && !snapshot.isEmpty()) {
+                shadowSnapshots.add(snapshot);
+            }
         }
     }
 }
