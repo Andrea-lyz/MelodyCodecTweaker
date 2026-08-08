@@ -1280,6 +1280,177 @@ public final class LhdcLinkHealthControllerTest {
         assertNull(controller.tickSwitchTransactions(MAC, 10_000L));
     }
 
+    @Test
+    public void suspendedPseudoHighWindowDoesNotTriggerDisasterShadow() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        // Decision 37 anchor sample: retx 111.8/s with streaming=false (suspended
+        // accumulation) plus a critical queue must not hit the shadow sentinel.
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);
+        controller.onQueueSample(MAC, 45, 45, 15_000L);
+        controller.onQueueSample(MAC, 45, 45, 15_300L);
+        controller.onBqrSample(MAC, disasterNoRxBqr(), 16_000L, false);
+
+        assertTrue(recorder.shadowTriggers.isEmpty());
+        assertEquals(1000, controller.snapshot(MAC, 16_000L).ceilingKbps);
+    }
+
+    @Test
+    public void congestionEventsDoNotResetCriticalQueueTimer() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);
+        controller.onQueueSample(MAC, 41, 45, 15_000L);   // 91% critical, not full
+        controller.onCongestion(MAC, 15_100L);            // soft congestion in between
+        controller.onBqrSample(MAC, disasterNoRxBqr(), 15_300L);  // 300 ms later
+
+        // With the pre-Phase-3 noteCongestion reset the timer would be wiped at 15.1 s and
+        // this shadow could not fire.
+        assertTrue(recorder.shadowTriggers.contains("disaster_noRx:1000:400"));
+    }
+
+    @Test
+    public void leakyBucketDoesNotIntegrateDuringStartGuard() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        // Two choppy events inside the 15 s guard would fill 20 >= 15 if integrated.
+        controller.onRemoteChoppyReport(MAC, 1, 5_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 10_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);  // outside guard: +10 only
+        assertEquals(1000, controller.snapshot(MAC, 16_000L).ceilingKbps);
+        assertFalse(recorder.events.contains("900:leaky_bucket_triggered"));
+    }
+
+    @Test
+    public void leakyBucketDoesNotIntegrateWhileAnyCapActive() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);  // trigger -> 900
+        assertEquals(900, controller.snapshot(MAC, 24_000L).ceilingKbps);
+
+        // While the cap is active the bucket must not keep integrating (review P2-3):
+        // a burst during the cap must not re-trigger immediately after recovery.
+        controller.onRemoteChoppyReport(MAC, 1, 30_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 31_000L);
+        for (int i = 1; i <= 9; i++) {
+            controller.onBqrSample(MAC, healthyBqr(), 36_000L + i * 6_000L);
+        }
+        // Recovery happens at 84 s (hold from 24 s); only one trigger event in total.
+        assertEquals(1000, controller.snapshot(MAC, 90_000L).ceilingKbps);
+        assertEquals(1, recorder.events.stream()
+                .filter(e -> e.endsWith("leaky_bucket_triggered")).count());
+    }
+
+    @Test
+    public void disasterSnapshotRingRollsPastFourWindows() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);  // baseline
+        controller.onBqrSample(MAC, healthyBqr(), 16_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 22_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 28_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 34_000L);  // ring now full (16..34)
+        controller.onQueueSample(MAC, 45, 45, 35_000L);
+        controller.onQueueSample(MAC, 45, 45, 35_300L);
+        controller.onBqrSample(MAC, disasterNoRxBqr(), 40_000L);  // rolls past slot 0
+
+        assertTrue(recorder.shadowTriggers.contains("disaster_noRx:1000:400"));
+        String snapshot = recorder.shadowSnapshots.get(0);
+        assertEquals(3, snapshot.chars().filter(c -> c == ';').count());
+        assertTrue(snapshot.startsWith("r15.0/n10.0@22000"));
+        assertTrue(snapshot.endsWith("r110.0/n110.0@40000"));
+    }
+
+    @Test
+    public void leapDoesNotFireWhenChoppyOutside8sWindow() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);   // baseline
+        controller.onRemoteChoppyReport(MAC, 1, 13_000L);         // 9 s before the bad window
+        controller.onQueueSample(MAC, 45, 45, 21_500L);
+        controller.onQueueSample(MAC, 45, 45, 21_700L);
+        controller.onQueueSample(MAC, 45, 45, 21_900L);
+        controller.onBqrSample(MAC, bqrFallbackBad(), 22_000L);
+
+        assertFalse(recorder.shadowTriggers.contains("leap_8s:1000:500"));
+    }
+
+    @Test
+    public void leapDoesNotFireWhenQueueDrained() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 17_000L);
+        controller.onQueueSample(MAC, 45, 45, 21_500L);
+        controller.onQueueSample(MAC, 45, 45, 21_700L);
+        controller.onQueueSample(MAC, 45, 45, 21_900L);   // >= 300 ms accumulated
+        controller.onQueueSample(MAC, 0, 45, 22_000L);    // drained -> accumulation cleared
+        controller.onBqrSample(MAC, bqrFallbackBad(), 22_500L);
+
+        assertFalse(recorder.shadowTriggers.contains("leap_8s:1000:500"));
+    }
+
+    @Test
+    public void disasterShadowRespectsCooldownAndPeerCap() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 10_000L);
+        controller.onQueueSample(MAC, 45, 45, 15_000L);
+        controller.onQueueSample(MAC, 45, 45, 15_300L);
+        controller.onBqrSample(MAC, disasterNoRxBqr(), 16_000L);  // fires
+        controller.onBqrSample(MAC, disasterNoRxBqr(), 22_000L);  // 6 s later: cooldown
+        assertEquals(1, recorder.shadowTriggers.stream()
+                .filter(t -> t.startsWith("disaster_noRx")).count());
+
+        // A peer-capped device never sees the 1000-tier disaster candidate.
+        Recorder cappedRecorder = new Recorder();
+        LhdcLinkHealthController capped = new LhdcLinkHealthController(cappedRecorder);
+        capped.activate(MAC, 100L);
+        capped.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+        capped.onBqrSample(MAC, healthyBqr(), 10_000L);
+        capped.onQueueSample(MAC, 45, 45, 15_000L);
+        capped.onQueueSample(MAC, 45, 45, 15_300L);
+        capped.onBqrSample(MAC, disasterNoRxBqr(), 16_000L);
+        assertTrue(cappedRecorder.shadowTriggers.isEmpty());
+    }
+
+    @Test
+    public void codecWriteClearsLeakyCapAndBucket() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);  // trigger -> 900
+        assertEquals(900, controller.snapshot(MAC, 24_000L).ceilingKbps);
+
+        controller.setPeerCeilingKbps(MAC, 1000, 30_000L, "codec_confirmed");
+        assertEquals(1000, controller.snapshot(MAC, 30_000L).ceilingKbps);
+
+        // One choppy after the user write starts from a clean bucket (no re-trigger).
+        controller.onRemoteChoppyReport(MAC, 1, 32_000L);
+        assertEquals(1000, controller.snapshot(MAC, 32_000L).ceilingKbps);
+        assertEquals(1, recorder.events.stream()
+                .filter(e -> e.endsWith("leaky_bucket_triggered")).count());
+    }
+
     private static long openHealthyProbe(LhdcLinkHealthController controller) {
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
         controller.onQueueSample(MAC, 0, 45, 10_100L);

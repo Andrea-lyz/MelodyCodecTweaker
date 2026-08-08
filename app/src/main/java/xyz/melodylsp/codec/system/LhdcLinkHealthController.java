@@ -121,6 +121,9 @@ final class LhdcLinkHealthController {
     // as a shadow sentinel: hit line + 10 s snapshot, no action.
     static final double DISASTER_NO_RX_PER_SEC = 110.0;
     static final double DISASTER_RETX_PER_SEC = 110.0;
+    // Review P2-2: the ring holds the last 4 decision-eligible windows (~24 s at the 6 s
+    // cadence), which is wider than the blueprint's "last 10 s" — a superset is safer for
+    // calibration. Phase 4 may switch to time-based trimming.
     static final int DISASTER_SNAPSHOT_WINDOWS = 4;
     static final long DISASTER_SHADOW_COOLDOWN_MS = 15_000L;
     /**
@@ -527,6 +530,11 @@ final class LhdcLinkHealthController {
             // the same way the BQR fallback cap is dropped.
             state.leakyFallbackCapKbps = 0;
             state.leakyFallbackHealthyWindows = 0;
+            // Review P2-5: the attempt also clears the bucket and the shadow cooldowns so a
+            // fresh user write starts with a clean slate instead of inherited state.
+            state.choppyBucket = 0.0;
+            state.lastLeapShadowMs = 0L;
+            state.lastDisasterShadowMs = 0L;
         }
         if (ceilingKbps <= 900) {
             if (state.to1000.probeInFlight) {
@@ -622,6 +630,9 @@ final class LhdcLinkHealthController {
                     // Phase N-3 transitional recovery: 6 healthy windows plus the base hold
                     // restore the rung. Phase 4 replaces this with the full asymmetric
                     // recovery (fast 400->500, long 500->900, strictest 900->1000).
+                    // Note (review P2-4): this uses strictlyHealthy (<=60/s) which is wider
+                    // than the bqrFallback recovery evidence (retx<24/noRx<21); the single-
+                    // rung cap is intentionally easier to leave. Phase 4 unifies the evidence.
                     state.leakyFallbackHealthyWindows =
                             strictlyHealthy ? state.leakyFallbackHealthyWindows + 1 : 0;
                     if (state.leakyFallbackHealthyWindows >= BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS
@@ -743,7 +754,9 @@ final class LhdcLinkHealthController {
                         state.queueHighAccumMs = 0L;
                     }
                     state.lastQueueHighMs = nowMs;
-                } else if (gapMs > LEAP_LOOKBACK_MS) {
+                } else {
+                    // Review P2-1: a drained queue must not keep a stale high-accumulation
+                    // value that a later single-sample spike could revive.
                     state.queueHighAccumMs = 0L;
                 }
             }
@@ -791,8 +804,12 @@ final class LhdcLinkHealthController {
             // Phase N-3 leaky bucket: decay first, then fill (+10 per deduped event). A full
             // bucket downgrades one rung (decision 30 keeps choppy independently effective).
             decayLeakyBucket(state, nowMs);
-            state.choppyBucket += LEAKY_BUCKET_FILL_PER_EVENT;
-            evaluateLeakyBucket(mac, state, nowMs);
+            if (state.leakyFallbackCapKbps == 0 && state.bqrFallbackCapKbps == 0) {
+                // Review P2-3: while any downgrade cap is active the bucket does not integrate,
+                // so a recovery is not immediately followed by a re-trigger.
+                state.choppyBucket += LEAKY_BUCKET_FILL_PER_EVENT;
+                evaluateLeakyBucket(mac, state, nowMs);
+            }
         }
         onCongestion(mac, nowMs);
     }
@@ -1214,6 +1231,7 @@ final class LhdcLinkHealthController {
     }
 
     private void recordBqrSnapshot(DeviceState state, long nowMs) {
+        if (!state.streaming) return;  // review P1-1: suspended-window pseudo-high must not pollute
         int i = state.bqrSnapshotIndex % DISASTER_SNAPSHOT_WINDOWS;
         state.bqrSnapshotTimes[i] = nowMs;
         state.bqrSnapshotRetx[i] = state.retransmissionsPerSecond;
@@ -1228,6 +1246,7 @@ final class LhdcLinkHealthController {
      * the pre-trigger snapshot for threshold calibration.
      */
     private void evaluateDisasterShadow(String mac, DeviceState state, long nowMs) {
+        if (!state.streaming) return;  // review P1-1: suspended accumulation is not a disaster
         if (state.bqrSnapshotIndex == 0) return;
         if (state.lastDisasterShadowMs != 0L
                 && nowMs - state.lastDisasterShadowMs < DISASTER_SHADOW_COOLDOWN_MS) return;
@@ -1263,6 +1282,7 @@ final class LhdcLinkHealthController {
      * draining would cross 1000 -> 500 on A devices. Only logged for calibration.
      */
     private void evaluateLeapWindow(String mac, DeviceState state, long nowMs) {
+        if (!state.streaming) return;  // review P1-1: stale queue/choppy from a suspend must not align
         if (nowMs < state.startGuardUntilMs) return;
         if (state.lastLeapShadowMs != 0L
                 && nowMs - state.lastLeapShadowMs < SHADOW_CANDIDATE_COOLDOWN_MS) return;
@@ -1319,6 +1339,9 @@ final class LhdcLinkHealthController {
         state.bqrFallbackSinceMs = nowMs;
         state.bqrFastFailUntilMs = 0L;
         state.bqrFastFailQueueSinceMs = 0L;
+        // Review P2-3: any downgrade is a success under the 6.8.4 semantics — clear the
+        // choppy bucket so the recovery is not immediately re-triggered by stale fill.
+        state.choppyBucket = 0.0;
         if (state.bqrFallbackRecoveredMs != 0L) {
             if (nowMs - state.bqrFallbackRecoveredMs <= BQR_FALLBACK_SUCCESS_WINDOW_MS) {
                 // The previous 900 phase died shortly after a recovery: failed probe, escalate.
