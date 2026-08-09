@@ -241,7 +241,9 @@ public final class MLog {
         if (stickyEventName != null && isStickyDiagnosticEvent(stickyEventName)) {
             rememberStickyDiagnostic(stickyEventName, priority, diagnosticMessage, time);
         }
-        if (persistDiagnostic && isDiagnosticRecordingActive(time)) {
+        boolean persistNow = persistDiagnostic
+                && (isDiagnosticRecordingActive(time) || isMemoryMirrorEventName(stickyEventName));
+        if (persistNow) {
             Context context = diagnosticContext;
             if (context != null) {
                 DiagnosticEvents.send(context, diagnosticScope, priority, diagnosticMessage, time);
@@ -249,6 +251,15 @@ public final class MLog {
                 enqueuePendingDiagnostic(priority, diagnosticMessage, time);
             }
         }
+    }
+
+    /**
+     * Memory-mirror events are low-frequency state snapshots that must stay visible on the
+     * diagnostic page even outside a recording session; they are exempt from the recording
+     * gate so the remember card can always refresh.
+     */
+    static boolean isMemoryMirrorEventName(String eventName) {
+        return eventName != null && eventName.startsWith("remember.snapshot.");
     }
 
     private static String prefix() {
@@ -355,7 +366,10 @@ public final class MLog {
                 || "codec.updated.hooks".equals(name)
                 || "cdm.hooks".equals(name)
                 || "lhdc.memory_patch".equals(name)
-                || "lhdc.link.bqr_hooks".equals(name);
+                || "lhdc.link.stage_d".equals(name)
+                || "lhdc.link.bqr_hooks".equals(name)
+                || "lhdc.governor.choppy_hooks".equals(name)
+                || "lhdc.governor.queue_hooks".equals(name);
     }
 
     private static void clearPendingDiagnostics() {

@@ -115,6 +115,21 @@ OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip
 5. 再回到诊断页，点击「生成反馈包」。
 6. 把生成的 `OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip` 发给开发者即可。
 
+### Buds Ace 3 BQR Stage D 取证版
+
+2026-08-05 的 Stage D 测试构建只增加远程取证，不启用新的保护降档：连续两个有效 BQR `overflow/underflow` 窗口只记录 `would_protect`，不会因此修改 Java ceiling、native probe ceiling 或实际码率。RF 重传、No-Rx、AFH 压力也仍然只参与现有恢复判断，不能单独强制降档。
+
+反馈用户请按以下流程复现：
+
+1. 安装 Stage D 测试 APK，并确认 LSPosed 四个作用域均已勾选。
+2. 重启手机，确保新的 `com.android.bluetooth` 进程已加载取证 Hook；仅开关蓝牙不能作为进程已重启的证据。
+3. 给模块 root 权限，打开诊断页并点击「开始记录问题」。
+4. 连接 Buds Ace 3，选择「音质优先」，连续播放固定长曲目 1～2 分钟，期间不要反复暂停或切换设备。
+5. 卡顿时记住大致时间，卡顿后尽快生成反馈包。
+6. 发回 ZIP、卡顿大致时间、手机系统版本和耳机固件版本。
+
+反馈包会记录 Stage D 启用状态、BQR/choppy/queue Hook 数量、原始 overflow/underflow、影子连续窗口、`bqr_shadow_candidate`、remote choppy 的 MAC 归因、actual/requested bitrate，以及 root Bluetooth 日志。点击「开始记录问题」后，root 可用时会同步启动最长约 31 分钟、总量约 3 MB 的过滤式蓝牙日志轮转采集，避免生成反馈包时系统环形缓冲已经覆盖早期 TX `45/45`；停止记录或打包时只终止当前 session 的采集进程，不清空或扩容系统 logcat。持续采集失败时仍会回退到原有末尾快照。没有 `would_protect` 只表示当前信号体系没有捕获到强证据，不能据此宣称卡顿已经修复。
+
 如果是为了适配 LHDC V5 native 内存补丁，请同时提供手机型号、系统版本，以及当前系统的 `/system/lib64/libbluetooth_jni.so`。这个文件可以通过 root 文件管理器复制，也可以在电脑上用 adb 尝试导出：
 
 ```bash
@@ -256,7 +271,7 @@ Java 侧将队列、remote choppy 与 BQR 归一到逐耳机链路状态，nativ
 
 - 在 `com.android.bluetooth` 进程内加载 APK 自带的 `libmelody_lhdc_patch.so`。
 - 扫描当前已映射的 `/system/lib64/libbluetooth_jni.so`。
-- 先按已知蓝牙库族的机器码字节特征匹配目标函数；当前已覆盖实测的 `branch_plus_69`、`branch_plus_23_op15`、`branch_plus_73_plc110`、`branch_plus_68_pjz110_1609401` 等变体。
+- 先按已知蓝牙库族的机器码字节特征匹配目标函数；当前已覆盖实测的 `branch_plus_69`、`branch_plus_23_op15`、`branch_plus_73_plc110`、`branch_plus_68_pjz110_1609401`、`branch_plus_27_rmx6688`（realme RMX6688 等 MTK 平台 16.0.7）等变体。
 - 已知字节特征未命中时，语义扫描器会验证共享跳转目标、`cmp #0x13`、`sub #7`、`cmp #2`、`b.hs` 和固定质量模式 4 这一组控制流约束；只有全库唯一命中才写入。
 - 只有在某个已知特征或语义控制流唯一命中时，才调用 native helper 写入对应 4 字节 ARM64 指令。
 - native helper 会再次核对 expected 指令，以对齐的 32 位原子写完成替换，随后执行指令缓存刷新、回读验证并恢复原内存页权限。

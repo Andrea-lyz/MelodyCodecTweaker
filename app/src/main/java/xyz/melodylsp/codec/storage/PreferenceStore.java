@@ -26,11 +26,13 @@ public final class PreferenceStore {
     public static final String MELODY_PREFS = "melody_lsp_codec_prefs";
 
     public static final String KEY_ENABLED = "enabled";
-
     private static final String KEY_REMEMBER_SUFFIX = "_remember";
     private static final String KEY_CODEC_TYPE_SUFFIX = "_codec_type";
     private static final String KEY_SPECIFIC1_SUFFIX = "_specific1";
     private static final String KEY_SAMPLERATE_SUFFIX = "_samplerate";
+    private static final String KEY_LHDC_CEILING_SUFFIX = "_lhdc_ceiling";
+    private static final String KEY_LHDC_CEILING_CODEC_SUFFIX = "_lhdc_ceiling_codec";
+    private static final String KEY_LHDC_CEILING_SPEC3_SUFFIX = "_lhdc_ceiling_spec3";
     private static final int CODEC_TYPE_UNKNOWN = -1;
 
     private final Context hostContext;
@@ -110,6 +112,61 @@ public final class PreferenceStore {
         emitDiagnosticSnapshot("remember_write");
     }
 
+    /**
+     * Persists the peer LHDC max-bitrate ceiling discovered for this device (e.g. 900 kbps
+     * index 7). Unlike {@link #writeSnapshot}, this is a device-capability fact, independent of
+     * the user's remember toggle, so it survives toggling remember off.
+     *
+     * @param lowByte the LHDC quality low byte that this peer accepts (see
+     *                {@code CodecLabelTable.LHDC_QUALITY_FIXED_900}).
+     */
+    public void writeLhdcCeiling(String mac, int codecType, long codecSpecific3, int lowByte) {
+        String key = normalizeMac(mac);
+        if (key == null || codecType <= 0 || lowByte <= 0) return;
+        boolean committed = prefs().edit()
+                .putInt(key + KEY_LHDC_CEILING_SUFFIX, lowByte)
+                .putInt(key + KEY_LHDC_CEILING_CODEC_SUFFIX, codecType)
+                .putLong(key + KEY_LHDC_CEILING_SPEC3_SUFFIX, codecSpecific3)
+                .commit();
+        if (!committed) {
+            MLog.w("lhdc.ceiling.commit failed mac=" + redact(key));
+        }
+        MLog.event("lhdc.ceiling.write",
+                "mac", redact(key),
+                "codec", codecType,
+                "specific3", codecSpecific3,
+                "lowByte", lowByte);
+    }
+
+    /**
+     * Reads the cached peer ceiling for {@code mac}, or {@code null} when no ceiling was ever
+     * learned. Callers must still verify {@link LhdcCeiling#matches(int, long)} against the
+     * live codec identity so a stale entry (different headset / capability word) is ignored.
+     */
+    public LhdcCeiling readLhdcCeiling(String mac) {
+        String key = normalizeMac(mac);
+        if (key == null) return null;
+        SharedPreferences sp = prefs();
+        if (!sp.contains(key + KEY_LHDC_CEILING_SUFFIX)) return null;
+        return new LhdcCeiling(
+                sp.getInt(key + KEY_LHDC_CEILING_CODEC_SUFFIX, CODEC_TYPE_UNKNOWN),
+                sp.getLong(key + KEY_LHDC_CEILING_SPEC3_SUFFIX, -1L),
+                sp.getInt(key + KEY_LHDC_CEILING_SUFFIX, 0));
+    }
+
+    /** Removes a previously learned ceiling (diagnostics / debugging). */
+    public void clearLhdcCeiling(String mac) {
+        String key = normalizeMac(mac);
+        if (key == null) return;
+        prefs().edit()
+                .remove(key + KEY_LHDC_CEILING_SUFFIX)
+                .remove(key + KEY_LHDC_CEILING_CODEC_SUFFIX)
+                .remove(key + KEY_LHDC_CEILING_SPEC3_SUFFIX)
+                .commit();
+        MLog.event("lhdc.ceiling.clear", "mac", redact(key));
+    }
+
+
     public void emitDiagnosticSnapshot(String reason) {
         SharedPreferences sp = prefs();
         TreeSet<String> macs = rememberedMacs(sp.getAll());
@@ -181,6 +238,24 @@ public final class PreferenceStore {
             this.codecType = codecType;
             this.codecSpecific1 = codecSpecific1;
             this.sampleRate = sampleRate;
+        }
+    }
+
+    /** Peer LHDC max-bitrate ceiling learned for one device, keyed by codec identity. */
+    public static final class LhdcCeiling {
+        public final int codecType;
+        public final long codecSpecific3;
+        /** LHDC quality low byte this peer accepts (7 = 900 kbps, 8 = 1000 kbps). */
+        public final int lowByte;
+
+        public LhdcCeiling(int codecType, long codecSpecific3, int lowByte) {
+            this.codecType = codecType;
+            this.codecSpecific3 = codecSpecific3;
+            this.lowByte = lowByte;
+        }
+
+        public boolean matches(int liveCodecType, long liveCodecSpecific3) {
+            return codecType == liveCodecType && codecSpecific3 == liveCodecSpecific3;
         }
     }
 }

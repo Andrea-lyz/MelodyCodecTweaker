@@ -43,6 +43,44 @@ void flush_instruction_cache(uint32_t* instruction) {
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
 
+void flush_instruction_cache_range(void* address, size_t length) {
+    auto* begin = reinterpret_cast<char*>(address);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    __builtin___clear_cache(begin, begin + length);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+uint32_t word_from_bytes(const uint8_t* bytes) {
+    uint32_t value = 0;
+    memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+
+void atomic_store_code_word(uint32_t* destination, const uint8_t* source) {
+    __atomic_store_n(destination, word_from_bytes(source), __ATOMIC_RELEASE);
+}
+
+bool code_block_equals(const uint32_t* block, const uint8_t* expected, size_t length) {
+    return memcmp(reinterpret_cast<const uint8_t*>(block), expected, length) == 0;
+}
+
+bool rollback_code_block(
+        uint32_t* block,
+        const uint8_t* expected,
+        size_t length,
+        uint32_t safe_gate) {
+    const size_t instruction_count = length / sizeof(uint32_t);
+    __atomic_store_n(block, safe_gate, __ATOMIC_RELEASE);
+    flush_instruction_cache(block);
+    for (size_t i = 1; i < instruction_count; ++i) {
+        atomic_store_code_word(block + i, expected + i * sizeof(uint32_t));
+    }
+    flush_instruction_cache_range(block, length);
+    atomic_store_code_word(block, expected);
+    flush_instruction_cache_range(block, length);
+    return code_block_equals(block, expected, length);
+}
+
 bool restore_protection(void* page, size_t page_size, int original_protection) {
     return mprotect(page, page_size, original_protection) == 0;
 }
@@ -60,6 +98,10 @@ constexpr const char* kEncodeSymbol = "lhdcv5BT_encode";
 constexpr const char* kFreeHandleSymbol = "lhdcv5BT_free_handle";
 constexpr const char* kSetTargetSymbol = "lhdcv5BT_set_target_bitrate_inx";
 constexpr const char* kGetBitrateSymbol = "lhdcv5BT_get_bitrate";
+#if defined(MELODY_DYN_OBSERVE)
+constexpr const char* kAdjustSymbol = "lhdcv5BT_adjust_bitrate";
+constexpr const char* kDynTag = "MelodyLhdcDyn";
+#endif
 #endif
 
 constexpr int kPolicyConnection = 6;
@@ -71,9 +113,6 @@ constexpr uint32_t kRate500 = 6;
 constexpr uint32_t kRate900 = 7;
 constexpr uint32_t kRate1000 = 8;
 constexpr uint32_t kDefaultQueueCapacity = 45;
-constexpr uint64_t kCriticalOccupancyPercent = 90ULL;
-constexpr uint64_t kCriticalHoldMs = 300ULL;
-constexpr uint64_t kUpgradeStableMs = 15'000ULL;
 constexpr uint64_t kUpgradeFailureWindowMs = 10'000ULL;
 constexpr uint64_t kUpgradeRecoveryMs = 60'000ULL;
 constexpr uint64_t kStreamingRecentMs = 2'000ULL;
@@ -83,6 +122,42 @@ constexpr uint64_t kUpgradeBackoffStepsMs[] = {
 constexpr uint32_t kGovernorEventQuickFailure = 1;
 constexpr uint32_t kGovernorEventUpgradeStable = 2;
 constexpr uint32_t kGovernorEventUpgradeApplied = 3;
+constexpr uint32_t kGovernorEventPeerCeilingDetected = 4;
+constexpr uint32_t kGovernorEventTransitionApplied = 5;
+
+// Reason ids for kGovernorEventTransitionApplied. The event slot has no room for a string, so
+// set_rate publishes a compact id here; Java maps it back to native_<reason>_<from>_<to>.
+constexpr uint32_t kTransitionReasonQualityStart = 1;
+constexpr uint32_t kTransitionReasonQualityStartRetry = 2;
+constexpr uint32_t kTransitionReasonProbeCeiling = 3;
+constexpr uint32_t kTransitionReasonProbeCeilingRestore = 4;
+constexpr uint32_t kTransitionReasonRemoteChoppy = 5;
+constexpr uint32_t kTransitionReasonQueueFull = 6;
+constexpr uint32_t kTransitionReasonQueueCritical = 7;
+constexpr uint32_t kTransitionReasonStableUpgrade = 8;
+
+constexpr bool fixed_1000_ab_mode() {
+#if defined(MELODY_FIXED_1000_AB)
+    return true;
+#else
+    return false;
+#endif
+}
+
+constexpr int kVerificationNone = 0;
+constexpr int kVerificationPending = 1;
+constexpr int kVerificationGetterConfirmed = 2;
+constexpr int kVerificationGetterUnavailable = 3;
+constexpr int kVerificationGetterReadFailed = 4;
+constexpr int kVerificationGetterMismatch = 5;
+constexpr int kVerificationSetterOnly = 6;
+
+// Setter success is only permission to try. The optional getter must confirm the encoder really
+// reached the target before UPGRADE_APPLIED is published; two consecutive confirms are required
+// and the whole verification is bounded so a slow or flaky getter cannot stall the governor.
+constexpr uint32_t kUpgradeVerifyRequiredSamples = 2;
+constexpr uint32_t kUpgradeVerifyMaxAttempts = 40;
+constexpr uint64_t kUpgradeVerifyWindowMs = 8'000ULL;
 
 using SetTargetBitrateFn = int32_t (*)(void*, uint32_t);
 using GetBitrateFn = int32_t (*)(void*, uint32_t*);
@@ -94,6 +169,15 @@ std::atomic<SetTargetBitrateFn> g_set_target{nullptr};
 std::atomic<GetBitrateFn> g_get_bitrate{nullptr};
 std::atomic<FreeHandleFn> g_free_handle{nullptr};
 std::atomic<EncodeFn> g_encode{nullptr};
+#if defined(__aarch64__)
+// Writable callback-slot addresses retained from the fixed-1000 governor install. Kept for the
+// observe-only dynamic probe so future ROM-family research can compare slot structure without
+// re-running the fixed-1000 A/B session.
+std::atomic<uintptr_t> g_encode_slot{0};
+std::atomic<uintptr_t> g_free_slot{0};
+std::atomic<int> g_encode_slot_segment{0};
+std::atomic<int> g_free_slot_segment{0};
+#endif
 std::atomic<void*> g_active_encoder_handle{nullptr};
 std::atomic<uint64_t> g_last_encode_ms{0};
 std::atomic<int> g_policy{kPolicyAdaptive};
@@ -102,7 +186,15 @@ std::atomic<uint64_t> g_choppy_sequence{0};
 std::atomic<int> g_choppy_level{0};
 std::atomic<uint32_t> g_probe_ceiling_rate{kRate1000};
 std::atomic<uint64_t> g_governor_event{0};
+std::atomic<uint32_t> g_governor_event_reason_id{0};
+// Phase N-1 requestId transaction: Java stamps every Target_Cap write; publish_governor_event
+// copies the pending id into the event slot so Java can tell which transaction an event belongs
+// to. 0 means the event is not bound to a Java request (native session-initialization path).
+std::atomic<uint32_t> g_pending_request_id{0};
+std::atomic<uint32_t> g_governor_event_request_id{0};
 std::atomic<uint64_t> g_stream_session_epoch{0};
+std::atomic<uint32_t> g_requested_rate{0};
+std::atomic<int> g_verification_state{kVerificationNone};
 
 struct UpgradeBoundaryRuntime {
     uint32_t failure_count = 0;
@@ -122,6 +214,11 @@ uint64_t g_last_congestion_ms = 0;
 uint64_t g_last_upgrade_ms = 0;
 uint32_t g_last_upgrade_from = 0;
 uint32_t g_last_upgrade_to = 0;
+uint32_t g_pending_upgrade_from = 0;
+uint32_t g_pending_upgrade_to = 0;
+uint32_t g_pending_verify_attempts = 0;
+uint32_t g_pending_verify_ok_samples = 0;
+uint64_t g_pending_upgrade_ms = 0;
 UpgradeBoundaryRuntime g_boundary_500_to_900;
 UpgradeBoundaryRuntime g_boundary_900_to_1000;
 uint64_t g_choppy_window_start_ms = 0;
@@ -133,6 +230,22 @@ uint64_t monotonic_ms() {
     if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0;
     return static_cast<uint64_t>(value.tv_sec) * 1000ULL
             + static_cast<uint64_t>(value.tv_nsec / 1000000L);
+}
+
+bool read_actual_rate(void* handle, uint32_t* rate) {
+    if (handle == nullptr || rate == nullptr) return false;
+    GetBitrateFn getter = g_get_bitrate.load(std::memory_order_acquire);
+    if (getter == nullptr) return false;
+    uint32_t bitrate = 0;
+    if (getter(handle, &bitrate) != 0) return false;
+    if (bitrate >= 64'000U && bitrate <= 1'000'000U) bitrate /= 1000U;
+    switch (bitrate) {
+        case 400: *rate = kRate400; return true;
+        case 500: *rate = kRate500; return true;
+        case 900: *rate = kRate900; return true;
+        case 1000: *rate = kRate1000; return true;
+        default: return false;
+    }
 }
 
 int bitrate_for_rate(uint32_t rate) {
@@ -155,8 +268,41 @@ uint64_t pack_governor_event(
 
 void publish_governor_event(
         uint32_t event, uint32_t from, uint32_t to, uint64_t detail_ms = 0) {
+    // Store the transaction id before the event. The consumer reads the event (acquire) before
+    // reason/request ids, and the release/acquire chain on g_governor_event makes both ids
+    // visible to it.
+    uint32_t stamped_request_id = g_pending_request_id.load(std::memory_order_acquire);
+    g_governor_event_request_id.store(stamped_request_id, std::memory_order_relaxed);
     g_governor_event.store(pack_governor_event(event, from, to, detail_ms),
             std::memory_order_release);
+    // One-shot transaction stamp (Phase N-1 review P1-3): only the first event after a Java
+    // Target_Cap write carries its requestId. Spontaneous native events that follow (upgrade
+    // verification, peer-ceiling detect, restore retries) start from 0 again, so the Java
+    // stale filter is not fooled into treating them as part of the latest transaction.
+    // CAS (Phase N-2 review P2-1): if a new Java request landed between the read and the
+    // clear, keep its id so the next event still carries it.
+    g_pending_request_id.compare_exchange_strong(
+            stamped_request_id, 0, std::memory_order_relaxed);
+}
+
+uint32_t transition_reason_id(const char* reason) {
+    if (reason == nullptr) return 0;
+    if (strcmp(reason, "quality_start") == 0) return kTransitionReasonQualityStart;
+    if (strcmp(reason, "quality_start_retry") == 0) return kTransitionReasonQualityStartRetry;
+    if (strcmp(reason, "probe_ceiling") == 0) return kTransitionReasonProbeCeiling;
+    if (strcmp(reason, "probe_ceiling_restore") == 0) return kTransitionReasonProbeCeilingRestore;
+    if (strcmp(reason, "remote_choppy") == 0) return kTransitionReasonRemoteChoppy;
+    if (strcmp(reason, "queue_full") == 0) return kTransitionReasonQueueFull;
+    if (strcmp(reason, "queue_critical") == 0) return kTransitionReasonQueueCritical;
+    if (strcmp(reason, "stable_upgrade") == 0) return kTransitionReasonStableUpgrade;
+    return 0;
+}
+
+void publish_transition_applied(uint32_t from, uint32_t to, const char* reason) {
+    const uint32_t reason_id = transition_reason_id(reason);
+    if (reason_id == 0) return;
+    g_governor_event_reason_id.store(reason_id, std::memory_order_release);
+    publish_governor_event(kGovernorEventTransitionApplied, from, to);
 }
 
 UpgradeBoundaryRuntime* boundary_for_upgrade(uint32_t from, uint32_t to) {
@@ -192,6 +338,13 @@ void reset_encoder_state(void* handle, uint32_t epoch, uint64_t now) {
     g_last_upgrade_ms = 0;
     g_last_upgrade_from = 0;
     g_last_upgrade_to = 0;
+    g_requested_rate.store(0, std::memory_order_release);
+    g_verification_state.store(kVerificationNone, std::memory_order_release);
+    g_pending_upgrade_ms = 0;
+    g_pending_upgrade_from = 0;
+    g_pending_upgrade_to = 0;
+    g_pending_verify_attempts = 0;
+    g_pending_verify_ok_samples = 0;
     g_boundary_500_to_900 = {};
     g_boundary_900_to_1000 = {};
     g_governor_event.store(0, std::memory_order_release);
@@ -231,39 +384,168 @@ bool record_upgrade_failure(uint64_t now, const char* reason) {
     return true;
 }
 
+void cancel_pending_upgrade() {
+    g_pending_upgrade_ms = 0;
+    g_pending_upgrade_from = 0;
+    g_pending_upgrade_to = 0;
+    g_pending_verify_attempts = 0;
+    g_pending_verify_ok_samples = 0;
+}
+
 bool set_rate(uint32_t target, const char* reason, uint32_t queue, uint64_t now, bool upgrade) {
     if (target == g_current_rate) return true;
+    // One setter call per pending upgrade; do not re-fire while getter verification is open.
+    if (upgrade && g_pending_upgrade_ms != 0 && target == g_pending_upgrade_to) return true;
     SetTargetBitrateFn setter = g_set_target.load(std::memory_order_acquire);
     if (setter == nullptr || g_governor_handle == nullptr) return false;
     const uint32_t previous = g_current_rate;
     const int32_t result = setter(g_governor_handle, target);
     governor_log_transition(reason, previous, target, queue, result);
     if (result != 0) return false;
-    g_current_rate = target;
+    publish_transition_applied(previous, target, reason);
+    g_requested_rate.store(target, std::memory_order_release);
     g_last_transition_ms = now;
     g_critical_since_ms = 0;
     g_low_since_ms = 0;
     if (upgrade) {
-        g_last_upgrade_ms = now;
-        g_last_upgrade_from = previous;
-        g_last_upgrade_to = target;
-        // Tell Java that set_target_bitrate_inx actually succeeded. Opening a probe ceiling is
-        // only permission to try; this event is the transition into verification.
-        publish_governor_event(kGovernorEventUpgradeApplied, previous, target);
-    } else {
+        // Setter success only opens a short verification window. The getter must confirm the
+        // encoder actually reached the target before Java sees UPGRADE_APPLIED, otherwise a
+        // peer that silently stays at 900 would be reported as a stable 1000.
+        g_pending_upgrade_from = previous;
+        g_pending_upgrade_to = target;
+        g_pending_upgrade_ms = now;
+        g_pending_verify_attempts = 0;
+        g_pending_verify_ok_samples = 0;
+        g_verification_state.store(kVerificationPending, std::memory_order_release);
+        return true;
+    }
+    g_current_rate = target;
+    g_verification_state.store(kVerificationSetterOnly, std::memory_order_release);
+    cancel_pending_upgrade();
+    if (target < previous) {
         bool keep_pending_choppy = false;
-        if (target < previous) {
-            const bool recorded = record_upgrade_failure(now, reason);
-            keep_pending_choppy = !recorded
-                    && g_last_upgrade_ms != 0
-                    && now - g_last_upgrade_ms <= kUpgradeFailureWindowMs
-                    && reason != nullptr
-                    && strcmp(reason, "remote_choppy") == 0
-                    && g_choppy_count < 2;
-        }
+        const bool recorded = record_upgrade_failure(now, reason);
+        keep_pending_choppy = !recorded
+                && g_last_upgrade_ms != 0
+                && now - g_last_upgrade_ms <= kUpgradeFailureWindowMs
+                && reason != nullptr
+                && strcmp(reason, "remote_choppy") == 0
+                && g_choppy_count < 2;
         if (!keep_pending_choppy) g_last_upgrade_ms = 0;
     }
     return true;
+}
+
+void maybe_verify_pending_upgrade(void* handle, uint64_t now) {
+    if (g_pending_upgrade_ms == 0) return;
+    const uint32_t target = g_pending_upgrade_to;
+    const uint32_t from = g_pending_upgrade_from;
+    const uint64_t elapsed = now - g_pending_upgrade_ms;
+    uint32_t actual = 0;
+    const bool getter_ok = read_actual_rate(handle, &actual);
+    if (getter_ok && actual >= target) {
+        ++g_pending_verify_attempts;
+        ++g_pending_verify_ok_samples;
+        if (g_pending_verify_ok_samples >= kUpgradeVerifyRequiredSamples) {
+            g_current_rate = target;
+            g_verification_state.store(
+                    kVerificationGetterConfirmed, std::memory_order_release);
+            __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                    "evt=upgrade.verified boundary=%d-%d attempts=%u verification=getter_ok",
+                    bitrate_for_rate(from), bitrate_for_rate(target),
+                    g_pending_verify_attempts);
+            if (from != 0) {
+                g_last_upgrade_ms = now;
+                g_last_upgrade_from = from;
+                g_last_upgrade_to = target;
+                publish_governor_event(kGovernorEventUpgradeApplied, from, target);
+            }
+            cancel_pending_upgrade();
+        }
+        return;
+    }
+    if (getter_ok) {
+        // The getter works but the encoder has not reached the target yet.
+        // Keep local decisions aligned with the observed encoder rung while verification stays
+        // open; this also lets congestion protection work during a delayed initial write.
+        g_current_rate = actual;
+        ++g_pending_verify_attempts;
+        g_pending_verify_ok_samples = 0;
+        const bool expired = elapsed > kUpgradeVerifyWindowMs
+                || g_pending_verify_attempts >= kUpgradeVerifyMaxAttempts;
+        if (!expired) return;
+        if (target == kRate1000 && actual == kRate900) {
+            // The peer is hard-capped at 900. Keep the current 900 rung, never publish a
+            // 900->1000 APPLIED/STABLE, and converge the probe ceiling for the rest of the
+            // session. Java binds this to the active MAC as the confirmed peer ceiling.
+            g_probe_ceiling_rate.store(kRate900, std::memory_order_release);
+            g_verification_state.store(
+                    kVerificationGetterMismatch, std::memory_order_release);
+            __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                    "evt=upgrade.peer_capped target=%d actual=%d attempts=%u "
+                    "verification=getter_ok ceiling=900",
+                    bitrate_for_rate(target), bitrate_for_rate(actual),
+                    g_pending_verify_attempts);
+            publish_governor_event(kGovernorEventPeerCeilingDetected, 0, kRate900);
+            cancel_pending_upgrade();
+            return;
+        }
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=upgrade.verify_failed boundary=%d-%d attempts=%u "
+                "verification=getter_ok actual=%d",
+                bitrate_for_rate(from), bitrate_for_rate(target),
+                g_pending_verify_attempts, bitrate_for_rate(actual));
+        g_verification_state.store(kVerificationGetterMismatch, std::memory_order_release);
+        if (from != 0) {
+            g_last_upgrade_ms = now;
+            g_last_upgrade_from = from;
+            g_last_upgrade_to = target;
+            record_upgrade_failure(now, "verify_timeout");
+            g_last_upgrade_ms = 0;
+        }
+        cancel_pending_upgrade();
+        return;
+    }
+    // Only libraries without the getter use the compatibility path. If the symbol exists but
+    // calls keep failing, fail the upgrade instead of turning an unread value into APPLIED.
+    ++g_pending_verify_attempts;
+    const bool no_getter = g_get_bitrate.load(std::memory_order_acquire) == nullptr;
+    const bool expired = elapsed > kUpgradeVerifyWindowMs
+            || g_pending_verify_attempts >= kUpgradeVerifyMaxAttempts;
+    if (no_getter) {
+        g_current_rate = target;
+        g_verification_state.store(
+                kVerificationGetterUnavailable, std::memory_order_release);
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=upgrade.verified boundary=%d-%d attempts=%u verification=getter_unavailable",
+                bitrate_for_rate(from), bitrate_for_rate(target),
+                g_pending_verify_attempts);
+        if (from != 0) {
+            g_last_upgrade_ms = now;
+            g_last_upgrade_from = from;
+            g_last_upgrade_to = target;
+            publish_governor_event(kGovernorEventUpgradeApplied, from, target);
+        }
+        cancel_pending_upgrade();
+        return;
+    }
+    if (expired) {
+        g_verification_state.store(
+                kVerificationGetterReadFailed, std::memory_order_release);
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=upgrade.verify_failed boundary=%d-%d attempts=%u "
+                "verification=getter_read_failed",
+                bitrate_for_rate(from), bitrate_for_rate(target),
+                g_pending_verify_attempts);
+        if (from != 0) {
+            g_last_upgrade_ms = now;
+            g_last_upgrade_from = from;
+            g_last_upgrade_to = target;
+            record_upgrade_failure(now, "getter_read_failed");
+            g_last_upgrade_ms = 0;
+        }
+        cancel_pending_upgrade();
+    }
 }
 
 void note_congestion(uint64_t now) {
@@ -277,15 +559,43 @@ void maybe_reset_upgrade_failures(uint64_t now) {
     UpgradeBoundaryRuntime* boundary =
             boundary_for_upgrade(g_last_upgrade_from, g_last_upgrade_to);
     if (boundary == nullptr) return;
+    // Never clear boundary evidence or publish STABLE while the getter still disagrees with the
+    // claimed target. This is the second guard against the "900 reported as stable 1000" state.
+    const char* verification = "getter_ok";
+    uint32_t actual = 0;
+    if (read_actual_rate(g_governor_handle, &actual)) {
+        if (actual < g_last_upgrade_to) {
+            g_verification_state.store(
+                    kVerificationGetterMismatch, std::memory_order_release);
+            __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                    "evt=upgrade.stable.deferred boundary=%d-%d reason=getter_mismatch actual=%d",
+                    bitrate_for_rate(g_last_upgrade_from), bitrate_for_rate(g_last_upgrade_to),
+                    bitrate_for_rate(actual));
+            return;
+        }
+        g_verification_state.store(
+                kVerificationGetterConfirmed, std::memory_order_release);
+    } else if (g_get_bitrate.load(std::memory_order_acquire) == nullptr) {
+        verification = "getter_unavailable";
+        g_verification_state.store(
+                kVerificationGetterUnavailable, std::memory_order_release);
+    } else {
+        g_verification_state.store(
+                kVerificationGetterReadFailed, std::memory_order_release);
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=upgrade.stable.deferred boundary=%d-%d reason=getter_read_failed",
+                bitrate_for_rate(g_last_upgrade_from), bitrate_for_rate(g_last_upgrade_to));
+        return;
+    }
     const uint64_t stable_from = g_last_upgrade_ms > g_last_congestion_ms
             ? g_last_upgrade_ms : g_last_congestion_ms;
     if (now - stable_from < kUpgradeRecoveryMs) {
         return;
     }
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=upgrade.recovered boundary=%d-%d failures=%u",
+            "evt=upgrade.recovered boundary=%d-%d failures=%u verification=%s",
             bitrate_for_rate(g_last_upgrade_from), bitrate_for_rate(g_last_upgrade_to),
-            boundary->failure_count);
+            boundary->failure_count, verification);
     boundary->failure_count = 0;
     boundary->backoff_until_ms = 0;
     publish_governor_event(kGovernorEventUpgradeStable,
@@ -293,17 +603,31 @@ void maybe_reset_upgrade_failures(uint64_t now) {
     g_last_upgrade_ms = 0;
 }
 
-void apply_choppy_protection(uint32_t queue, uint64_t now) {
+void apply_choppy_protection(uint32_t queue, uint64_t now, bool observe_only) {
     const uint64_t sequence = g_choppy_sequence.load(std::memory_order_acquire);
     if (sequence == g_seen_choppy_sequence) return;
     g_seen_choppy_sequence = sequence;
-    if (g_choppy_level.load(std::memory_order_acquire) <= 0) return;
+    const int level = g_choppy_level.load(std::memory_order_acquire);
+    if (level <= 0) {
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=choppy.report level=%d sequence=%llu action=observe_only",
+                level, static_cast<unsigned long long>(sequence));
+        return;
+    }
     if (g_choppy_window_start_ms == 0 || now - g_choppy_window_start_ms > 5'000ULL) {
         g_choppy_window_start_ms = now;
         g_choppy_count = 0;
     }
     ++g_choppy_count;
     note_congestion(now);
+    if (observe_only) {
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=choppy.report level=%d sequence=%llu count=%u "
+                "action=observe_only target=%d",
+                level, static_cast<unsigned long long>(sequence), g_choppy_count,
+                bitrate_for_rate(g_current_rate));
+        return;
+    }
     uint32_t target = g_current_rate;
     if (g_choppy_count >= 3) {
         target = kRate400;
@@ -313,7 +637,16 @@ void apply_choppy_protection(uint32_t queue, uint64_t now) {
         target = kRate400;
     }
     if (target != g_current_rate) {
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=choppy.report level=%d sequence=%llu count=%u action=downgrade target=%d",
+                level, static_cast<unsigned long long>(sequence), g_choppy_count,
+                bitrate_for_rate(target));
         set_rate(target, "remote_choppy", queue, now, false);
+    } else {
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=choppy.report level=%d sequence=%llu count=%u action=debounced target=%d",
+                level, static_cast<unsigned long long>(sequence), g_choppy_count,
+                bitrate_for_rate(target));
     }
 }
 
@@ -323,12 +656,13 @@ void quality_governor_sample(void* handle, uint32_t queue) {
     if (handle != g_governor_handle || epoch != g_seen_policy_epoch) {
         reset_encoder_state(handle, epoch, now);
         const uint32_t start_rate = clamp_to_probe_ceiling(kRate1000);
-        set_rate(start_rate, "quality_start", queue, now, false);
+        set_rate(start_rate, "quality_start", queue, now, true);
     }
-    if (g_current_rate == 0) {
+    if (g_current_rate == 0 && g_pending_upgrade_ms == 0) {
         const uint32_t start_rate = clamp_to_probe_ceiling(kRate1000);
-        set_rate(start_rate, "quality_start_retry", queue, now, false);
+        set_rate(start_rate, "quality_start_retry", queue, now, true);
     }
+    maybe_verify_pending_upgrade(handle, now);
     maybe_reset_upgrade_failures(now);
     if (queue > g_queue_capacity) g_queue_capacity = queue;
     const uint32_t probe_ceiling =
@@ -337,66 +671,16 @@ void quality_governor_sample(void* handle, uint32_t queue) {
         set_rate(probe_ceiling, "probe_ceiling", queue, now, false);
         return;
     }
-    apply_choppy_protection(queue, now);
-
-    const uint64_t occupancy = static_cast<uint64_t>(queue) * 100ULL;
-    const uint64_t capacity = static_cast<uint64_t>(g_queue_capacity);
-    const bool full = queue >= g_queue_capacity;
-    const bool critical = occupancy >= capacity * kCriticalOccupancyPercent;
-    const bool low = occupancy <= capacity * 25ULL;
-
-    if (full) {
-        note_congestion(now);
-        const uint32_t target = g_current_rate >= kRate900 ? kRate500 : kRate400;
-        set_rate(target, "queue_full", queue, now, false);
-        return;
-    }
-
-    if (critical) {
-        note_congestion(now);
-        if (g_critical_since_ms == 0) g_critical_since_ms = now;
-    } else {
-        g_critical_since_ms = 0;
-    }
-
-    const bool transition_hold_elapsed = g_last_transition_ms == 0
-            || now - g_last_transition_ms >= 700ULL;
-    if (transition_hold_elapsed
-            && g_critical_since_ms != 0
-            && now - g_critical_since_ms >= kCriticalHoldMs
-            && g_current_rate > kRate400) {
-        const uint32_t target = g_current_rate >= kRate900 ? kRate500 : kRate400;
-        set_rate(target, "queue_critical", queue, now, false);
-        return;
-    }
-
-    if (!low) {
-        g_low_since_ms = 0;
-        return;
-    }
-    if (g_low_since_ms == 0) g_low_since_ms = now;
-
-    uint64_t required_stable_ms = 0;
-    uint32_t target = g_current_rate;
-    if (g_current_rate == kRate400) {
-        required_stable_ms = kUpgradeStableMs;
-        target = kRate500;
-    } else if (g_current_rate == kRate500) {
-        required_stable_ms = kUpgradeStableMs;
-        target = kRate900;
-    } else if (g_current_rate == kRate900) {
-        required_stable_ms = kUpgradeStableMs;
-        target = kRate1000;
-    }
-    if (required_stable_ms == 0) return;
-    target = clamp_to_probe_ceiling(target);
-    if (target <= g_current_rate) return;
-    UpgradeBoundaryRuntime* boundary = boundary_for_upgrade(g_current_rate, target);
-    if (boundary != nullptr && now < boundary->backoff_until_ms) return;
-    const uint64_t stable_from = g_low_since_ms > g_last_congestion_ms
-            ? g_low_since_ms : g_last_congestion_ms;
-    if (now - stable_from >= required_stable_ms) {
-        set_rate(target, "stable_upgrade", queue, now, true);
+    // Phase N-1 (Java single brain): native choppy/queue/stable-upgrade decisions are removed.
+    // The encoder still receives choppy reports and queue samples as sensors, but native never
+    // downgrades or upgrades on its own. Java owns every Target_Cap change through the cap
+    // channel (nativeSetGovernorTargetKbps); the cap is re-applied here when a session reset
+    // left the encoder below it.
+    apply_choppy_protection(queue, now, true);
+    if (g_current_rate != 0 && g_current_rate < probe_ceiling
+            && g_pending_upgrade_ms == 0
+            && (g_last_transition_ms == 0 || now - g_last_transition_ms >= 700ULL)) {
+        set_rate(probe_ceiling, "probe_ceiling_restore", queue, now, false);
     }
 }
 
@@ -674,6 +958,8 @@ int hook_existing_encoder_pointer() {
     void** free_candidate = nullptr;
     int encode_candidate_count = 0;
     int free_candidate_count = 0;
+    int encode_segment = 0;
+    int free_segment = 0;
     FILE* maps = fopen("/proc/self/maps", "re");
     char line[512];
     uintptr_t bluetooth_tail = 0;
@@ -689,23 +975,39 @@ int hook_existing_encoder_pointer() {
         if (bluetooth_mapping) {
             bluetooth_tail = static_cast<uintptr_t>(end);
             if (writable) {
+                const int encode_before = encode_candidate_count;
+                const int free_before = free_candidate_count;
                 scan_pointer_range(static_cast<uintptr_t>(start),
                         static_cast<uintptr_t>(end), encode,
                         &encode_candidate, &encode_candidate_count);
                 scan_pointer_range(static_cast<uintptr_t>(start),
                         static_cast<uintptr_t>(end), free_handle,
                         &free_candidate, &free_candidate_count);
+                if (encode_candidate_count > encode_before && encode_segment == 0) {
+                    encode_segment = 1;
+                }
+                if (free_candidate_count > free_before && free_segment == 0) {
+                    free_segment = 1;
+                }
             }
         } else if (bluetooth_tail != 0
                 && static_cast<uintptr_t>(start) == bluetooth_tail
                 && writable
                 && strcmp(path, "[anon:.bss]") == 0) {
+            const int encode_before = encode_candidate_count;
+            const int free_before = free_candidate_count;
             scan_pointer_range(static_cast<uintptr_t>(start),
                     static_cast<uintptr_t>(end), encode,
                     &encode_candidate, &encode_candidate_count);
             scan_pointer_range(static_cast<uintptr_t>(start),
                     static_cast<uintptr_t>(end), free_handle,
                     &free_candidate, &free_candidate_count);
+            if (encode_candidate_count > encode_before && encode_segment == 0) {
+                encode_segment = 2;
+            }
+            if (free_candidate_count > free_before && free_segment == 0) {
+                free_segment = 2;
+            }
             bluetooth_tail = static_cast<uintptr_t>(end);
         } else if (bluetooth_tail != 0
                 && static_cast<uintptr_t>(start) >= bluetooth_tail) {
@@ -716,6 +1018,12 @@ int hook_existing_encoder_pointer() {
 
     int result = -5;
     if (encode_candidate_count == 1 && free_candidate_count == 1) {
+        g_encode_slot.store(reinterpret_cast<uintptr_t>(encode_candidate),
+                std::memory_order_release);
+        g_free_slot.store(reinterpret_cast<uintptr_t>(free_candidate),
+                std::memory_order_release);
+        g_encode_slot_segment.store(encode_segment, std::memory_order_release);
+        g_free_slot_segment.store(free_segment, std::memory_order_release);
         // Publish every forward target before exposing either wrapper to Bluetooth threads.
         g_set_target.store(reinterpret_cast<SetTargetBitrateFn>(target),
                 std::memory_order_release);
@@ -746,6 +1054,164 @@ int hook_existing_encoder_pointer() {
 #endif
 }
 
+// Observe-only dynamic adapter probe (MELODY_DYN_OBSERVE, debug builds only): scans the
+// writable owner of lhdcv5BT_adjust_bitrate inside libbluetooth_jni and records its slot
+// structure relationship to the encode/free slots. Never writes a pointer. This is the
+// diagnostic retained from the DYN-A/B experiments for future ROM-family research, gated by
+// the diagnostic recording session on the Java side.
+struct AdjustObserveRuntime {
+    int result = -2;
+    int adjust_candidates = 0;
+    int encode_candidates = 0;
+    int free_candidates = 0;
+    int owner_segment = 0;  // 0=none, 1=file-backed data, 2=adjacent anon .bss
+    bool same_range_as_encode = false;
+    uintptr_t adjust_owner = 0;
+    uintptr_t adjust_slot = 0;
+    uintptr_t encode_owner = 0;
+    int64_t owner_delta = 0;
+};
+
+AdjustObserveRuntime g_adjust_observe;
+std::mutex g_adjust_observe_mutex;
+
+#if defined(MELODY_DYN_OBSERVE) && defined(__aarch64__)
+int probe_adjust_owner_observe() {
+    LoadedImage encoder;
+    if (!find_loaded_image(kEncoderLibrary, &encoder)) return -3;
+
+    void* adjust = resolve_elf64_export(encoder, kAdjustSymbol);
+    void* encode = resolve_elf64_export(encoder, kEncodeSymbol);
+    void* free_handle = resolve_elf64_export(encoder, kFreeHandleSymbol);
+    if (adjust == nullptr
+            || !is_executable_library_address(
+                    reinterpret_cast<uintptr_t>(adjust), encoder.path)) {
+        return -4;
+    }
+    if (encode != nullptr
+            && !is_executable_library_address(
+                    reinterpret_cast<uintptr_t>(encode), encoder.path)) {
+        encode = nullptr;
+    }
+    if (free_handle != nullptr
+            && !is_executable_library_address(
+                    reinterpret_cast<uintptr_t>(free_handle), encoder.path)) {
+        free_handle = nullptr;
+    }
+
+    void** adjust_candidate = nullptr;
+    void** encode_candidate = nullptr;
+    void** free_candidate = nullptr;
+    int adjust_candidate_count = 0;
+    int encode_candidate_count = 0;
+    int free_candidate_count = 0;
+    int owner_segment = 0;
+    bool same_range_as_encode = false;
+
+    FILE* maps = fopen("/proc/self/maps", "re");
+    char line[512];
+    uintptr_t bluetooth_tail = 0;
+    while (maps != nullptr && fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        char perms[5] = {};
+        char path[384] = {};
+        if (sscanf(line, "%llx-%llx %4s %*s %*s %*s %383s",
+                &start, &end, perms, path) != 4) continue;
+        const bool bluetooth_mapping = ends_with(path, kBluetoothLibrary);
+        const bool writable = perms[0] == 'r' && perms[1] == 'w';
+        bool mapping_has_adjust = false;
+        bool mapping_has_encode = false;
+        if (bluetooth_mapping) {
+            bluetooth_tail = static_cast<uintptr_t>(end);
+            if (writable) {
+                const int adjust_before = adjust_candidate_count;
+                const int encode_before = encode_candidate_count;
+                scan_pointer_range(static_cast<uintptr_t>(start),
+                        static_cast<uintptr_t>(end), adjust,
+                        &adjust_candidate, &adjust_candidate_count);
+                scan_pointer_range(static_cast<uintptr_t>(start),
+                        static_cast<uintptr_t>(end), encode,
+                        &encode_candidate, &encode_candidate_count);
+                scan_pointer_range(static_cast<uintptr_t>(start),
+                        static_cast<uintptr_t>(end), free_handle,
+                        &free_candidate, &free_candidate_count);
+                mapping_has_adjust = adjust_candidate_count > adjust_before;
+                mapping_has_encode = encode_candidate_count > encode_before;
+                if (owner_segment == 0 && mapping_has_adjust) owner_segment = 1;
+            }
+        } else if (bluetooth_tail != 0
+                && static_cast<uintptr_t>(start) == bluetooth_tail
+                && writable
+                && strcmp(path, "[anon:.bss]") == 0) {
+            const int adjust_before = adjust_candidate_count;
+            const int encode_before = encode_candidate_count;
+            scan_pointer_range(static_cast<uintptr_t>(start),
+                    static_cast<uintptr_t>(end), adjust,
+                    &adjust_candidate, &adjust_candidate_count);
+            scan_pointer_range(static_cast<uintptr_t>(start),
+                    static_cast<uintptr_t>(end), encode,
+                    &encode_candidate, &encode_candidate_count);
+            scan_pointer_range(static_cast<uintptr_t>(start),
+                    static_cast<uintptr_t>(end), free_handle,
+                    &free_candidate, &free_candidate_count);
+            mapping_has_adjust = adjust_candidate_count > adjust_before;
+            mapping_has_encode = encode_candidate_count > encode_before;
+            if (owner_segment == 0 && mapping_has_adjust) owner_segment = 2;
+            bluetooth_tail = static_cast<uintptr_t>(end);
+        } else if (bluetooth_tail != 0
+                && static_cast<uintptr_t>(start) >= bluetooth_tail) {
+            bluetooth_tail = 0;
+        }
+        if (mapping_has_adjust && mapping_has_encode) same_range_as_encode = true;
+    }
+    if (maps != nullptr) fclose(maps);
+
+    int result = -5;
+    if (adjust_candidate_count == 1) {
+        result = 1;
+    } else if (adjust_candidate_count > 1) {
+        result = -6;
+    }
+
+    AdjustObserveRuntime scan;
+    scan.result = result;
+    scan.adjust_candidates = adjust_candidate_count;
+    scan.encode_candidates = encode_candidate_count;
+    scan.free_candidates = free_candidate_count;
+    scan.owner_segment = owner_segment;
+    scan.same_range_as_encode = same_range_as_encode;
+    scan.adjust_owner = adjust_candidate_count == 1
+            ? reinterpret_cast<uintptr_t>(*adjust_candidate) : 0;
+    scan.adjust_slot = adjust_candidate_count == 1
+            ? reinterpret_cast<uintptr_t>(adjust_candidate) : 0;
+    scan.encode_owner = encode_candidate_count == 1
+            ? reinterpret_cast<uintptr_t>(*encode_candidate) : 0;
+    if (scan.adjust_owner != 0 && scan.encode_owner != 0) {
+        scan.owner_delta = static_cast<int64_t>(scan.adjust_owner)
+                - static_cast<int64_t>(scan.encode_owner);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_adjust_observe_mutex);
+        g_adjust_observe = scan;
+    }
+    __android_log_print(ANDROID_LOG_INFO, kDynTag,
+            "evt=adjust.owner.observe result=%d adjust_candidates=%d "
+            "encode_candidates=%d free_candidates=%d owner=%p owner_slot=%p "
+            "segment=%d same_range_as_encode=%d delta=%lld",
+            result, adjust_candidate_count, encode_candidate_count, free_candidate_count,
+            reinterpret_cast<void*>(scan.adjust_owner),
+            reinterpret_cast<void*>(scan.adjust_slot),
+            owner_segment, same_range_as_encode ? 1 : 0,
+            static_cast<long long>(scan.owner_delta));
+    return result;
+}
+#else
+int probe_adjust_owner_observe() {
+    return -2;
+}
+#endif
+
 }  // namespace
 
 extern "C" JNIEXPORT jint JNICALL
@@ -755,6 +1221,42 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeInstallGovernor(
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
             "evt=hook.install mode=fixed_encode result=%d", result);
     return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeProbeAdjustOwnerObserve(
+        JNIEnv*, jclass) {
+    return probe_adjust_owner_observe();
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetAdjustObserveBits(
+        JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(g_adjust_observe_mutex);
+    const AdjustObserveRuntime& s = g_adjust_observe;
+    jlong bits = (s.adjust_candidates & 0xffffL)
+            | ((static_cast<jlong>(s.encode_candidates) & 0xffffL) << 16)
+            | ((static_cast<jlong>(s.free_candidates) & 0xffffL) << 32)
+            | ((static_cast<jlong>(s.owner_segment) & 0xffL) << 48)
+            | (s.same_range_as_encode ? (1LL << 56) : 0LL);
+    return bits;
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetAdjustObserveSlotAddress(
+        JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lock(g_adjust_observe_mutex);
+    return static_cast<jlong>(g_adjust_observe.adjust_slot);
+}
+
+extern "C" JNIEXPORT jlong JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetEncodeObserveSlotAddress(
+        JNIEnv*, jclass) {
+#if defined(__aarch64__)
+    return static_cast<jlong>(g_encode_slot.load(std::memory_order_acquire));
+#else
+    return 0L;
+#endif
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -769,21 +1271,53 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorPolicy(
     g_policy.store(normalized, std::memory_order_release);
     const uint32_t epoch = g_policy_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=policy value=%d epoch=%u", normalized, epoch);
+            "evt=policy value=%d epoch=%u mode=%s", normalized, epoch,
+            fixed_1000_ab_mode() ? "fixed_1000_ab" : "adaptive_governor");
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorProbeCeilingKbps(
-        JNIEnv*, jclass, jint ceiling_kbps) {
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorTargetKbps(
+        JNIEnv*, jclass, jint target_kbps, jint request_id) {
     uint32_t rate = kRate1000;
-    if (ceiling_kbps <= 500) {
-        rate = kRate500;
-    } else if (ceiling_kbps <= 900) {
-        rate = kRate900;
+    if (target_kbps > 0) {
+        if (target_kbps <= 400) {
+            rate = kRate400;
+        } else if (target_kbps <= 500) {
+            rate = kRate500;
+        } else if (target_kbps <= 900) {
+            rate = kRate900;
+        }
+    }
+    if (request_id > 0) {
+        g_pending_request_id.store(static_cast<uint32_t>(request_id),
+                std::memory_order_release);
     }
     g_probe_ceiling_rate.store(rate, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(g_governor_mutex);
+        if (g_pending_upgrade_ms != 0 && g_pending_upgrade_to > rate) {
+            cancel_pending_upgrade();
+            uint32_t actual = 0;
+            if (read_actual_rate(g_governor_handle, &actual) && actual <= rate) {
+                g_current_rate = actual;
+            }
+        }
+        const uint32_t requested = g_requested_rate.load(std::memory_order_acquire);
+        if (requested > rate && g_current_rate != 0 && g_current_rate <= rate) {
+            // A confirmed lower peer ceiling resolves the rejected higher request. Preserve the
+            // mismatch in the emitted event/log, then expose the stable capped rung to live UI.
+            g_requested_rate.store(rate, std::memory_order_release);
+            uint32_t actual = 0;
+            g_verification_state.store(
+                    read_actual_rate(g_governor_handle, &actual) && actual == rate
+                            ? kVerificationGetterConfirmed : kVerificationSetterOnly,
+                    std::memory_order_release);
+        }
+    }
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=probe.ceiling bitrate=%d", bitrate_for_rate(rate));
+            "evt=probe.ceiling bitrate=%d request_id=%u",
+            bitrate_for_rate(rate),
+            g_pending_request_id.load(std::memory_order_acquire));
 }
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -791,6 +1325,20 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeConsumeGovernorEvent
         JNIEnv*, jclass) {
     return static_cast<jlong>(
             g_governor_event.exchange(0, std::memory_order_acq_rel));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeConsumeGovernorEventReasonId(
+        JNIEnv*, jclass) {
+    return static_cast<jint>(
+            g_governor_event_reason_id.exchange(0, std::memory_order_acq_rel));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeConsumeGovernorEventRequestId(
+        JNIEnv*, jclass) {
+    return static_cast<jint>(
+            g_governor_event_request_id.exchange(0, std::memory_order_acq_rel));
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -818,6 +1366,18 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetGovernorBitrateKb
         return bitrate_for_rate(g_current_rate);
     }
     return 0;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetGovernorRequestedBitrateKbps(
+        JNIEnv*, jclass) {
+    return bitrate_for_rate(g_requested_rate.load(std::memory_order_acquire));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetGovernorVerificationState(
+        JNIEnv*, jclass) {
+    return g_verification_state.load(std::memory_order_acquire);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -854,8 +1414,11 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeReportQueueLength(
 extern "C" JNIEXPORT void JNICALL
 Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeReportChoppy(
         JNIEnv*, jclass, jint level) {
+    const uint64_t sequence = g_choppy_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
     g_choppy_level.store(level, std::memory_order_release);
-    g_choppy_sequence.fetch_add(1, std::memory_order_acq_rel);
+    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+            "evt=choppy.received level=%d sequence=%llu",
+            level, static_cast<unsigned long long>(sequence));
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -952,6 +1515,151 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativePatchInstruction(
     flush_instruction_cache(instruction);
     const bool rollback_ok = __atomic_load_n(instruction, __ATOMIC_ACQUIRE) == expected;
     if (restore_protection(page, page_size, original_protection)) {
+        return rollback_ok
+                ? kErrorRestoreFailedRolledBackBase - first_restore_errno
+                : kErrorRollbackVerifyFailedBase - first_restore_errno;
+    }
+    const int second_restore_errno = current_errno();
+    return rollback_ok
+            ? kErrorRestoreFailedDirtyBase - second_restore_errno
+            : kErrorRollbackVerifyFailedBase - second_restore_errno;
+#endif
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativePatchCodeBlock(
+        JNIEnv* env,
+        jclass /* clazz */,
+        jlong address,
+        jbyteArray expected_array,
+        jbyteArray replacement_array,
+        jint safe_gate_instruction,
+        jint original_protection) {
+#if !defined(__aarch64__)
+    (void) env;
+    (void) address;
+    (void) expected_array;
+    (void) replacement_array;
+    (void) safe_gate_instruction;
+    (void) original_protection;
+    return kErrorUnsupportedArchitecture;
+#else
+    constexpr jsize kMaxCodeBlockBytes = 256;
+    if (expected_array == nullptr || replacement_array == nullptr) {
+        return kErrorInvalidArgument;
+    }
+    const jsize expected_length = env->GetArrayLength(expected_array);
+    const jsize replacement_length = env->GetArrayLength(replacement_array);
+    if (expected_length < static_cast<jsize>(2 * sizeof(uint32_t))
+            || expected_length > kMaxCodeBlockBytes
+            || replacement_length != expected_length
+            || (expected_length & (static_cast<jsize>(sizeof(uint32_t)) - 1)) != 0) {
+        return kErrorInvalidArgument;
+    }
+
+    const auto raw_address = static_cast<uintptr_t>(address);
+    if (raw_address == 0 || (raw_address & (alignof(uint32_t) - 1U)) != 0
+            || (original_protection & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0
+            || (original_protection & PROT_READ) == 0
+            || (original_protection & PROT_EXEC) == 0) {
+        return kErrorInvalidArgument;
+    }
+    const uint32_t safe_gate = static_cast<uint32_t>(safe_gate_instruction);
+    if ((safe_gate & 0xfc000000U) != 0x14000000U) {
+        return kErrorInvalidArgument;
+    }
+
+    uint8_t expected[kMaxCodeBlockBytes]{};
+    uint8_t replacement[kMaxCodeBlockBytes]{};
+    env->GetByteArrayRegion(
+            expected_array, 0, expected_length, reinterpret_cast<jbyte*>(expected));
+    env->GetByteArrayRegion(
+            replacement_array, 0, replacement_length, reinterpret_cast<jbyte*>(replacement));
+    if (env->ExceptionCheck()) return kErrorInvalidArgument;
+
+    const size_t length = static_cast<size_t>(expected_length);
+    auto* block = reinterpret_cast<uint32_t*>(raw_address);
+    if (code_block_equals(block, replacement, length)) return kPatchAlreadyApplied;
+    if (!code_block_equals(block, expected, length)) return kErrorUnexpectedInstruction;
+
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    if (system_page_size <= 0
+            || (system_page_size & (system_page_size - 1L)) != 0
+            || raw_address > UINTPTR_MAX - length) {
+        return kErrorInvalidArgument;
+    }
+    const size_t page_size = static_cast<size_t>(system_page_size);
+    const uintptr_t page_start = raw_address & ~(page_size - 1U);
+    const uintptr_t block_end = raw_address + length;
+    if (block_end > UINTPTR_MAX - (page_size - 1U)) return kErrorInvalidArgument;
+    const uintptr_t page_end = (block_end + page_size - 1U) & ~(page_size - 1U);
+    if (page_end <= page_start) return kErrorInvalidArgument;
+    const size_t protection_length = page_end - page_start;
+    auto* page = reinterpret_cast<void*>(page_start);
+
+    const int writable_protection = original_protection | PROT_WRITE;
+    if (mprotect(page, protection_length, writable_protection) != 0) {
+        return kErrorWritableProtectionBase - current_errno();
+    }
+
+    if (code_block_equals(block, replacement, length)
+            || !code_block_equals(block, expected, length)) {
+        const jint result = code_block_equals(block, replacement, length)
+                ? kPatchAlreadyApplied
+                : kErrorUnexpectedInstruction;
+        if (!restore_protection(page, protection_length, original_protection)) {
+            const int first_restore_errno = current_errno();
+            if (!restore_protection(page, protection_length, original_protection)) {
+                return kErrorRestoreFailedDirtyBase - current_errno();
+            }
+            return kErrorRestoreAfterNoWriteBase - first_restore_errno;
+        }
+        return result;
+    }
+
+    // Gate new entrants to the original restart path while the remaining instructions are
+    // replaced. The final aligned entry store activates the comparator atomically.
+    __atomic_store_n(block, safe_gate, __ATOMIC_RELEASE);
+    flush_instruction_cache(block);
+    if (__atomic_load_n(block, __ATOMIC_ACQUIRE) != safe_gate) {
+        const bool rollback_ok = rollback_code_block(block, expected, length, safe_gate);
+        const bool restored = restore_protection(
+                page, protection_length, original_protection);
+        if (!rollback_ok) return kErrorRollbackVerifyFailedBase - (restored ? 0 : current_errno());
+        return restored ? kErrorVerifyFailed : kErrorRestoreFailedDirtyBase - current_errno();
+    }
+
+    const size_t instruction_count = length / sizeof(uint32_t);
+    for (size_t i = 1; i < instruction_count; ++i) {
+        atomic_store_code_word(block + i, replacement + i * sizeof(uint32_t));
+    }
+    flush_instruction_cache_range(block, length);
+    if (memcmp(reinterpret_cast<uint8_t*>(block) + sizeof(uint32_t),
+            replacement + sizeof(uint32_t), length - sizeof(uint32_t)) != 0) {
+        const bool rollback_ok = rollback_code_block(block, expected, length, safe_gate);
+        const bool restored = restore_protection(
+                page, protection_length, original_protection);
+        if (!rollback_ok) return kErrorRollbackVerifyFailedBase - (restored ? 0 : current_errno());
+        return restored ? kErrorVerifyFailed : kErrorRestoreFailedDirtyBase - current_errno();
+    }
+
+    atomic_store_code_word(block, replacement);
+    flush_instruction_cache_range(block, length);
+    if (!code_block_equals(block, replacement, length)) {
+        const bool rollback_ok = rollback_code_block(block, expected, length, safe_gate);
+        const bool restored = restore_protection(
+                page, protection_length, original_protection);
+        if (!rollback_ok) return kErrorRollbackVerifyFailedBase - (restored ? 0 : current_errno());
+        return restored ? kErrorVerifyFailed : kErrorRestoreFailedDirtyBase - current_errno();
+    }
+
+    if (restore_protection(page, protection_length, original_protection)) {
+        return kPatchOk;
+    }
+
+    const int first_restore_errno = current_errno();
+    const bool rollback_ok = rollback_code_block(block, expected, length, safe_gate);
+    if (restore_protection(page, protection_length, original_protection)) {
         return rollback_ok
                 ? kErrorRestoreFailedRolledBackBase - first_restore_errno
                 : kErrorRollbackVerifyFailedBase - first_restore_errno;

@@ -22,6 +22,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -34,6 +36,7 @@ import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
+import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.leaudio.BluetoothLeAudioBridge;
 import xyz.melodylsp.codec.util.MLog;
@@ -68,6 +71,13 @@ public final class SystemHookInstaller {
     private static final long GAME_MODE_SBC_FALLBACK_TTL_MS = 180_000L;
     private static final long LHDC_QUEUE_SAMPLE_INTERVAL_MS = 200L;
     private static final long LHDC_QUEUE_IDLE_INTERVAL_MS = 1_000L;
+    /**
+     * Phase N-2 choppy 1s dedup (decision 33/6.8.2): the host double-delivers the same
+     * physical glitch within ~2 ms; one physical perturbation is one audible glitch, so
+     * duplicate reports inside this window are logged and dropped at the Java convergence
+     * point.
+     */
+    private static final long CHOPPY_DEDUP_WINDOW_MS = 1_000L;
     private static final long BQR_DIAGNOSTIC_INTERVAL_MS = 60_000L;
     private static final long BQR_LIVE_SUBSCRIPTION_TTL_MS = 12_000L;
     private static final int LHDC_QUEUE_CAPACITY = 45;
@@ -82,6 +92,7 @@ public final class SystemHookInstaller {
     private final String sourceDir;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private CodecBridgeService bridgeService;
+    private volatile Object a2dpServiceInstance;
     private CodecBroadcastBridge codecBroadcastBridge;
     private BluetoothLeAudioBridge leAudioBridge;
     private Context appContext;
@@ -95,7 +106,7 @@ public final class SystemHookInstaller {
     private boolean smartAudioQueueSampleScheduled;
     private int smartAudioQueueSampleFailures;
     private final LhdcLinkHealthController linkHealthController;
-    private String activeLhdcMac;
+    private volatile String activeLhdcMac;
     private String lastBqrDiagnosticState;
     private long lastBqrDiagnosticMs;
     private BroadcastReceiver lhdcDiagnosticLiveControlReceiver;
@@ -105,6 +116,15 @@ public final class SystemHookInstaller {
     private final Object lhdcDiagnosticReasonLock = new Object();
     private final Map<String, Integer> lhdcDiagnosticReasonCounts = new HashMap<>();
     private final Map<String, Long> lhdcDiagnosticReasonTimes = new HashMap<>();
+    /** Per-MAC confirmed peer max-bitrate capability (900/1000 kbps), surviving process ordering. */
+    private final Map<String, Integer> peerCeilingByMac = new HashMap<>();
+    /**
+     * Phase N-2: last accepted choppy report per MAC for the 1 s dedup window. The choppy
+     * hook runs on binder threads, so the map must be safe for concurrent access
+     * (review P2-5).
+     */
+    private final Map<String, Long> lastRemoteChoppyEventMsByMac = new ConcurrentHashMap<>();
+    private final AtomicLong remoteChoppySequence = new AtomicLong();
 
     public SystemHookInstaller(
             MelodyCodecLspEntry module, ClassLoader classLoader, String sourceDir) {
@@ -124,10 +144,99 @@ public final class SystemHookInstaller {
                             String mac, int ceilingKbps, String reason) {
                         handleProbeStateChanged(mac, ceilingKbps, reason);
                     }
+
+                    @Override
+                    public void onBqrShadowCandidate(
+                            String mac,
+                            int fromKbps,
+                            int candidateKbps,
+                            long overflowCount,
+                            long underflowCount,
+                            int candidateCount,
+                            long streamSessionId) {
+                        handleBqrShadowCandidate(
+                                mac,
+                                fromKbps,
+                                candidateKbps,
+                                overflowCount,
+                                underflowCount,
+                                candidateCount,
+                                streamSessionId);
+                    }
+
+                    @Override
+                    public void onBqrFallbackStateChanged(
+                            String mac,
+                            int capKbps,
+                            String reason,
+                            int badWindows,
+                            int healthyWindows,
+                            double retransmissionsPerSecond,
+                            double noRxPerSecond,
+                            int escalationLevel,
+                            long holdMs) {
+                        handleBqrFallbackStateChanged(
+                                mac,
+                                capKbps,
+                                reason,
+                                badWindows,
+                                healthyWindows,
+                                retransmissionsPerSecond,
+                                noRxPerSecond,
+                                escalationLevel,
+                                holdMs);
+                    }
+
+                    @Override
+                    public void onBqrWindowSkipped(
+                            String mac,
+                            String reason,
+                            double retransmissionsPerSecond,
+                            double noRxPerSecond,
+                            long nowMs) {
+                        MLog.event("lhdc.link.bqr_window_skipped",
+                                "mac", redactMac(mac),
+                                "reason", reason,
+                                "retxPerSec", rateText(retransmissionsPerSecond),
+                                "noRxPerSec", rateText(noRxPerSecond),
+                                "nowMs", nowMs);
+                    }
+
+                    @Override
+                    public void onShadowTrigger(
+                            String mac,
+                            String kind,
+                            int fromKbps,
+                            int toKbps,
+                            long nowMs,
+                            double retransmissionsPerSecond,
+                            double noRxPerSecond,
+                            int queueLength,
+                            long queueHighAccumMs,
+                            int choppyCount5s,
+                            String snapshot) {
+                        // Phase N-3 shadow sentinels: calibration evidence only, never applied.
+                        MLog.event("lhdc.link.shadow_trigger",
+                                "mac", redactMac(mac),
+                                "kind", kind,
+                                "fromKbps", fromKbps,
+                                "toKbps", toKbps,
+                                "retxPerSec", rateText(retransmissionsPerSecond),
+                                "noRxPerSec", rateText(noRxPerSecond),
+                                "queue", queueLength,
+                                "queueHighAccumMs", queueHighAccumMs,
+                                "choppyCount5s", choppyCount5s,
+                                "snapshot", snapshot);
+                    }
                 });
     }
 
     public void install() {
+        MLog.event("lhdc.link.stage_d",
+                "mode", "shadow_only",
+                "requiredWindows", LhdcLinkHealthController.REQUIRED_SHADOW_UNSTABLE_WINDOWS,
+                "cooldownMs", LhdcLinkHealthController.SHADOW_CANDIDATE_COOLDOWN_MS,
+                "rateMutation", false);
         hookApplicationOnCreate();
         hookBluetoothQualityReports();
         Class<?> a2dpCls = resolveA2dpServiceClass();
@@ -349,7 +458,18 @@ public final class SystemHookInstaller {
     }
 
     private void handleProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
-        NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+        int requestId = NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
+        // Phase N-1 requestId transaction: register the issued Target_Cap so native
+        // confirmations with the same requestId close the switch and timeouts fall back
+        // to the getter. requestId == 0 means nothing was written (governor unavailable or the
+        // same rung already applied): no transaction, no phantom timeout. When the queue/event
+        // loop is not sampling (ADAPTIVE policy), no confirmation can ever arrive, so the
+        // transaction is not registered either (Phase N-1 review P1-4).
+        if (requestId > 0 && NativeLhdcMemoryPatch.shouldSampleQueue()) {
+            linkHealthController.onTargetCapIssued(
+                    mac, NativeLhdcMemoryPatch.currentDesiredGovernorProbeCeilingKbps(),
+                    requestId, SystemClock.elapsedRealtime());
+        }
         MLog.event("lhdc.link.probe_ceiling",
                 "mac", redactMac(mac),
                 "ceilingKbps", ceilingKbps,
@@ -373,6 +493,61 @@ public final class SystemHookInstaller {
                 "reason");
     }
 
+    /** Stage-D shadow result: persist evidence and update diagnostics, but never touch ceilings. */
+    private void handleBqrShadowCandidate(
+            String mac,
+            int fromKbps,
+            int candidateKbps,
+            long overflowCount,
+            long underflowCount,
+            int candidateCount,
+            long streamSessionId) {
+        LhdcLinkHealthController.Snapshot snapshot =
+                linkHealthController.snapshot(mac, SystemClock.elapsedRealtime());
+        MLog.event("lhdc.link.bqr_shadow_candidate",
+                "mac", redactMac(mac),
+                "wouldProtect", candidateKbps > 0,
+                "fromKbps", fromKbps,
+                "candidateKbps", candidateKbps > 0 ? candidateKbps : "observe_only",
+                "overflow", overflowCount,
+                "underflow", underflowCount,
+                "candidateCount", candidateCount,
+                "streamSessionId", streamSessionId,
+                "actualBitrateKbps", NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                "requestedBitrateKbps",
+                NativeLhdcMemoryPatch.currentGovernorRequestedBitrateKbps(),
+                "bitrateVerification", NativeLhdcMemoryPatch.currentGovernorVerification(),
+                "ceilingUnchangedKbps", snapshot.ceilingKbps);
+        sendLhdcDiagnosticLiveState(mac, snapshot, "bqr_shadow_candidate", "shadow");
+    }
+
+    private void handleBqrFallbackStateChanged(
+            String mac,
+            int capKbps,
+            String reason,
+            int badWindows,
+            int healthyWindows,
+            double retransmissionsPerSecond,
+            double noRxPerSecond,
+            int escalationLevel,
+            long holdMs) {
+        MLog.event("lhdc.link.bqr_fallback",
+                "mac", redactMac(mac),
+                "capKbps", capKbps,
+                "reason", reason,
+                "badWindows", badWindows,
+                "healthyWindows", healthyWindows,
+                "escalationLevel", escalationLevel,
+                "holdMs", holdMs,
+                "retxPerSec", rateText(retransmissionsPerSecond),
+                "noRxPerSec", rateText(noRxPerSecond),
+                "actualBitrateKbps", NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                "requestedBitrateKbps",
+                NativeLhdcMemoryPatch.currentGovernorRequestedBitrateKbps(),
+                "bitrateVerification", NativeLhdcMemoryPatch.currentGovernorVerification(),
+                "pid", android.os.Process.myPid());
+    }
+
     private void sendLhdcDiagnosticLiveState(
             String mac,
             LhdcLinkHealthController.Snapshot snapshot,
@@ -391,6 +566,10 @@ public final class SystemHookInstaller {
             payload.put("streaming", NativeLhdcMemoryPatch.isGovernorStreaming());
             payload.put("actualBitrateKbps",
                     NativeLhdcMemoryPatch.currentGovernorBitrateKbps());
+            payload.put("requestedBitrateKbps",
+                    NativeLhdcMemoryPatch.currentGovernorRequestedBitrateKbps());
+            payload.put("bitrateVerification",
+                    NativeLhdcMemoryPatch.currentGovernorVerification());
             payload.put("retransmissionsPerSec",
                     finiteOrNull(snapshot.retransmissionsPerSecond));
             payload.put("noRxPerSec", finiteOrNull(snapshot.noRxPerSecond));
@@ -398,6 +577,10 @@ public final class SystemHookInstaller {
             payload.put("usableAfh", snapshot.usableAfhChannels);
             payload.put("healthyWindows", snapshot.healthyBqrWindows);
             payload.put("ceilingKbps", snapshot.ceilingKbps);
+            payload.put("effectiveCeilingKbps", snapshot.ceilingKbps);
+            payload.put("peerCeilingKbps", snapshot.peerCeilingKbps);
+            payload.put("boundary900To1000Supported",
+                    snapshot.boundary900To1000Supported);
             payload.put("lock500to900", snapshot.boundary500To900Locked);
             payload.put("lock900to1000", snapshot.boundary900To1000Locked);
             payload.put("requiredHealthyWindows", snapshot.requiredHealthyBqrWindows);
@@ -413,6 +596,27 @@ public final class SystemHookInstaller {
             payload.put("nativeBackoffRemainingMs", snapshot.nativeBackoffRemainingMs);
             payload.put("blockedReason", snapshot.blockedReason);
             payload.put("streamSessionId", snapshot.streamSessionId);
+            payload.put("lastRemoteChoppyLevel", snapshot.lastRemoteChoppyLevel);
+            payload.put("lastRemoteChoppyAgoMs", snapshot.lastRemoteChoppyAgoMs);
+            payload.put("remoteChoppyCount5s", snapshot.remoteChoppyCount5s);
+            payload.put("choppyCapabilityState", snapshot.choppyCapabilityState);
+            payload.put("overflow", snapshot.lastBqrOverflowCount);
+            payload.put("underflow", snapshot.lastBqrUnderflowCount);
+            payload.put("shadowUnstableWindows", snapshot.shadowUnstableWindows);
+            payload.put("shadowCandidateCount", snapshot.shadowCandidateCount);
+            payload.put("bqrFallbackCapKbps", snapshot.bqrFallbackCapKbps);
+            payload.put("leakyFallbackCapKbps", snapshot.leakyFallbackCapKbps);
+            payload.put("bqrFallbackHealthyWindows", snapshot.bqrFallbackHealthyWindows);
+            payload.put("bqrFallbackRequiredHealthyWindows",
+                    snapshot.bqrFallbackRequiredHealthyWindows);
+            payload.put("bqrFallbackHoldRemainingMs", snapshot.bqrFallbackHoldRemainingMs);
+            payload.put("leakyFallbackHealthyWindows", snapshot.leakyFallbackHealthyWindows);
+            payload.put("leakyFallbackRequiredHealthyWindows",
+                    snapshot.leakyFallbackRequiredHealthyWindows);
+            payload.put("leakyFallbackHoldRemainingMs", snapshot.leakyFallbackHoldRemainingMs);
+            payload.put("lastShadowCandidateKbps", snapshot.lastShadowCandidateKbps);
+            payload.put("lastShadowCandidateAgoMs", snapshot.lastShadowCandidateAgoMs);
+            payload.put("shadowStreamSessionId", snapshot.shadowStreamSessionId);
             appendLhdcDiagnosticReasonHistory(payload);
             if (reason != null && !reason.isEmpty()) payload.put("reason", reason);
             publishLhdcDiagnosticLivePayload(payload.toString());
@@ -452,6 +656,23 @@ public final class SystemHookInstaller {
                     lhdcDiagnosticReasonCounts.getOrDefault(reason, 0) + 1);
             lhdcDiagnosticReasonTimes.put(reason, capturedAtMs);
         }
+    }
+
+    /** Maps a native transition reason id to the diagnostics key {@code native_<name>_<from>_<to>}. */
+    private static String nativeTransitionReason(NativeLhdcMemoryPatch.GovernorEvent event) {
+        String name;
+        switch (event.reasonId) {
+            case 1: name = "quality_start"; break;
+            case 2: name = "quality_start_retry"; break;
+            case 3: name = "probe_ceiling"; break;
+            case 4: name = "probe_ceiling_restore"; break;
+            case 5: name = "remote_choppy"; break;
+            case 6: name = "queue_full"; break;
+            case 7: name = "queue_critical"; break;
+            case 8: name = "stable_upgrade"; break;
+            default: name = "unknown";
+        }
+        return "native_" + name + "_" + event.fromKbps + "_" + event.toKbps;
     }
 
     private void appendLhdcDiagnosticReasonHistory(JSONObject payload) throws Exception {
@@ -581,6 +802,7 @@ public final class SystemHookInstaller {
             ensureLeAudioBridge(context);
         }
         if (a2dpService == null) return;
+        a2dpServiceInstance = a2dpService;
         try {
             if (bridgeService == null) {
                 bridgeService = new CodecBridgeService(a2dpService);
@@ -639,7 +861,15 @@ public final class SystemHookInstaller {
                     try {
                         CodecSnapshot snapshot =
                                 bridge.notifyCodecChanged(chain.getArgs().toArray());
-                        handleCodecSnapshotForGovernor(snapshot);
+                        if (snapshot != null) {
+                            mainHandler.post(() -> {
+                                try {
+                                    handleCodecSnapshotForGovernor(snapshot);
+                                } catch (Throwable t) {
+                                    MLog.w("LHDC codec capability sync failed", t);
+                                }
+                            });
+                        }
                     } catch (Throwable t) {
                         MLog.w("notifyCodecChanged failed", t);
                     }
@@ -651,35 +881,133 @@ public final class SystemHookInstaller {
         MLog.event("codec.updated.hooks", "count", hooked);
     }
 
-    private void handleGovernorPolicyChanged(String mac, int policy, String reason) {
-        if (LhdcQualityPolicy.normalize(policy) == LhdcQualityPolicy.QUALITY) return;
-        mainHandler.post(() -> resetLhdcLinkState(mac,
-                policy == LhdcQualityPolicy.CONNECTION
-                        ? "policy_connection" : "policy_adaptive"));
+    private void handleGovernorPolicyChanged(
+            String mac, int policy, String reason, int ceilingKbps) {
+        String normalizedMac = normalizeMac(mac);
+        if (normalizedMac == null) return;
+        mainHandler.post(() -> {
+            if (ceilingKbps > 0) {
+                rememberPeerCeiling(normalizedMac, ceilingKbps, "policy_broadcast");
+            }
+            if (LhdcQualityPolicy.normalize(policy) != LhdcQualityPolicy.QUALITY) {
+                resetLhdcLinkState(normalizedMac,
+                        policy == LhdcQualityPolicy.CONNECTION
+                                ? "policy_connection" : "policy_adaptive");
+            }
+        });
     }
 
     private void handleCodecSnapshotForGovernor(CodecSnapshot snapshot) {
-        if (snapshot == null || CodecLabelTable.isLhdc(snapshot.activeCodecType)) return;
-        String mac = snapshot.mac;
-        if (mac == null || (!mac.equals(activeLhdcMac)
-                && !mac.equals(linkHealthController.activeMac()))) {
+        if (snapshot == null) return;
+        String mac = normalizeMac(snapshot.mac);
+        if (mac == null) return;
+        if (CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+            // A stack-confirmed LHDC config is the strongest capability signal. Always cache it
+            // per MAC; the native ceiling is only rewritten when this MAC is (or becomes) active.
+            syncPeerCeilingFromSnapshot(mac, snapshot, "codec_confirmed");
             return;
         }
-        resetLhdcLinkState(mac, "codec_exit");
+        if (mac.equals(activeLhdcMac) || mac.equals(linkHealthController.activeMac())) {
+            resetLhdcLinkState(mac, "codec_exit");
+        }
+    }
+
+    /**
+     * Mirrors the stack-confirmed transport low byte into the native governor probe ceiling
+     * and the link-health controller so a 900 kbps peer never gets probed to 1000.
+     */
+    private void syncPeerCeilingFromSnapshot(
+            String mac, CodecSnapshot snapshot, String reason) {
+        if (mac == null || snapshot == null) return;
+        int ceilingKbps = peerCeilingFromSnapshot(snapshot);
+        if (ceilingKbps <= 0) return;
+        rememberPeerCeiling(mac, ceilingKbps, reason);
+    }
+
+    /**
+     * Persists a confirmed peer ceiling per MAC, syncs the per-MAC link-health state, and applies
+     * the ceiling to the global native governor only when this MAC is the active LHDC device.
+     * Non-active snapshots only update the capability cache.
+     */
+    private void rememberPeerCeiling(String mac, int ceilingKbps, String reason) {
+        String key = normalizeMac(mac);
+        if (key == null || ceilingKbps <= 0) return;
+        int normalizedCeiling = NativeLhdcMemoryPatch.normalizeProbeCeilingKbps(ceilingKbps);
+        Integer previous = peerCeilingByMac.put(key, normalizedCeiling);
+        linkHealthController.setPeerCeilingKbps(
+                key, normalizedCeiling, SystemClock.elapsedRealtime(), reason);
+        boolean nativeApplied = key.equals(activeLhdcMac)
+                || key.equals(linkHealthController.activeMac());
+        if (nativeApplied) {
+            // Bypass write: capability sync must not advance the transaction id of an
+            // in-flight controller decision (Phase N-1 decision 33).
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(normalizedCeiling);
+        }
+        MLog.event("lhdc.link.peer_ceiling_sync",
+                "mac", redactMac(key),
+                "ceilingKbps", normalizedCeiling,
+                "reason", reason,
+                "nativeApplied", nativeApplied,
+                "changed", previous == null || previous != normalizedCeiling);
+    }
+
+    /**
+     * Restores the active MAC's known peer ceiling before the controller activates, so the first
+     * {@code device_active} publish is already 900 and never flashes 1000. Falls back to querying
+     * the current stack-confirmed codec config through the bridge when no cache entry exists.
+     */
+    private boolean restorePeerCeilingForActive(String mac) {
+        String key = normalizeMac(mac);
+        if (key == null) return false;
+        Integer cached = peerCeilingByMac.get(key);
+        if (cached != null && cached > 0) {
+            linkHealthController.setPeerCeilingKbps(
+                    key, cached, SystemClock.elapsedRealtime(), "bqr_activate");
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(cached);
+            MLog.event("lhdc.link.peer_ceiling_restored",
+                    "mac", redactMac(key),
+                    "ceilingKbps", cached,
+                    "source", "per_mac_cache");
+            return true;
+        }
+        CodecBridgeService bridge = bridgeService;
+        if (bridge == null) return false;
+        try {
+            CodecSnapshot snapshot = bridge.getStatusUnchecked(key);
+            if (snapshot != null && CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+                int ceilingKbps = peerCeilingFromSnapshot(snapshot);
+                if (ceilingKbps > 0) {
+                    rememberPeerCeiling(key, ceilingKbps, "bqr_activate_query");
+                    return true;
+                }
+            }
+        } catch (Throwable t) {
+            MLog.w("LHDC BQR activate ceiling query failed", t);
+        }
+        return false;
+    }
+
+    private static int peerCeilingFromSnapshot(CodecSnapshot snapshot) {
+        if (snapshot == null) return 0;
+        long lowByte = snapshot.activeCodecSpecific1 & 0xFFL;
+        if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) return 900;
+        if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_1000) return 1000;
+        return 0;
     }
 
     private void resetLhdcLinkState(String mac, String reason) {
-        if (mac == null || mac.isEmpty()) return;
-        boolean nativeSessionActive = mac.equals(activeLhdcMac);
+        String key = normalizeMac(mac);
+        if (key == null) return;
+        boolean nativeSessionActive = key.equals(activeLhdcMac);
         boolean controllerWasActive = linkHealthController.resetDevice(
-                mac, SystemClock.elapsedRealtime(), reason);
+                key, SystemClock.elapsedRealtime(), reason);
         if (nativeSessionActive) activeLhdcMac = null;
         if (nativeSessionActive && !controllerWasActive) {
-            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(1000);
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(1000);
         }
         if (nativeSessionActive || controllerWasActive) {
             MLog.event("lhdc.link.session_reset",
-                    "mac", redactMac(mac),
+                    "mac", redactMac(key),
                     "reason", reason,
                     "ceilingKbps", 1000);
         }
@@ -801,6 +1129,16 @@ public final class SystemHookInstaller {
         }
         if (!mac.equals(activeLhdcMac)) {
             activeLhdcMac = mac;
+            // Restore the confirmed peer ceiling before activation so the first publish is
+            // already 900 (or the queried stack config) instead of a 1000 flash.
+            if (!restorePeerCeilingForActive(mac)) {
+                // Do not leak a previous headset's 900 ceiling into an unknown new device.
+                NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(1000);
+                MLog.event("lhdc.link.peer_ceiling_restored",
+                        "mac", redactMac(mac),
+                        "ceilingKbps", 1000,
+                        "source", "unknown_default");
+            }
             linkHealthController.activate(mac, capturedAtMs);
         }
         boolean streaming = NativeLhdcMemoryPatch.isGovernorStreaming();
@@ -808,6 +1146,9 @@ public final class SystemHookInstaller {
         LhdcLinkHealthController.Snapshot snapshot =
                 linkHealthController.snapshot(mac, capturedAtMs);
         int actualBitrateKbps = NativeLhdcMemoryPatch.currentGovernorBitrateKbps();
+        int requestedBitrateKbps =
+                NativeLhdcMemoryPatch.currentGovernorRequestedBitrateKbps();
+        String bitrateVerification = NativeLhdcMemoryPatch.currentGovernorVerification();
         Object[] telemetry = {
                 "mac", redactMac(mac),
                 "unusedAfh", sample.unusedAfhChannels,
@@ -824,8 +1165,13 @@ public final class SystemHookInstaller {
                 "underflow", sample.underflowCount,
                 "streaming", streaming,
                 "actualBitrateKbps", actualBitrateKbps,
+                "requestedBitrateKbps", requestedBitrateKbps,
+                "bitrateVerification", bitrateVerification,
                 "healthyWindows", snapshot.healthyBqrWindows,
                 "ceilingKbps", snapshot.ceilingKbps,
+                "effectiveCeilingKbps", snapshot.ceilingKbps,
+                "peerCeilingKbps", snapshot.peerCeilingKbps,
+                "boundary900To1000Supported", snapshot.boundary900To1000Supported,
                 "lock500to900", snapshot.boundary500To900Locked,
                 "lock900to1000", snapshot.boundary900To1000Locked,
                 "requiredHealthyWindows", snapshot.requiredHealthyBqrWindows,
@@ -840,7 +1186,15 @@ public final class SystemHookInstaller {
                 "recoveryWaitRemainingMs", snapshot.recoveryWaitRemainingMs,
                 "nativeBackoffRemainingMs", snapshot.nativeBackoffRemainingMs,
                 "blockedReason", snapshot.blockedReason,
-                "streamSessionId", snapshot.streamSessionId
+                "streamSessionId", snapshot.streamSessionId,
+                "lastRemoteChoppyLevel", snapshot.lastRemoteChoppyLevel,
+                "remoteChoppyCount5s", snapshot.remoteChoppyCount5s,
+                "choppyCapabilityState", snapshot.choppyCapabilityState,
+                "shadowUnstableWindows", snapshot.shadowUnstableWindows,
+                "shadowCandidateCount", snapshot.shadowCandidateCount,
+                "lastShadowCandidateKbps", snapshot.lastShadowCandidateKbps,
+                "lastShadowCandidateAgoMs", snapshot.lastShadowCandidateAgoMs,
+                "shadowStreamSessionId", snapshot.shadowStreamSessionId
         };
         MLog.eventLogOnly("lhdc.link.bqr", telemetry);
         sendLhdcDiagnosticLiveState(mac, snapshot, null, "bqr");
@@ -850,7 +1204,10 @@ public final class SystemHookInstaller {
                 + snapshot.boundary900To1000Locked + '|'
                 + snapshot.requiredHealthyBqrWindows + '|' + snapshot.requiredQuietMs + '|'
                 + snapshot.probePhase + '|' + snapshot.blockedReason + '|'
-                + snapshot.probeBadBqrWindows + '|' + snapshot.streamSessionId;
+                + snapshot.probeBadBqrWindows + '|' + snapshot.streamSessionId + '|'
+                + snapshot.peerCeilingKbps + '|' + sample.overflowCount + '|'
+                + sample.underflowCount + '|' + snapshot.shadowUnstableWindows + '|'
+                + snapshot.shadowCandidateCount + '|' + snapshot.choppyCapabilityState;
         if (!diagnosticState.equals(lastBqrDiagnosticState)
                 || capturedAtMs - lastBqrDiagnosticMs >= BQR_DIAGNOSTIC_INTERVAL_MS) {
             lastBqrDiagnosticState = diagnosticState;
@@ -902,13 +1259,56 @@ public final class SystemHookInstaller {
                     Object[] args = chain.getArgs().toArray();
                     int level = args.length > 0 && args[0] instanceof Integer
                             ? (Integer) args[0] : 0;
-                    NativeLhdcMemoryPatch.reportRemoteChoppy(level);
+                    byte[] callbackPayload = args.length > 1 && args[1] instanceof byte[]
+                            ? (byte[]) args[1] : null;
+                    long nowMs = SystemClock.elapsedRealtime();
+                    long sequence = remoteChoppySequence.incrementAndGet();
+                    RemoteChoppyAttribution attribution =
+                            resolveRemoteChoppyAttribution(callbackPayload);
                     if (level > 0) {
-                        long nowMs = SystemClock.elapsedRealtime();
-                        mainHandler.post(() -> {
-                            String mac = activeLhdcMac;
-                            if (mac != null) linkHealthController.onCongestion(mac, nowMs);
-                        });
+                        String dedupKey = attribution.reliable && attribution.mac != null
+                                ? attribution.mac : "<unknown>";
+                        Long lastAcceptedAt = lastRemoteChoppyEventMsByMac.get(dedupKey);
+                        if (lastAcceptedAt != null
+                                && nowMs - lastAcceptedAt < CHOPPY_DEDUP_WINDOW_MS) {
+                            // Phase N-2 1s dedup: same physical event re-delivered; record the
+                            // drop so the feedback package can audit double-delivery, but do
+                            // not feed the decision path twice.
+                            MLog.event("lhdc.link.choppy_dedup",
+                                    "mac", redactMac(dedupKey),
+                                    "level", level,
+                                    "sequence", sequence,
+                                    "sinceMs", nowMs - lastAcceptedAt);
+                        } else {
+                            lastRemoteChoppyEventMsByMac.put(dedupKey, nowMs);
+                            NativeLhdcMemoryPatch.reportRemoteChoppy(level);
+                            if (attribution.reliable && attribution.mac != null) {
+                                mainHandler.post(() -> {
+                                    linkHealthController.onRemoteChoppyReport(
+                                            attribution.mac, level, nowMs);
+                                    LhdcLinkHealthController.Snapshot snapshot =
+                                            linkHealthController.snapshot(
+                                                    attribution.mac,
+                                                    SystemClock.elapsedRealtime());
+                                    logRemoteChoppyEvent(
+                                            level, sequence, callbackPayload, attribution,
+                                            snapshot);
+                                    sendLhdcDiagnosticLiveState(
+                                            attribution.mac,
+                                            snapshot,
+                                            "remote_choppy",
+                                            "choppy");
+                                });
+                            } else {
+                                logRemoteChoppyEvent(
+                                        level, sequence, callbackPayload, attribution, null);
+                            }
+                        }
+                    } else {
+                        LhdcLinkHealthController.Snapshot snapshot = attribution.mac != null
+                                ? linkHealthController.snapshot(attribution.mac, nowMs) : null;
+                        logRemoteChoppyEvent(
+                                level, sequence, callbackPayload, attribution, snapshot);
                     }
                     return chain.proceed();
                 });
@@ -917,6 +1317,111 @@ public final class SystemHookInstaller {
             MLog.event("lhdc.governor.choppy_hooks", "count", hooked);
         } catch (Throwable t) {
             MLog.w("LHDC remote choppy hook unavailable", t);
+        }
+    }
+
+    private RemoteChoppyAttribution resolveRemoteChoppyAttribution(byte[] callbackPayload) {
+        Object service = a2dpServiceInstance;
+        if (service != null) {
+            try {
+                Method method = findMethod(service.getClass(), "getActiveDevice");
+                if (method != null) {
+                    method.setAccessible(true);
+                    String mac = macFromDeviceArg(method.invoke(service));
+                    if (mac != null) {
+                        return new RemoteChoppyAttribution(
+                                mac, "active_device", true,
+                                callbackAddressMatch(callbackPayload, mac));
+                    }
+                }
+            } catch (Throwable ignored) {
+                // Attribution falls through to the already-filtered controller active device.
+            }
+        }
+        String fallback = normalizeMac(activeLhdcMac);
+        if (fallback != null
+                && fallback.equals(linkHealthController.activeMac())
+                && NativeLhdcMemoryPatch.isGovernorStreaming()) {
+            return new RemoteChoppyAttribution(
+                    fallback, "controller_active", true,
+                    callbackAddressMatch(callbackPayload, fallback));
+        }
+        return new RemoteChoppyAttribution(
+                null, "unknown", false,
+                callbackPayload != null && callbackPayload.length == 6
+                        ? "unresolved_address_length" : "not_address_length");
+    }
+
+    private void logRemoteChoppyEvent(
+            int level,
+            long sequence,
+            byte[] callbackPayload,
+            RemoteChoppyAttribution attribution,
+            LhdcLinkHealthController.Snapshot snapshot) {
+        MLog.event("lhdc.link.remote_choppy",
+                "mac", redactMac(attribution.mac),
+                "attribution", attribution.source,
+                "attributionReliable", attribution.reliable,
+                "payloadLength", callbackPayload != null ? callbackPayload.length : -1,
+                "payloadAddressMatch", attribution.payloadAddressMatch,
+                "level", level,
+                "sequence", sequence,
+                "choppyCapabilityState", snapshot != null
+                        ? snapshot.choppyCapabilityState
+                        : LhdcLinkHealthController.CHOPPY_CAPABILITY_UNKNOWN,
+                "actualBitrateKbps", NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                "requestedBitrateKbps",
+                NativeLhdcMemoryPatch.currentGovernorRequestedBitrateKbps(),
+                "bitrateVerification", NativeLhdcMemoryPatch.currentGovernorVerification(),
+                "queue", snapshot != null ? snapshot.currentQueueLength : -1,
+                "queueCapacity", snapshot != null ? snapshot.queueCapacity : 0,
+                "bqrAgeMs", snapshot != null ? snapshot.lastBqrAgoMs : -1L,
+                "unusedAfh", snapshot != null
+                        ? Math.max(0, 79 - snapshot.usableAfhChannels) : -1,
+                "retxPerSec", snapshot != null
+                        ? rateText(snapshot.retransmissionsPerSecond) : "?",
+                "noRxPerSec", snapshot != null
+                        ? rateText(snapshot.noRxPerSecond) : "?",
+                "probePhase", snapshot != null ? snapshot.probePhase : "?",
+                "streamSessionId", snapshot != null ? snapshot.streamSessionId : 0L);
+    }
+
+    private static String callbackAddressMatch(byte[] payload, String mac) {
+        String normalized = normalizeMac(mac);
+        if (payload == null || payload.length != 6 || normalized == null) {
+            return "not_address_length";
+        }
+        String[] parts = normalized.split(":");
+        if (parts.length != 6) return "invalid_mac";
+        boolean forward = true;
+        boolean reverse = true;
+        for (int i = 0; i < 6; i++) {
+            int expected;
+            try {
+                expected = Integer.parseInt(parts[i], 16);
+            } catch (NumberFormatException ignored) {
+                return "invalid_mac";
+            }
+            forward &= (payload[i] & 0xFF) == expected;
+            reverse &= (payload[5 - i] & 0xFF) == expected;
+        }
+        if (forward) return "forward";
+        if (reverse) return "reverse";
+        return "none";
+    }
+
+    private static final class RemoteChoppyAttribution {
+        final String mac;
+        final String source;
+        final boolean reliable;
+        final String payloadAddressMatch;
+
+        RemoteChoppyAttribution(
+                String mac, String source, boolean reliable, String payloadAddressMatch) {
+            this.mac = mac;
+            this.source = source;
+            this.reliable = reliable;
+            this.payloadAddressMatch = payloadAddressMatch;
         }
     }
 
@@ -993,48 +1498,129 @@ public final class SystemHookInstaller {
                     long nowMs = SystemClock.elapsedRealtime();
                     String mac = activeLhdcMac;
                     long streamSessionId = NativeLhdcMemoryPatch.currentGovernorSessionEpoch();
-                    NativeLhdcMemoryPatch.GovernorEvent event =
-                            NativeLhdcMemoryPatch.consumeGovernorEvent();
+                    // Keep the single-slot native event pending until it can be bound to a known
+                    // active MAC; consuming it with mac=null would permanently lose capability
+                    // detection and upgrade evidence before the first BQR callback.
+                    NativeLhdcMemoryPatch.GovernorEvent event = mac != null
+                            ? NativeLhdcMemoryPatch.consumeGovernorEvent() : null;
                     if (mac != null) {
                         if (NativeLhdcMemoryPatch.isGovernorStreaming()) {
                             linkHealthController.onStreamSessionChanged(
                                     mac, streamSessionId, nowMs);
                         }
-                        if (event != null) {
-                            linkHealthController.onGovernorEvent(
-                                    mac, event.type, event.fromKbps, event.toKbps,
-                                    event.detailMs, nowMs);
+                        if (event != null
+                                && event.type
+                                == LhdcLinkHealthController.EVENT_PEER_CEILING_DETECTED) {
+                            // Native getter proved the peer cannot sustain the target rung
+                            // (e.g. actual 900 for target 1000). Bind it to the active MAC.
+                            if (event.toKbps == 900 || event.toKbps == 1000) {
+                                rememberPeerCeiling(mac, event.toKbps, "native_detected");
+                            }
+                        } else if (event != null) {
+                            boolean current =
+                                    NativeLhdcMemoryPatch.isGovernorEventCurrent(event);
+                            if (!current) {
+                                // Phase N-1 requestId transaction: the event belongs to a
+                                // superseded Target_Cap write. Java only acts on the latest
+                                // transaction; older results are logged and dropped.
+                                MLog.event("lhdc.governor.event_stale",
+                                        "mac", redactMac(mac),
+                                        "type", event.type,
+                                        "fromKbps", event.fromKbps,
+                                        "toKbps", event.toKbps,
+                                        "reasonId", event.reasonId,
+                                        "requestId", event.requestId);
+                            }
+                            if (event.type
+                                    == LhdcLinkHealthController.EVENT_TRANSITION_APPLIED) {
+                                noteLhdcDiagnosticReason(
+                                        nativeTransitionReason(event), nowMs);
+                                if (current) {
+                                    linkHealthController.onTransitionConfirmed(
+                                            mac, event.toKbps, event.requestId, nowMs);
+                                }
+                            } else if (current) {
+                                linkHealthController.onGovernorEvent(
+                                        mac, event.type, event.fromKbps, event.toKbps,
+                                        event.detailMs, nowMs);
+                            }
                         }
                         if (NativeLhdcMemoryPatch.isGovernorStreaming()) {
                             linkHealthController.onQueueSample(
                                     mac, length, LHDC_QUEUE_CAPACITY, nowMs);
+                            // Transactions can only be confirmed while the native sampler runs;
+                            // when streaming is suspended no event can arrive, so defer the
+                            // timeout check instead of reporting a getter=0 phantom timeout.
+                            LhdcLinkHealthController.PendingTransaction switchTimedOut =
+                                    linkHealthController.tickSwitchTransactions(mac, nowMs);
+                            if (switchTimedOut != null) {
+                                MLog.event("lhdc.governor.switch_timeout",
+                                        "mac", redactMac(mac),
+                                        "targetKbps", switchTimedOut.targetKbps,
+                                        "requestId", switchTimedOut.requestId,
+                                        "sinceMs", switchTimedOut.sinceMs,
+                                        "actualBitrateKbps",
+                                        NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                                        "bitrateVerification",
+                                        NativeLhdcMemoryPatch.currentGovernorVerification());
+                            }
                         }
                         if (event != null) {
                             LhdcLinkHealthController.Snapshot snapshot =
                                     linkHealthController.snapshot(mac, nowMs);
-                            MLog.event("lhdc.link.governor_event",
-                                    "mac", redactMac(mac),
-                                    "type", event.type,
-                                    "fromKbps", event.fromKbps,
-                                    "toKbps", event.toKbps,
-                                    "detailMs", event.detailMs,
-                                    "actualBitrateKbps",
-                                    NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
-                                    "ceilingKbps", snapshot.ceilingKbps,
-                                    "requiredHealthyWindows",
-                                    snapshot.requiredHealthyBqrWindows,
-                                    "requiredQuietMs", snapshot.requiredQuietMs,
-                                    "queue", snapshot.currentQueueLength,
-                                    "lowQueueDurationMs", snapshot.lowQueueDurationMs,
-                                    "probePhase", snapshot.probePhase,
-                                    "probeElapsedMs", snapshot.probeElapsedMs,
-                                    "nativeBackoffRemainingMs",
-                                    snapshot.nativeBackoffRemainingMs,
-                                    "blockedReason", snapshot.blockedReason,
-                                    "streamSessionId", snapshot.streamSessionId);
                             String liveReason = null;
-                            if (event.type == LhdcLinkHealthController.EVENT_UPGRADE_APPLIED) {
-                                liveReason = "native_upgrade_applied";
+                            if (event.type
+                                    == LhdcLinkHealthController.EVENT_PEER_CEILING_DETECTED) {
+                                MLog.event("lhdc.link.peer_ceiling_detected",
+                                        "mac", redactMac(mac),
+                                        "actualKbps", event.toKbps,
+                                        "peerCeilingKbps", snapshot.peerCeilingKbps,
+                                        "ceilingKbps", snapshot.ceilingKbps,
+                                        "probePhase", snapshot.probePhase);
+                                liveReason = "peer_ceiling_detected";
+                            } else if (event.type
+                                    == LhdcLinkHealthController.EVENT_TRANSITION_APPLIED) {
+                                MLog.event("lhdc.link.native_transition",
+                                        "mac", redactMac(mac),
+                                        "reason", nativeTransitionReason(event),
+                                        "fromKbps", event.fromKbps,
+                                        "toKbps", event.toKbps,
+                                        "actualBitrateKbps",
+                                        NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                                        "requestedBitrateKbps",
+                                        NativeLhdcMemoryPatch.currentGovernorRequestedBitrateKbps(),
+                                        "bitrateVerification",
+                                        NativeLhdcMemoryPatch.currentGovernorVerification());
+                                liveReason = nativeTransitionReason(event);
+                            } else {
+                                MLog.event("lhdc.link.governor_event",
+                                        "mac", redactMac(mac),
+                                        "type", event.type,
+                                        "fromKbps", event.fromKbps,
+                                        "toKbps", event.toKbps,
+                                        "detailMs", event.detailMs,
+                                        "actualBitrateKbps",
+                                        NativeLhdcMemoryPatch.currentGovernorBitrateKbps(),
+                                        "requestedBitrateKbps",
+                                        NativeLhdcMemoryPatch.currentGovernorRequestedBitrateKbps(),
+                                        "bitrateVerification",
+                                        NativeLhdcMemoryPatch.currentGovernorVerification(),
+                                        "ceilingKbps", snapshot.ceilingKbps,
+                                        "requiredHealthyWindows",
+                                        snapshot.requiredHealthyBqrWindows,
+                                        "requiredQuietMs", snapshot.requiredQuietMs,
+                                        "queue", snapshot.currentQueueLength,
+                                        "lowQueueDurationMs", snapshot.lowQueueDurationMs,
+                                        "probePhase", snapshot.probePhase,
+                                        "probeElapsedMs", snapshot.probeElapsedMs,
+                                        "nativeBackoffRemainingMs",
+                                        snapshot.nativeBackoffRemainingMs,
+                                        "blockedReason", snapshot.blockedReason,
+                                        "streamSessionId", snapshot.streamSessionId);
+                                if (event.type
+                                        == LhdcLinkHealthController.EVENT_UPGRADE_APPLIED) {
+                                    liveReason = "native_upgrade_applied";
+                                }
                             }
                             sendLhdcDiagnosticLiveState(
                                     mac, snapshot, liveReason, "governor");
@@ -1047,6 +1633,14 @@ public final class SystemHookInstaller {
                     MLog.w("LHDC queue sample invocation failed", t);
                 }
             }
+        }
+        // Observe-only dynamic adapter probe: runs only while a diagnostic recording session is
+        // active (and only in debug builds, see BuildConfig.LHDC_DYN_OBSERVE). Evidence lands in
+        // the feedback package for future ROM-family research; never changes bitrate state.
+        if (appContext != null
+                && DiagnosticEvents.isRecording(appContext)
+                && NativeLhdcMemoryPatch.isGovernorStreaming()) {
+            NativeLhdcMemoryPatch.probeAdjustOwnerIfEnabled();
         }
         synchronized (this) {
             if (!smartAudioQueueSampleScheduled && smartAudioInterface != null) {
@@ -1090,7 +1684,10 @@ public final class SystemHookInstaller {
         synchronized (this) {
             if (nativePatchRunning) return;
             NativeLhdcMemoryPatch.PatchResult previous = NativeLhdcMemoryPatch.lastResult();
-            if (nativePatchTerminal && !shouldRetryTerminalNativePatch(previous, forceIfPending)) {
+            NativeLhdcMemoryPatch.PatchResult previousQualitySwitch =
+                    NativeLhdcMemoryPatch.lastQualitySwitchResult();
+            if (nativePatchTerminal && !shouldRetryTerminalNativePatch(
+                    previous, previousQualitySwitch, forceIfPending)) {
                 cachedResult = previous;
             } else {
                 nativePatchRunning = true;
@@ -1108,6 +1705,8 @@ public final class SystemHookInstaller {
         }
 
         NativeLhdcMemoryPatch.PatchResult result = NativeLhdcMemoryPatch.apply();
+        NativeLhdcMemoryPatch.PatchResult qualitySwitchResult =
+                NativeLhdcMemoryPatch.applyQualitySwitchGuard();
         try {
             MLog.event("lhdc.memory_patch",
                     "status", result.status,
@@ -1117,24 +1716,36 @@ public final class SystemHookInstaller {
                     "patched", result.patchedCount,
                     "original", result.originalCount,
                     "success", result.success);
+            MLog.event("lhdc.memory_patch.fast_switch",
+                    "status", qualitySwitchResult.status,
+                    "reason", reason,
+                    "detail", qualitySwitchResult.reason,
+                    "addr", qualitySwitchResult.addressHex(),
+                    "patched", qualitySwitchResult.patchedCount,
+                    "original", qualitySwitchResult.originalCount,
+                    "success", qualitySwitchResult.success);
             sendNativePatchState(result);
         } finally {
             synchronized (this) {
                 nativePatchRunning = false;
-                nativePatchTerminal = result.terminal;
+                nativePatchTerminal = result.terminal && qualitySwitchResult.terminal;
             }
         }
-        if (!result.terminal && allowRetry) {
+        if ((!result.terminal || !qualitySwitchResult.terminal) && allowRetry) {
             scheduleNativeLhdcMemoryPatch(reason);
         }
     }
 
     private static boolean shouldRetryTerminalNativePatch(
             NativeLhdcMemoryPatch.PatchResult previous,
+            NativeLhdcMemoryPatch.PatchResult previousQualitySwitch,
             boolean forceIfPending) {
         if (!forceIfPending) return false;
-        if (previous == null) return true;
-        return !previous.terminal || "pending".equals(previous.status);
+        if (previous == null || previousQualitySwitch == null) return true;
+        return !previous.terminal
+                || "pending".equals(previous.status)
+                || !previousQualitySwitch.terminal
+                || "pending".equals(previousQualitySwitch.status);
     }
 
     private void sendNativePatchState(NativeLhdcMemoryPatch.PatchResult result) {

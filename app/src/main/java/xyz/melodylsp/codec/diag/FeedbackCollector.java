@@ -13,6 +13,7 @@ import android.provider.MediaStore;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -53,7 +54,11 @@ public final class FeedbackCollector {
             "bridge.le.ws",
             "dexkit",
             "native.patch",
+            "diag.root.capture",
             "lhdc.link.bqr",
+            "lhdc.link.choppy",
+            "lhdc.link.queue",
+            "lhdc.link.shadow",
             "lhdc.link.governor",
             "codec.write",
             "remember.write",
@@ -119,11 +124,12 @@ public final class FeedbackCollector {
     };
     private static final String MODULE_LOGCAT_COMMAND =
             "/system/bin/logcat -d -b all -t 20000 "
-                    + "MelodyCodecLsp:V MelodyLhdcGov:V '*:S'";
+                    + "MelodyCodecLsp:V MelodyLhdcGov:V MelodyLhdcDyn:V '*:S'";
     private static final String BLUETOOTH_LOGCAT_COMMAND =
             "/system/bin/logcat -d -b all -t 50000 "
                     + "MelodyCodecLsp:V "
                     + "MelodyLhdcGov:V "
+                    + "MelodyLhdcDyn:V "
                     + "BluetoothQualityReportNativeInterface:V "
                     + "BluetoothQualityReportJni:V "
                     + "bluetooth-a2dp:V soc_bta_av:V "
@@ -138,11 +144,29 @@ public final class FeedbackCollector {
         String name = "OPlusHeadsetAudioHelper-feedback-" + stamp + ".zip";
         DiagnosticEvents.requestRememberedSnapshot(context);
         sleepQuietly(900L);
+        SharedPreferences diag = context.getSharedPreferences(
+                DiagnosticEvents.PREFS, Context.MODE_PRIVATE);
+        String sessionId = diag.getString(DiagnosticEvents.KEY_SESSION_ID, "");
+        // Fail closed when the session is not root-backed: a feedback package without the
+        // mandatory root capture and vendor libraries is not a valid diagnostic submission.
+        if (!isValidRootBackedSession(diag)) {
+            throw new IllegalStateException(
+                    "当前没有有效的 root 记录会话，请先在 Root 管理器授权并重新开始记录");
+        }
+        // Collect vendor libraries BEFORE stopping the root logcat so the LHDC encoder stays
+        // mapped and playing while the two .so files are located and read.
+        NativeLibraryCollector.CollectionResult nativeResult =
+                NativeLibraryCollector.collect(context);
+        if (!nativeResult.succeeded()) {
+            String detail = nativeResult.errors.isEmpty()
+                    ? "未知错误" : String.join("; ", nativeResult.errors);
+            throw new IllegalStateException(
+                    "native 库收集失败（请保持耳机连接并继续播放后重试）：" + detail);
+        }
+        String persistentBluetoothLog = RootBluetoothLogCapture.stopAndRead(context, sessionId);
         OutputTarget target = openTarget(context, name);
         try {
             ZipOutputStream zip = new ZipOutputStream(target.stream);
-            SharedPreferences diag = context.getSharedPreferences(
-                    DiagnosticEvents.PREFS, Context.MODE_PRIVATE);
             write(zip, "summary.txt", buildSummary(context));
             write(zip, "diagnostics.txt", buildDiagnostics(diag));
             write(zip, "timeline.txt", diag.getString(DiagnosticEvents.KEY_EVENTS, ""));
@@ -154,14 +178,21 @@ public final class FeedbackCollector {
             String moduleLogcat = collectModuleLogcat();
             write(zip, "logcat-module.txt", moduleLogcat);
             write(zip, "logcat.txt", moduleLogcat);
-            write(zip, "logcat-bluetooth-root.txt", collectBluetoothLogcatRoot());
+            write(zip, "logcat-bluetooth-root.txt", mergeUniqueLogLines(
+                    persistentBluetoothLog, collectBluetoothLogcatRoot()));
 
             write(zip, "module-prop.txt", readResource(context,
                     "META-INF/xposed/module.prop"));
             write(zip, "scope-list.txt", readResource(context,
                     "META-INF/xposed/scope.list"));
+            writeNativeLibraries(zip, nativeResult);
             zip.close();
             target.finish(context);
+            try {
+                RootBluetoothLogCapture.cleanup(context, sessionId);
+            } catch (Throwable ignored) {
+                // The archive already contains the capture; cleanup is best-effort only.
+            }
             try {
                 DiagnosticEvents.stopSession(context, "feedback_collected");
             } catch (Throwable ignored) {
@@ -170,7 +201,68 @@ public final class FeedbackCollector {
             return target.displayPath;
         } catch (Throwable t) {
             target.abort(context);
+            for (NativeLibraryCollector.CollectedLibrary lib
+                    : nativeResult.libraries.values()) {
+                deleteQuietly(lib.tempFile);
+            }
             throw t;
+        }
+    }
+
+    static boolean isValidRootBackedSession(SharedPreferences diag) {
+        if (diag == null) return false;
+        String sessionId = diag.getString(DiagnosticEvents.KEY_SESSION_ID, "");
+        if (sessionId == null || sessionId.isEmpty()) return false;
+        String status = diag.getString(RootBluetoothLogCapture.KEY_CAPTURE_STATUS, "");
+        return "started".equals(status)
+                || "collected".equals(status)
+                || "stopped".equals(status);
+    }
+
+    private static void writeNativeLibraries(
+            ZipOutputStream zip,
+            NativeLibraryCollector.CollectionResult result) throws Exception {
+        StringBuilder manifest = new StringBuilder();
+        manifest.append("module=MelodyCodecTweaker native library evidence\n");
+        manifest.append("device=").append(Build.MODEL).append('\n');
+        manifest.append("build=").append(Build.DISPLAY).append('\n');
+        manifest.append("fingerprint=").append(Build.FINGERPRINT).append('\n');
+        for (String basename : new String[]{
+                NativeLibraryCollector.LIB_BLUETOOTH_JNI,
+                NativeLibraryCollector.LIB_LHDC_ENC}) {
+            NativeLibraryCollector.CollectedLibrary lib = result.libraries.get(basename);
+            if (lib == null) {
+                manifest.append(basename).append("=missing\n");
+                continue;
+            }
+            manifest.append(basename).append('\n');
+            manifest.append("  source=").append(lib.sourcePath).append('\n');
+            manifest.append("  size=").append(lib.size).append('\n');
+            manifest.append("  sha256=").append(lib.sha256).append('\n');
+            writeBinary(zip, "native/" + basename, lib.tempFile);
+        }
+        write(zip, "native/manifest.txt", manifest.toString());
+    }
+
+    private static void writeBinary(
+            ZipOutputStream zip, String name, File file) throws Exception {
+        ZipEntry entry = new ZipEntry(name);
+        zip.putNextEntry(entry);
+        try (InputStream in = new FileInputStream(file)) {
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                zip.write(buf, 0, n);
+            }
+        }
+        zip.closeEntry();
+    }
+
+    private static void deleteQuietly(File file) {
+        if (file == null) return;
+        try {
+            if (file.exists() && !file.delete()) file.deleteOnExit();
+        } catch (Throwable ignored) {
         }
     }
 
@@ -384,7 +476,7 @@ public final class FeedbackCollector {
         return mergeUniqueLogLines(taggedFiltered, allFiltered);
     }
 
-    private static String mergeUniqueLogLines(String first, String second) {
+    static String mergeUniqueLogLines(String first, String second) {
         Set<String> lines = new LinkedHashSet<>();
         addLogLines(lines, first);
         addLogLines(lines, second);
@@ -453,6 +545,81 @@ public final class FeedbackCollector {
         failures.append("$ /system/bin/sh -c su -c ...\n").append(shellResult).append('\n');
         return "root command failed: no usable su was found or root access was denied\n\n"
                 + failures;
+    }
+
+    static String runRootCommandForDiagnostics(String command, long timeoutMs) {
+        return runRootCommand(command, timeoutMs);
+    }
+
+    /**
+     * Runs {@code command} under root and writes its raw stdout to {@code dest} without ever
+     * converting the payload to a String. Traverses the same su candidates as
+     * {@link #runRootCommand}; stderr is drained separately. Returns true only when a candidate
+     * exits 0 and produces a non-empty file. Used exclusively for vendor native libraries.
+     */
+    static boolean runRootBinary(String command, java.io.File dest, long timeoutMs) {
+        for (String su : SU_CANDIDATES) {
+            Process process = null;
+            FileDrainer out = null;
+            Thread err = null;
+            try {
+                process = new ProcessBuilder(su, "-c", command).start();
+                out = new FileDrainer(process.getInputStream(), dest);
+                out.start();
+                final Process watched = process;
+                err = new Thread(() -> {
+                    try (InputStream in = watched.getErrorStream()) {
+                        byte[] buf = new byte[512];
+                        while (in.read(buf) > 0) {
+                            // Drain stderr so the process never blocks on a full pipe.
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }, "OPlusHeadsetAudioHelper-native-stderr");
+                err.setDaemon(true);
+                err.start();
+                boolean finished = process.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
+                out.join(2_000L);
+                if (!finished) {
+                    process.destroy();
+                    continue;
+                }
+                if (process.exitValue() != 0) continue;
+                return dest.length() > 0L;
+            } catch (Throwable t) {
+                // Try the next su candidate.
+            } finally {
+                if (err != null) err.interrupt();
+                if (out != null) out.interrupt();
+                if (process != null) process.destroy();
+            }
+        }
+        return false;
+    }
+
+    /** Copies the process stdout into {@code dest} on a background thread, then drains any tail. */
+    private static final class FileDrainer extends Thread {
+        private final InputStream in;
+        private final java.io.File dest;
+
+        FileDrainer(InputStream in, java.io.File dest) {
+            super("OPlusHeadsetAudioHelper-native-drain");
+            this.in = in;
+            this.dest = dest;
+            setDaemon(true);
+        }
+
+        @Override
+        public void run() {
+            try (OutputStream out = new FileOutputStream(dest)) {
+                byte[] buf = new byte[16 * 1024];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     private static boolean looksLikeRootCommandFailure(String result) {

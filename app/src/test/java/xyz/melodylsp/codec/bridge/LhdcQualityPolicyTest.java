@@ -43,4 +43,42 @@ public class LhdcQualityPolicyTest {
         assertSame(request, LhdcQualityPolicy.transportRequest(
                 request, LhdcQualityPolicy.QUALITY));
     }
+
+    @Test
+    public void ceiling900TransportIsPreservedUnderQualityPolicy() {
+        long requested = 0x8000L | CodecLabelTable.LHDC_QUALITY_FIXED_1000;
+        long lowered = 0x8000L | CodecLabelTable.LHDC_QUALITY_FIXED_900;
+        // A request already lowered to the 900 kbps peer ceiling must not be lifted back
+        // to 1000 by the QUALITY transport mapping.
+        assertEquals(
+                lowered,
+                LhdcQualityPolicy.transportSpecific1(lowered, LhdcQualityPolicy.QUALITY));
+        // The logical mapping still speaks the QUALITY concept.
+        assertEquals(
+                requested,
+                LhdcQualityPolicy.logicalSpecific1(lowered, LhdcQualityPolicy.QUALITY));
+    }
+
+    @Test
+    public void normalizeTreats900AsQuality() {
+        assertEquals(LhdcQualityPolicy.QUALITY,
+                LhdcQualityPolicy.normalize(
+                        (int) CodecLabelTable.LHDC_QUALITY_FIXED_900));
+    }
+
+    @Test
+    public void clampToCeilingLowersOnlyFixed1000() {
+        long lowered = 0x8000L | CodecLabelTable.LHDC_QUALITY_FIXED_900;
+        long requested = 0x8000L | CodecLabelTable.LHDC_QUALITY_FIXED_1000;
+        assertEquals(
+                lowered,
+                LhdcQualityPolicy.clampToCeiling(
+                        requested, (int) CodecLabelTable.LHDC_QUALITY_FIXED_900));
+        // ABR and other low bytes are untouched.
+        long abr = 0x8000L | CodecLabelTable.LHDC_QUALITY_ABR;
+        assertEquals(
+                abr,
+                LhdcQualityPolicy.clampToCeiling(
+                        abr, (int) CodecLabelTable.LHDC_QUALITY_FIXED_900));
+    }
 }

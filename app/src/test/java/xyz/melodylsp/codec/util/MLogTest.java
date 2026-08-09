@@ -31,6 +31,9 @@ public final class MLogTest {
         assertTrue(MLog.isStickyDiagnosticEvent("hires_anchored.injected"));
         assertTrue(MLog.isStickyDiagnosticEvent("codec.bt.receiver.registered"));
         assertTrue(MLog.isStickyDiagnosticEvent("lhdc.link.bqr_hooks"));
+        assertTrue(MLog.isStickyDiagnosticEvent("lhdc.link.stage_d"));
+        assertTrue(MLog.isStickyDiagnosticEvent("lhdc.governor.choppy_hooks"));
+        assertTrue(MLog.isStickyDiagnosticEvent("lhdc.governor.queue_hooks"));
         assertFalse(MLog.isStickyDiagnosticEvent("lhdc.link.bqr_summary"));
         assertFalse(MLog.isStickyDiagnosticEvent("codec.bt.reply"));
     }
