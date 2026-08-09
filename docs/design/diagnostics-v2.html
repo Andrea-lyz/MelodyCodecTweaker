@@ -897,7 +897,17 @@
     feedback.textContent = s.feedbackBusy ? '正在打包…' : '生成反馈包';
   }
 
-  function renderBoundary(prefix, state) {
+  function fmtCountdown(ms) {
+    const totalSec = Math.max(1, Math.round(ms / 1000));
+    if (totalSec >= 60) {
+      const min = Math.floor(totalSec / 60);
+      const sec = totalSec % 60;
+      return min + ' 分' + (sec > 0 ? ' ' + sec + ' 秒' : '');
+    }
+    return totalSec + ' 秒';
+  }
+
+  function renderBoundary(prefix, state, progress) {
     const bar = byId(prefix + '-bar');
     const value = byId(prefix + '-value');
     const lock = byId(prefix + '-lock');
@@ -913,7 +923,13 @@
       unsupported: ['不支持', 'var(--muted)', 'unsupported']
     };
     const current = states[state] || states.unknown;
-    bar.style.width = state === 'unknown' ? '0%' : '100%';
+    // Phase 5: a recovering bar fills with the recovery progress (0..1); other states
+    // are full (unknown stays empty).
+    const fill = state === 'unknown' ? 0
+      : (state === 'recovering' && Number.isFinite(progress))
+          ? Math.max(0, Math.min(1, progress))
+          : 1;
+    bar.style.width = (fill * 100).toFixed(1) + '%';
     bar.className = current[2];
     if (lock) lock.style.display = state === 'unsupported' ? '' : 'none';
     const aria = {
@@ -927,7 +943,9 @@
       unsupported: '不支持 1000 kbps'
     }[state] || '状态未知';
     bar.setAttribute('aria-label', aria);
-    value.textContent = current[0];
+    value.textContent = (state === 'recovering' && Number.isFinite(progress))
+      ? current[0] + ' ' + Math.round(fill * 100) + '%'
+      : current[0];
     value.style.color = current[1];
   }
 
@@ -978,18 +996,40 @@
       const activeCapKbps = bqrFallbackCapKbps > 0 && leakyCapKbps > 0
         ? Math.min(bqrFallbackCapKbps, leakyCapKbps)
         : Math.max(bqrFallbackCapKbps, leakyCapKbps);
+      // Phase 5: which protective mechanism drives the active cap and its recovery.
+      const bqrProgressActive = bqrFallbackCapKbps > 0
+        && (leakyCapKbps === 0 || bqrFallbackCapKbps <= leakyCapKbps);
+      const recoveryStreak = bqrProgressActive
+        ? number(latest.bqrFallbackHealthyWindows, 0)
+        : number(latest.leakyFallbackHealthyWindows, 0);
+      const recoveryRequired = bqrProgressActive
+        ? number(latest.bqrFallbackRequiredHealthyWindows, 0)
+        : number(latest.leakyFallbackRequiredHealthyWindows, 0);
+      const recoveryHoldRemainingMs = bqrProgressActive
+        ? number(latest.bqrFallbackHoldRemainingMs, 0)
+        : number(latest.leakyFallbackHoldRemainingMs, 0);
       if (activeCapKbps > 0) {
-        // Phase N-4 tiered recovery (6.8.5): the evidence text follows the tier.
-        const tierText = activeCapKbps <= 400
-          ? '连续 5 个健康窗口 + 30s 驻留'
-          : activeCapKbps <= 500
-          ? '连续 6 个健康窗口 + 60s~5min 驻留（连续失败后递增）'
-          : '连续 8 个健康窗口 + 2min 驻留';
-        const sourceText = bqrFallbackCapKbps > 0
+        const sourceText = bqrProgressActive
           ? 'BQR 保护' : '链路波动保护（漏桶）';
+        let countdownText;
+        if (recoveryRequired > 0 && recoveryStreak >= recoveryRequired) {
+          countdownText = recoveryHoldRemainingMs > 0
+            ? '窗口已达标，将在 ' + fmtCountdown(recoveryHoldRemainingMs) + ' 后再次尝试'
+            : '窗口已达标，等待切换';
+        } else if (recoveryRequired > 0) {
+          const shown = Math.min(recoveryStreak, recoveryRequired);
+          countdownText = '恢复中：' + shown + '/' + recoveryRequired + ' 健康窗'
+            + (recoveryHoldRemainingMs > 0
+                ? ' · 驻留剩余 ' + fmtCountdown(recoveryHoldRemainingMs) : '');
+          if (bqrProgressActive && activeCapKbps <= 500 && activeCapKbps > 400) {
+            countdownText += '（连续失败后驻留递增）';
+          }
+        } else {
+          countdownText = '等待健康证据';
+        }
         byId('bqr-evidence').textContent =
-          sourceText + '降档已生效，当前上限钳制在 ' + activeCapKbps
-          + ' kbps；需' + tierText + '后自动恢复。';
+          sourceText + '降档已生效，当前上限 ' + activeCapKbps
+          + ' kbps；' + countdownText + '。';
       } else if (retx > 60 || norx > 60 || unused > 49 || queueRatio >= 0.9) {
         byId('bqr-evidence').textContent =
           '链路压力较高，尚无保护降档证据；RF-only 不会触发强制降档。';
@@ -1063,8 +1103,13 @@
       } else {
         upperState = 'unknown';
       }
-      renderBoundary('boundary-500-900', lowerState);
-      renderBoundary('boundary-900-1000', upperState);
+      // Phase 5: a recovering bar fills with the window progress (streak / required).
+      const barProgress = recoveryRequired > 0
+        ? Math.min(recoveryStreak, recoveryRequired) / recoveryRequired : null;
+      renderBoundary('boundary-500-900', lowerState,
+        lowerState === 'recovering' ? barProgress : null);
+      renderBoundary('boundary-900-1000', upperState,
+        upperState === 'recovering' ? barProgress : null);
     }
     renderReasons(data.reasonCounts || {}, data.reasonTimes || {});
     renderHistory(data.history || []);

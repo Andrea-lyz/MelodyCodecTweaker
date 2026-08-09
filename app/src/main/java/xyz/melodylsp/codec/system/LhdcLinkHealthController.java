@@ -314,6 +314,18 @@ final class LhdcLinkHealthController {
         final int bqrFallbackCapKbps;
         /** Leaky-bucket fallback cap in kbps; 0 when inactive. */
         final int leakyFallbackCapKbps;
+        /** BQR recovery streak: counted windows while capped; 0 when inactive. */
+        final int bqrFallbackHealthyWindows;
+        /** Windows the current BQR tier needs (400->5, 500->6, 900->8); 0 when inactive. */
+        final int bqrFallbackRequiredHealthyWindows;
+        /** BQR hold remaining (incl. escalation) in ms; 0 when inactive or expired. */
+        final long bqrFallbackHoldRemainingMs;
+        /** Leaky-bucket recovery streak; 0 when inactive. */
+        final int leakyFallbackHealthyWindows;
+        /** Leaky-bucket required windows (6); 0 when inactive. */
+        final int leakyFallbackRequiredHealthyWindows;
+        /** Leaky-bucket hold remaining in ms; 0 when inactive or expired. */
+        final long leakyFallbackHoldRemainingMs;
 
         Snapshot(
                 int ceilingKbps,
@@ -351,7 +363,13 @@ final class LhdcLinkHealthController {
                 long lastShadowCandidateAgoMs,
                 long shadowStreamSessionId,
                 int bqrFallbackCapKbps,
-                int leakyFallbackCapKbps) {
+                int leakyFallbackCapKbps,
+                int bqrFallbackHealthyWindows,
+                int bqrFallbackRequiredHealthyWindows,
+                long bqrFallbackHoldRemainingMs,
+                int leakyFallbackHealthyWindows,
+                int leakyFallbackRequiredHealthyWindows,
+                long leakyFallbackHoldRemainingMs) {
             this.ceilingKbps = ceilingKbps;
             this.healthyBqrWindows = healthyBqrWindows;
             this.usableAfhChannels = usableAfhChannels;
@@ -388,6 +406,12 @@ final class LhdcLinkHealthController {
             this.shadowStreamSessionId = shadowStreamSessionId;
             this.bqrFallbackCapKbps = bqrFallbackCapKbps;
             this.leakyFallbackCapKbps = leakyFallbackCapKbps;
+            this.bqrFallbackHealthyWindows = bqrFallbackHealthyWindows;
+            this.bqrFallbackRequiredHealthyWindows = bqrFallbackRequiredHealthyWindows;
+            this.bqrFallbackHoldRemainingMs = bqrFallbackHoldRemainingMs;
+            this.leakyFallbackHealthyWindows = leakyFallbackHealthyWindows;
+            this.leakyFallbackRequiredHealthyWindows = leakyFallbackRequiredHealthyWindows;
+            this.leakyFallbackHoldRemainingMs = leakyFallbackHoldRemainingMs;
         }
     }
 
@@ -1010,7 +1034,8 @@ final class LhdcLinkHealthController {
                     false, false, 0, 0L, -1, 0, 0L, -1L,
                     "stable", 0L, 0, 0L, 0L, "none", 0L,
                     0, false, -1L, 0, -1L, 0,
-                    choppyCapabilityState, 0L, 0L, 0, 0, 0, -1L, 0L, 0, 0);
+                    choppyCapabilityState, 0L, 0L, 0, 0, 0, -1L, 0L, 0, 0,
+                    0, 0, 0L, 0, 0, 0L);
         }
         BoundaryState probe = inFlightBoundary(state);
         BoundaryState blocked = probe != null ? probe : firstBlockedBoundary(state);
@@ -1031,6 +1056,18 @@ final class LhdcLinkHealthController {
                 ? state.remoteChoppyCount : 0;
         long lastShadowCandidateAgoMs = state.lastShadowCandidateMs == 0L
                 ? -1L : Math.max(0L, nowMs - state.lastShadowCandidateMs);
+        int bqrRequired = state.bqrFallbackCapKbps > 0
+                ? requiredWindowsForBqrCap(state.bqrFallbackCapKbps) : 0;
+        long bqrHoldRemaining = state.bqrFallbackCapKbps > 0
+                ? Math.max(0L, state.bqrFallbackSinceMs
+                        + tierHoldMsForBqrCap(state.bqrFallbackCapKbps, state) - nowMs)
+                : 0L;
+        int leakyRequired = state.leakyFallbackCapKbps > 0
+                ? BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS : 0;
+        long leakyHoldRemaining = state.leakyFallbackCapKbps > 0
+                ? Math.max(0L, state.leakyFallbackSinceMs
+                        + BQR_FALLBACK_HOLD_MS[0] - nowMs)
+                : 0L;
         return new Snapshot(
                 effectiveCeiling(state),
                 state.healthyBqrWindows,
@@ -1067,7 +1104,27 @@ final class LhdcLinkHealthController {
                 lastShadowCandidateAgoMs,
                 state.shadowStreamSessionId,
                 state.bqrFallbackCapKbps,
-                state.leakyFallbackCapKbps);
+                state.leakyFallbackCapKbps,
+                state.bqrFallbackHealthyWindows,
+                bqrRequired,
+                bqrHoldRemaining,
+                state.leakyFallbackHealthyWindows,
+                leakyRequired,
+                leakyHoldRemaining);
+    }
+
+    /** Phase 5 countdown UI: required recovery windows per BQR cap tier. */
+    private static int requiredWindowsForBqrCap(int capKbps) {
+        if (capKbps <= 400) return RECOVERY_FAST_HEALTHY_WINDOWS;
+        if (capKbps <= 500) return BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS;
+        return BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT;
+    }
+
+    /** Phase 5 countdown UI: effective hold (incl. escalation) for the active BQR tier. */
+    private static long tierHoldMsForBqrCap(int capKbps, DeviceState state) {
+        if (capKbps <= 400) return RECOVERY_FAST_HOLD_MS;
+        if (capKbps <= 500) return bqrFallbackHoldMs(state);
+        return strictFallbackHoldMs(state);
     }
 
     private DeviceState stateFor(String mac) {

@@ -673,6 +673,43 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
+    public void snapshotExposesRecoveryProgressForCountdownUi() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+
+        // Idle snapshot: no cap fields yet.
+        LhdcLinkHealthController.Snapshot idle = controller.snapshot(MAC, 20_000L);
+        assertEquals(900, idle.ceilingKbps);
+
+        // Baseline (invalid interval, not counted) then three non-bad windows.
+        controller.onBqrSample(MAC, healthyBqr(), 30_000L);
+        for (int i = 1; i <= 3; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 36_000L + i * 6_000L);  // 42..54
+        }
+        LhdcLinkHealthController.Snapshot mid = controller.snapshot(MAC, 54_000L);
+        assertEquals(3, mid.bqrFallbackHealthyWindows);
+        assertEquals(8, mid.bqrFallbackRequiredHealthyWindows);
+        // Hold: trigger at 10s + 120s (level 0) = 130s; remaining at 54s = 76s.
+        assertEquals(76_000L, mid.bqrFallbackHoldRemainingMs);
+        assertEquals(0, mid.leakyFallbackHealthyWindows);
+        assertEquals(0, mid.leakyFallbackRequiredHealthyWindows);
+        assertEquals(0L, mid.leakyFallbackHoldRemainingMs);
+
+        // Leaky path exposes its own progress fields.
+        LhdcLinkHealthController leaky = new LhdcLinkHealthController(new Recorder());
+        leaky.activate(MAC, 100L);
+        leaky.onRemoteChoppyReport(MAC, 1, 16_000L);
+        leaky.onRemoteChoppyReport(MAC, 1, 24_000L);  // leaky -> 900
+        LhdcLinkHealthController.Snapshot ls = leaky.snapshot(MAC, 30_000L);
+        assertEquals(900, ls.leakyFallbackCapKbps);
+        assertEquals(6, ls.leakyFallbackRequiredHealthyWindows);
+        // Hold: trigger at 24s + 60s = 84s; remaining at 30s = 54s.
+        assertEquals(54_000L, ls.leakyFallbackHoldRemainingMs);
+    }
+
+    @Test
     public void midTierCountsRelaxedNoRxButKeepsRetxAndOneSidedHotGates() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);

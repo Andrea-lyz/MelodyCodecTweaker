@@ -606,6 +606,14 @@ public final class SystemHookInstaller {
             payload.put("shadowCandidateCount", snapshot.shadowCandidateCount);
             payload.put("bqrFallbackCapKbps", snapshot.bqrFallbackCapKbps);
             payload.put("leakyFallbackCapKbps", snapshot.leakyFallbackCapKbps);
+            payload.put("bqrFallbackHealthyWindows", snapshot.bqrFallbackHealthyWindows);
+            payload.put("bqrFallbackRequiredHealthyWindows",
+                    snapshot.bqrFallbackRequiredHealthyWindows);
+            payload.put("bqrFallbackHoldRemainingMs", snapshot.bqrFallbackHoldRemainingMs);
+            payload.put("leakyFallbackHealthyWindows", snapshot.leakyFallbackHealthyWindows);
+            payload.put("leakyFallbackRequiredHealthyWindows",
+                    snapshot.leakyFallbackRequiredHealthyWindows);
+            payload.put("leakyFallbackHoldRemainingMs", snapshot.leakyFallbackHoldRemainingMs);
             payload.put("lastShadowCandidateKbps", snapshot.lastShadowCandidateKbps);
             payload.put("lastShadowCandidateAgoMs", snapshot.lastShadowCandidateAgoMs);
             payload.put("shadowStreamSessionId", snapshot.shadowStreamSessionId);
