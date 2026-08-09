@@ -124,8 +124,8 @@ final class LhdcLinkHealthController {
     static final int RECOVERY_FAST_HEALTHY_WINDOWS = 5;
     static final long RECOVERY_FAST_HOLD_MS = 30_000L;
     // 900 -> 1000 is the strictest tier: more windows and a longer hold than the regular
-    // 500 -> 900 tier (which keeps the calibrated <24 retx with a relaxed <25 noRx,
-    // decision 44, plus the escalating hold).
+    // 500 -> 900 tier (which shares the non-bad <30/<25 evidence but resets on one-sided
+    // hot windows and uses the escalating 60s hold; decisions 44/46).
     static final int BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT = 8;
     /**
      * Strict-tier (900 -> 1000) escalating hold (decision 45, 2026-08-09): the base 120 s
@@ -720,8 +720,9 @@ final class LhdcLinkHealthController {
                     // streak (review P2-1). X3 sits in the 24-35 band after interference
                     // stops; the strict gate never accumulated six windows and stranded the
                     // 900 rung (earlier the AFH<=49 gate made it unreachable). The BQR
-                    // fallback recovery keeps the calibrated <24 retx; noRx is <25 for the
-                    // 500 tier (decision 44) and non-bad <25 for the 900 tier (3a7d64a).
+                    // fallback recovery uses non-bad evidence <30/<25 for the 500 and 900
+                    // tiers (decisions 44/45/46; the 500 tier still resets on one-sided
+                    // hot windows, the 900 tier keeps the streak).
                     if (streaming && legalWindow) {
                         if (nowMs < state.downgradeDeadZoneUntilMs) {
                             // Phase N-4 dead zone (6.8.4): freeze recovery evidence too.
