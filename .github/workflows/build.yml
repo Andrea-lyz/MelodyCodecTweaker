@@ -36,12 +36,15 @@ jobs:
       - name: Build Release APK
         run: ./gradlew :app:assembleRelease
 
+      # The artifact is a signed release build; the name no longer claims "dev".
+      # Note: the experimental governor (auto bitrate protection) defaults OFF in
+      # release builds — users enable it from the module diagnostics page.
       - name: Prepare artifact name
         id: meta
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
           DATE=$(date +'%Y%m%d')
-          APK_NAME="OPlusHeadsetAudioHelper-dev-${SHORT_SHA}-${DATE}.apk"
+          APK_NAME="OPlusHeadsetAudioHelper-${SHORT_SHA}-${DATE}.apk"
           echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Sign APK

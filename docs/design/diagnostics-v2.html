@@ -447,6 +447,20 @@
     </div>
   </section>
 
+  <!-- ═══════════════ 实验性功能 ═══════════════ -->
+  <section class="card">
+    <div class="switch-row">
+      <div class="label">
+        <strong>实验性：自动码率保护</strong>
+        <p>开启后「音质优先」会按链路证据自动降档保护、环境恢复后自动升回（1000→900→500 阶梯）。默认关闭；实验性功能，移动/干扰环境下可能出现短暂降码率。</p>
+      </div>
+      <label class="switch">
+        <input type="checkbox" data-governor-enabled>
+        <span></span>
+      </label>
+    </div>
+  </section>
+
   <!-- ═══════════════ BQR 实时环境（新增） ═══════════════ -->
   <section class="card" id="bqr">
     <div class="section-head">
@@ -1327,10 +1341,12 @@
     // Fail open: a single card renderer must never leave the whole page invisible.
     byId('diagnostics-page').classList.remove('loading');
     lastSnapshot = s;
-    const enabledSwitch = document.querySelector('input[data-enabled]');
-    const hideSwitch = document.querySelector('input[data-hide-launcher]');
-    enabledSwitch.checked = !!s.enabled;
-    hideSwitch.checked = !!s.hideLauncherIcon;
+  const enabledSwitch = document.querySelector('input[data-enabled]');
+  const hideSwitch = document.querySelector('input[data-hide-launcher]');
+  const governorSwitch = document.querySelector('input[data-governor-enabled]');
+  enabledSwitch.checked = !!s.enabled;
+  hideSwitch.checked = !!s.hideLauncherIcon;
+  governorSwitch.checked = !!s.governorEnabled;
     byId('module-status-text').textContent = s.enabled
       ? '已启用。重启无线耳机 App 后会注入音质控制项。'
       : '已停用。重启无线耳机 App 后宿主页会恢复原状。';
@@ -1373,6 +1389,9 @@
   });
   document.querySelector('input[data-hide-launcher]').addEventListener('change', event => {
     if (bridge && bridge.setHideLauncherIcon) bridge.setHideLauncherIcon(!!event.target.checked);
+  });
+  document.querySelector('input[data-governor-enabled]').addEventListener('change', event => {
+    if (bridge && bridge.setGovernorEnabled) bridge.setGovernorEnabled(!!event.target.checked);
   });
   byId('record-button').addEventListener('click', () => {
     if (bridge && bridge.toggleRecording) bridge.toggleRecording();

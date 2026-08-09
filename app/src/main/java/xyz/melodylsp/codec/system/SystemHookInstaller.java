@@ -354,6 +354,15 @@ public final class SystemHookInstaller {
                     registerLhdcSessionReceiver(appContext);
                     NativeLhdcMemoryPatch.configureModuleContext(appContext);
                     NativeLhdcMemoryPatch.installGovernor();
+                    // Experimental governor switch: mirror the module preference so the
+                    // runtime flag matches the UI (default OFF in production builds).
+                    boolean governorEnabled = appContext.getSharedPreferences(
+                                    CodecIpc.PREFS_MODULE, Context.MODE_PRIVATE)
+                            .getBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+                    linkHealthController.setGovernorEnabled(
+                            governorEnabled, SystemClock.elapsedRealtime());
+                    MLog.eventLogOnly(
+                            "lhdc.governor.experimental", "enabled", governorEnabled);
                     MLog.setDiagnosticContext(appContext, "bluetooth");
                     MLog.event("scope.system.context.ready");
                     ensureLeAudioBridge(appContext);
@@ -398,6 +407,13 @@ public final class SystemHookInstaller {
                 }
                 if (enabled && !wasActive && lastLhdcDiagnosticLivePayload != null) {
                     sendLhdcDiagnosticLivePayload(lastLhdcDiagnosticLivePayload);
+                }
+                if (intent.hasExtra(CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED)) {
+                    boolean govEnabled = intent.getBooleanExtra(
+                            CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+                    linkHealthController.setGovernorEnabled(
+                            govEnabled, SystemClock.elapsedRealtime());
+                    MLog.eventLogOnly("lhdc.governor.experimental", "enabled", govEnabled);
                 }
             }
         };

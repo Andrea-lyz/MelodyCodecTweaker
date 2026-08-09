@@ -304,6 +304,11 @@ never mistake an automatic downgrade for a malfunction:
 
 ## 9. Known boundaries and trade-offs
 
+- **Experimental switch (default OFF)**: the governor ships as an experimental feature.
+  Release builds start with it disabled; users enable "Experimental: auto bitrate
+  protection" from the module diagnostics page — the switch syncs to the bluetooth
+  process immediately. Turning it off clears every active cap at once (bitrate returns to
+  the peer ceiling) and stops evaluation, while choppy/BQR stay recorded for diagnostics.
 - **400 tier dormant**: the disaster breaker (noRx ≥ 110/s) runs in shadow mode and a
   real sample has never been observed; if such magnitudes ever appear, the 400→500
   recovery path must be device-verified before enabling it;
@@ -321,9 +326,11 @@ never mistake an automatic downgrade for a malfunction:
 The governor works automatically with the module — no configuration needed. To verify
 on your own device:
 
-1. install the module and enable "Quality-First" while playing music;
-2. create interference (e.g. put the earbuds near a 2.4 GHz source) and watch the
+1. install the module and enable "Experimental: auto bitrate protection" on the
+   diagnostics page (off by default);
+2. enable "Quality-First" while playing music;
+3. create interference (e.g. put the earbuds near a 2.4 GHz source) and watch the
    automatic downgrade and recovery;
-3. check the boundary bars, recovery progress and countdown on the diagnostics page;
-4. if something looks wrong, export a one-tap feedback zip and attach the device model
+4. check the boundary bars, recovery progress and countdown on the diagnostics page;
+5. if something looks wrong, export a one-tap feedback zip and attach the device model
    and system version.

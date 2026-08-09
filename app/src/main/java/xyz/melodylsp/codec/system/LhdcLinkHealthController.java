@@ -4,8 +4,6 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
-import xyz.melodylsp.codec.BuildConfig;
-
 /**
  * Learns whether each headset can sustain the next LHDC quality rung.
  *
@@ -534,6 +532,13 @@ final class LhdcLinkHealthController {
     private final Map<String, Boolean> choppyCapabilityObservedByMac = new HashMap<>();
     private final Listener listener;
     private String activeMac;
+    /**
+     * Experimental governor switch (default ON for the unit-test semantics; the bluetooth
+     * process overrides it from module prefs at startup, where the default is OFF). When
+     * disabled, BQR fallback, leaky bucket and fast-fail evaluations are skipped entirely
+     * (choppy/BQR remain recorded for diagnostics).
+     */
+    private volatile boolean governorEnabled = true;
 
     LhdcLinkHealthController(Listener listener) {
         this.listener = listener;
@@ -555,6 +560,35 @@ final class LhdcLinkHealthController {
         resetSessionEvidence(state, nowMs);
         state.lastPublishedCeiling = -1;
         publishCeiling(mac, state, "device_active", nowMs);
+    }
+
+    /**
+     * Experimental governor switch. Turning it off abandons the governor immediately: every
+     * active cap is cleared so the link returns to the peer ceiling, and all recovery/bad
+     * evidence is reset. Turning it on starts with fresh evidence.
+     */
+    synchronized void setGovernorEnabled(boolean enabled, long nowMs) {
+        if (governorEnabled == enabled) return;
+        governorEnabled = enabled;
+        for (DeviceState state : devices.values()) {
+            state.bqrFallbackBadWindows = 0;
+            state.bqrFallbackStepBadWindows = 0;
+            state.bqrFallbackHealthyWindows = 0;
+            state.leakyFallbackHealthyWindows = 0;
+            if (!enabled) {
+                state.bqrFallbackCapKbps = 0;
+                state.leakyFallbackCapKbps = 0;
+                state.choppyBucket = 0.0;
+                state.choppyBucketLastDecayMs = 0L;
+                state.downgradeDeadZoneUntilMs = 0L;
+            }
+        }
+        if (!enabled && activeMac != null) {
+            DeviceState state = devices.get(activeMac);
+            if (state != null) {
+                publishCeiling(activeMac, state, "governor_experimental_disabled", nowMs);
+            }
+        }
     }
 
     /**
@@ -705,7 +739,7 @@ final class LhdcLinkHealthController {
                     && state.retransmissionsPerSecond <= MAX_RETRANSMISSIONS_PER_SECOND
                     && state.noRxPerSecond <= MAX_NO_RX_PER_SECOND;
             state.healthyBqrWindows = strictlyHealthy ? state.healthyBqrWindows + 1 : 0;
-            if (BuildConfig.LHDC_BQR_FALLBACK) {
+            if (governorEnabled) {
                 evaluateBqrFallback(mac, state, nowMs, streaming, legalWindow);
                 recordBqrSnapshot(state, nowMs);
                 evaluateDisasterShadow(mac, state, nowMs);
@@ -846,7 +880,7 @@ final class LhdcLinkHealthController {
         } else {
             maybeCancelDegradedProbe(mac, state, nowMs);
         }
-        if (BuildConfig.LHDC_BQR_FALLBACK) {
+        if (governorEnabled) {
             evaluateBqrQueueFastFail(mac, state, length, nowMs);
             // Phase N-3: 8 s leap window accumulates sustained high queue (continuous
             // segments only, so the startup fill-and-drain transient cannot accumulate).
@@ -905,7 +939,7 @@ final class LhdcLinkHealthController {
             // are not blocked here.
             return;
         }
-        if (BuildConfig.LHDC_BQR_FALLBACK) {
+        if (governorEnabled) {
             // Phase N-3 leaky bucket: decay first, then fill (+10 per deduped event). A full
             // bucket downgrades one rung (decision 30 keeps choppy independently effective).
             decayLeakyBucket(state, nowMs);
