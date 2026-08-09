@@ -92,7 +92,6 @@ need_tool() {
 
 need_tool awk
 need_tool logcat
-need_tool timeout
 
 HAVE_SU=0
 if command_exists su; then
@@ -177,11 +176,22 @@ if [ "$LIVE_SECONDS" -gt 0 ]; then
     # PR #10 review: drive the capture with toybox timeout instead of backgrounding
     # "su -c logcat" and killing the su wrapper — killing su left the real logcat
     # process behind (PID mismatch), growing the live log file indefinitely.
+    # PR #11 review: only the live mode needs timeout; prefer a standalone timeout and
+    # fall back to the toybox applet so --dump keeps working without it.
+    TIMEOUT_CMD=timeout
+    if ! command_exists timeout; then
+        if command_exists toybox; then
+            TIMEOUT_CMD="toybox timeout"
+        else
+            echo "缺少命令: timeout（或 toybox）"
+            exit 1
+        fi
+    fi
     if [ "$HAVE_SU" = "1" ]; then
-        su -c "timeout $LIVE_SECONDS logcat -v time -b all" > "$LOG_LIVE" 2>/dev/null
+        su -c "$TIMEOUT_CMD $LIVE_SECONDS logcat -v time -b all" > "$LOG_LIVE" 2>/dev/null
         LIVE_SOURCE="root:logcat live"
     else
-        timeout "$LIVE_SECONDS" logcat -v time -b all > "$LOG_LIVE" 2>/dev/null
+        $TIMEOUT_CMD "$LIVE_SECONDS" logcat -v time -b all > "$LOG_LIVE" 2>/dev/null
         LIVE_SOURCE="direct:logcat live"
     fi
     echo
