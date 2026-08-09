@@ -1014,7 +1014,7 @@
         let countdownText;
         if (recoveryRequired > 0 && recoveryStreak >= recoveryRequired) {
           countdownText = recoveryHoldRemainingMs > 0
-            ? '窗口已达标，将在 ' + fmtCountdown(recoveryHoldRemainingMs) + ' 后再次尝试'
+            ? '窗口已达标，将在 ' + fmtCountdown(recoveryHoldRemainingMs) + '后再次尝试'
             : '窗口已达标，等待切换';
         } else if (recoveryRequired > 0) {
           const shown = Math.min(recoveryStreak, recoveryRequired);
