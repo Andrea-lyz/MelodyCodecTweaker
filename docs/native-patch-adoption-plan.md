@@ -52,8 +52,8 @@ A2DP_VendorCodecEqualsLhdcV5`，忽略纯音质码率字段差异，得到 `rest
 | 独立构建 | 样本 | 说明 |
 | ---- | ---- | ---- |
 | OP15/Ace6T | OnePlus 15 `libbluetooth_jni_op15.so` = Ace 6T C16.0.7.201（同 hash） | |
-| PJZ301/PLK301 | PJZ110 16.0.8.301 = PLK110 16.0.8.301（同 hash） | Buds Ace 3 同栈 |
-| PJZ401 | PJZ110 16.0.9.401 | 当前主验证机型 |
+| PJZ110_1608301/PLK110 | PJZ110 16.0.8.301 = PLK110 16.0.8.301（同 hash） | Buds Ace 3 同栈 |
+| PJZ110_1609401 | PJZ110 16.0.9.401 | 当前主验证机型 |
 | PLC110 | PLC110 16.0.8.300(CN01B90P01) | |
 | RMX6688 | realme RMX6688 | MTK 平台 |
 
@@ -64,14 +64,14 @@ A2DP_VendorCodecEqualsLhdcV5`，忽略纯音质码率字段差异，得到 `rest
 | 构建 | 命中 pattern | 偏移 |
 | ---- | ---- | ---- |
 | OP15/Ace6T | branch_plus_23_op15 | 0x720f3c |
-| PJZ301/PLK301 | branch_plus_69 | 0x7242c8 |
-| PJZ401 | branch_plus_68_pjz110_1609401 | 0x7245d0 |
+| PJZ110_1608301/PLK110 | branch_plus_69 | 0x7242c8 |
+| PJZ110_1609401 | branch_plus_68_pjz110_1609401 | 0x7245d0 |
 | PLC110 | branch_plus_73_plc110 | 0x713758 |
 | RMX6688 | branch_plus_27_rmx6688 | 0x70ba9c |
 
 ### 3.3 快切等价补丁审查
 
-以 PJZ401 已适配的补丁为模板，提取语义指纹（`mov x9,#0x3aff; movk x9,#0x3505,lsl#16;
+以 PJZ110_1609401 已适配的补丁为模板，提取语义指纹（`mov x9,#0x3aff; movk x9,#0x3505,lsl#16;
 movk x9,#0x4c,lsl#32; cmp x8,x9`，即构造 LHDC V5 id 比较），并反汇编各构建的
 `A2DP_CodecEquals` 分发链（`cmp 0x100e0ff / 0x2400d7ff / 0xaa012dff` 三连 + default
 unsupported 分支）：
@@ -81,15 +81,15 @@ unsupported 分支）：
   问题确认是分发链漏接，而非函数缺失；
 - 字符串佐证：`unsupported codec` / `VendorCodecEquals` / `LhdcV5` 在 5 个构建中均存在。
 
-结论：**PJZ401 的 bug 在 5 个构建中普遍存在**，仅 PJZ401 已适配。
+结论：**PJZ110_1609401 的 bug 在 5 个构建中普遍存在**，仅 PJZ110_1609401 已适配。
 
 ## 4. 当前结果（适配矩阵）
 
 | 独立构建 | 机型 / 系统 | 码率 branch | 快切等价补丁 |
 | ---- | ---- | ---- | ---- |
-| PJZ401 | PJZ110 16.0.9.401 / OnePlus 13（.402 一加 11 共用 spec） | ✅ | ✅ 已适配 + 真机验证 |
+| PJZ110_1609401 | PJZ110 16.0.9.401 / OnePlus 13（.402 一加 11 共用 spec） | ✅ | ✅ 已适配 + 真机验证 |
 | OP15/Ace6T | OnePlus 15 / Ace 6T C16.0.7.201 | ✅ | ❌ 待适配 |
-| PJZ301/PLK301 | PJZ110 16.0.8.301 / PLK110（Buds Ace 3） | ✅ | ❌ 待适配 |
+| PJZ110_1608301/PLK110 | PJZ110 16.0.8.301 / PLK110（Buds Ace 3） | ✅ | ❌ 待适配 |
 | PLC110 | PLC110 16.0.8.300 | ✅ | ❌ 待适配 |
 | RMX6688 | realme RMX6688（MTK） | ✅ | ❌ 待适配 |
 
@@ -100,7 +100,7 @@ unsupported 分支）：
 语义模板（LHDC V5 id 构造、字段校验、质量位掩码 `0xc0100735`）跨构建复用，但以下必须
 逐构建适配：
 
-| 差异项 | OP15 / PJZ301 / PJZ401 | PLC110 / RMX6688 |
+| 差异项 | OP15 / PJZ110_1608301 / PJZ110_1609401 | PLC110 / RMX6688 |
 | ---- | ---- | ---- |
 | CIE 指针寄存器 | x21 | x28 |
 | CIE 栈偏移 | x29 - #0x70 | x29 - #0x60 |
@@ -112,7 +112,7 @@ unsupported 分支）：
 1. 新增 4 个 `CodeBlockSpec`（`lhdcv5_quality_equals_op15 / _pjz110_1608301 /
    _plc110_1608300 / _rmx6688`），orig = 各构建 default 块等长字节，patch = 语义模板
    适配寄存器 / 栈偏移 / 跳转目标，不足等长处以原尾部指令补齐；
-2. 单测：每个 spec 原样唯一命中、patch 后语义等价、与 PJZ401 模板指令一致性；
+2. 单测：每个 spec 原样唯一命中、patch 后语义等价、与 PJZ110_1609401 模板指令一致性；
 3. 构建（debug/release）+ 静态验证；
 4. 真机验证（见 §7）。
 
