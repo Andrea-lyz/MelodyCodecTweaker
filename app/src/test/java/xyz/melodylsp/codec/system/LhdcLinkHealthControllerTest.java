@@ -709,6 +709,210 @@ public final class LhdcLinkHealthControllerTest {
         assertEquals(54_000L, ls.leakyFallbackHoldRemainingMs);
     }
 
+    // ---------- Phase 5: real-device replay & abnormal recovery (decision 48) ----------
+
+    /** 6 s window: retx 28.0/noRx 27.5 — decision-47 band: counts for the mid tier. */
+    private static LhdcLinkHealthController.BqrSample midTierNoRx27Bqr() {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, 168, 165, 0, -45, 10, 0, 0);
+    }
+
+    /** 6 s window from per-second rates (replay helper). */
+    private static LhdcLinkHealthController.BqrSample sample(double retx, double noRx) {
+        return new LhdcLinkHealthController.BqrSample(
+                30, 0, (int) Math.round(retx * 6), (int) Math.round(noRx * 6),
+                0, -45, 10, 0, 0);
+    }
+
+    @Test
+    public void replay030818MidTierRecoversWithNoRx27Windows() {
+        // Feedback 030818: the 500 tier windows at noRx 27.0/27.7 reset the streak under
+        // the <25 gate, so the device took 2m12s to recover. Decision 47 (<28) makes them
+        // count: the replay recovers at the first window past the 60s hold.
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        controller.onBqrSample(MAC, midTierNoRx27Bqr(), 26_000L);  // 03:04:14 replay
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 32_000L + i * 6_000L);  // 38..68
+        }
+        // 7 counted windows by 68s; hold (10s trigger + 60s) not yet elapsed.
+        assertEquals(500, controller.snapshot(MAC, 68_000L).ceilingKbps);
+        controller.onBqrSample(MAC, midTierRelaxedBqr(), 74_000L);
+        assertEquals(900, controller.snapshot(MAC, 74_000L).ceilingKbps);
+    }
+
+    @Test
+    public void replay030818StrictTierRecoversWithOneSidedRetxWindow() {
+        // Feedback 030818: the 900 tier recovered on the very window that was one-sided
+        // hot (retx 38.3/noRx 23.5) — decision 45 neutrality kept the streak and the
+        // 120s hold expired exactly then.
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 8; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);  // 32..74
+        }
+        assertEquals(900, controller.snapshot(MAC, 74_000L).ceilingKbps);  // hold not elapsed
+        controller.onBqrSample(MAC, strictOneSidedRetxBqr(), 80_000L);  // neutral
+        controller.onBqrSample(MAC, midBandBqr(), 86_000L);
+        assertEquals(900, controller.snapshot(MAC, 92_000L).ceilingKbps);  // 82s < 120s
+        for (int i = 1; i <= 8; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 92_000L + i * 6_000L);  // 98..140
+        }
+        assertEquals(1000, controller.snapshot(MAC, 140_000L).ceilingKbps);
+    }
+
+    @Test
+    public void replay003454MarginalLinkStaysAt900() {
+        // Feedback 003454: true bad windows interleaved (31/26, 36.7/26.8, 37.7/35) kept
+        // resetting the strict streak — one-sided neutrality must NOT bypass the bad gate.
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        double[][] windows = {
+                {27.2, 23.8},  // non-bad
+                {31.0, 26.0},  // bad
+                {36.7, 26.8},  // bad
+                {29.8, 24.8},  // non-bad
+                {28.3, 26.3},  // one-sided (noRx)
+                {24.0, 23.2},  // non-bad
+                {37.7, 35.0},  // bad
+                {23.6, 22.6},  // non-bad
+        };
+        long t = 26_000L;
+        for (double[] w : windows) {
+            controller.onBqrSample(MAC, sample(w[0], w[1]), t);
+            t += 6_000L;
+        }
+        // Longest non-bad run is 2: no recovery, and no step-down (no 4 consecutive bad).
+        assertEquals(900, controller.snapshot(MAC, t).ceilingKbps);
+        assertTrue(recorder.fallbackEvents.stream().noneMatch(e -> e.endsWith(":recovered")));
+    }
+
+    @Test
+    public void bqrPauseFreezesRecoveryStreak() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 3; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 26_000L + i * 6_000L);  // 32..44
+        }
+        assertEquals(3, controller.snapshot(MAC, 44_000L).bqrFallbackHealthyWindows);
+        // 31 s gap exceeds the 15 s valid interval: the window is skipped and the streak
+        // is frozen (evaluateBqrFallback is not reached on invalid intervals), not reset.
+        controller.onBqrSample(MAC, midTierRelaxedBqr(), 75_000L);
+        assertEquals(3, controller.snapshot(MAC, 75_000L).bqrFallbackHealthyWindows);
+        // Fresh windows continue the streak; hold (10s + 60s) long expired.
+        for (int i = 1; i <= 3; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 81_000L + i * 6_000L);  // 87..99
+        }
+        assertEquals(900, controller.snapshot(MAC, 99_000L).ceilingKbps);
+    }
+
+    @Test
+    public void streamPauseFreezesRecoveryStreak() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 3; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 26_000L + i * 6_000L);  // 32..44
+        }
+        assertEquals(3, controller.snapshot(MAC, 44_000L).bqrFallbackHealthyWindows);
+        // streaming=false returns early from evaluateBqrFallback: streak frozen.
+        controller.onBqrSample(MAC, midTierRelaxedBqr(), 50_000L, false);
+        assertEquals(3, controller.snapshot(MAC, 50_000L).bqrFallbackHealthyWindows);
+        // Streaming resumes (start guard re-armed, but healthy counting is unaffected).
+        for (int i = 1; i <= 4; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 56_000L + i * 6_000L);  // 62..80
+        }
+        assertEquals(900, controller.snapshot(MAC, 80_000L).ceilingKbps);
+    }
+
+    @Test
+    public void choppyDuringBqrRecoveryDoesNotReTriggerLeaky() {
+        // Review P2-3 (decision 30): while a BQR cap is active the leaky bucket does not
+        // integrate, so a choppy pair cannot interrupt the recovery (feedback 030818:
+        // choppy kept reporting during the 900-tier recovery and it still completed).
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 4; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);  // 32..50
+        }
+        assertEquals(4, controller.snapshot(MAC, 50_000L).bqrFallbackHealthyWindows);
+        // Choppy pair during the capped recovery: recorded but never integrated.
+        controller.onRemoteChoppyReport(MAC, 1, 60_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 61_000L);
+        assertEquals(900, controller.snapshot(MAC, 61_000L).ceilingKbps);
+        assertTrue(recorder.events.stream()
+                .noneMatch(e -> e.endsWith("leaky_bucket_triggered")));
+        // The strict recovery continues and completes once the 120s hold expires.
+        for (int i = 1; i <= 13; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 62_000L + i * 6_000L);  // 68..140
+        }
+        assertEquals(1000, controller.snapshot(MAC, 140_000L).ceilingKbps);
+    }
+
+    @Test
+    public void replay030818FullCycleLeakyThenSteppedRecovery() {
+        // Full 030818 cycle: leaky 1000->900, BQR step 900->500, then both recoveries
+        // (decisions 44/45/46/47), ending back at 1000 with no escalation.
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        // Leaky trigger (choppy pair) at 24s.
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);
+        assertEquals(900, controller.snapshot(MAC, 24_000L).ceilingKbps);
+
+        // 900 tier degrades: 4 bad windows (36..54) step to 500.
+        controller.onBqrSample(MAC, bqrFallbackBad(), 30_000L);  // baseline
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 36_000L + i * 6_000L);  // 36..54
+        }
+        assertEquals(500, controller.snapshot(MAC, 54_000L).ceilingKbps);
+
+        // 500 tier: dead zone until 64s; non-bad windows from 66s; hold (54s + 60s) at 114s.
+        controller.onBqrSample(MAC, bqrFallbackBad(), 60_000L);  // dead zone skip
+        for (int i = 1; i <= 8; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 66_000L + i * 6_000L);  // 72..114
+        }
+        assertEquals(900, controller.snapshot(MAC, 114_000L).ceilingKbps);
+
+        // 900 tier: 120s hold from 114s; non-bad plus one-sided-neutral windows.
+        for (int i = 1; i <= 10; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 126_000L + i * 6_000L);  // 132..186
+        }
+        controller.onBqrSample(MAC, strictOneSidedRetxBqr(), 192_000L);  // neutral
+        for (int i = 1; i <= 10; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 198_000L + i * 6_000L);  // 204..258
+        }
+        // Hold (114s + 120s) expires at 234s; the 234s window recovers.
+        assertEquals(1000, controller.snapshot(MAC, 240_000L).ceilingKbps);
+        // No re-trigger: escalation stays 0 and the last recovery reports the strict 120s.
+        assertEquals("0:120000", recorder.fallbackDetails.get(recorder.fallbackDetails.size() - 1));
+    }
+
     @Test
     public void midTierCountsNonBadWindowsButKeepsOneSidedHotGates() {
         Recorder recorder = new Recorder();
