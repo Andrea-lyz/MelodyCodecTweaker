@@ -89,15 +89,16 @@ final class LhdcLinkHealthController {
     static final double BQR_FALLBACK_BAD_RETX_PER_SEC = 30.0;
     static final double BQR_FALLBACK_BAD_NO_RX_PER_SEC = 25.0;
     static final int BQR_FALLBACK_REQUIRED_BAD_WINDOWS = 4;
-    static final double BQR_FALLBACK_HEALTHY_RETX_PER_SEC = 24.0;
     /**
-     * Mid-tier (500 -> 900) recovery noRx gate (2026-08-09 compromise, decision 44): the
-     * Buds-calibrated <21 noRx sits inside the X3-family normal band (noRx 21-29), so
-     * 500->900 recoveries took ~4 min waiting for a rare sub-21 window (feedback 233639:
-     * noRx 22.5/21.2 windows kept resetting the streak). retx keeps the strict <24 gate;
-     * noRx relaxes to the non-bad boundary <25, keeping a one-sided hot window (e.g.
-     * retx 23/noRx 26) from counting.
+     * Mid-tier (500 -> 900) recovery gate (decisions 44 + 46, 2026-08-09): non-bad
+     * evidence (retx < 30 && noRx < 25) matching the strict tier. Decision 44 relaxed
+     * noRx from <21 to <25 because the Buds-calibrated <21 sits inside this headset's
+     * normal band (noRx 21-29); decision 46 relaxes retx from <24 to <30 because the
+     * 500-tier normal retx band (13-26) straddles 24 and windows at retx 24-26 kept
+     * resetting the streak (feedback 023759). A one-sided hot window (retx >= 30 or
+     * noRx >= 25 alone) still resets the streak, and the bad gate (>=30/>=25) is unchanged.
      */
+    static final double BQR_FALLBACK_HEALTHY_RETX_MID_PER_SEC = 30.0;
     static final double BQR_FALLBACK_HEALTHY_NO_RX_MID_PER_SEC = 25.0;
     static final int BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS = 6;
     /**
@@ -1349,10 +1350,10 @@ final class LhdcLinkHealthController {
                 requiredWindows = RECOVERY_FAST_HEALTHY_WINDOWS;
                 holdMs = RECOVERY_FAST_HOLD_MS;
             } else if (cap <= 500) {
-                // Regular tier 500 -> 900: retx keeps the calibrated <24, noRx relaxes to
-                // <25 (decision 44) + escalating hold. A one-sided hot window (noRx >= 25)
-                // still resets the streak, and the bad gate (>=30/>=25) is unchanged.
-                tierHealthy = retx < BQR_FALLBACK_HEALTHY_RETX_PER_SEC
+                // Regular tier 500 -> 900: non-bad evidence (retx < 30 && noRx < 25,
+                // decisions 44 + 46) + escalating hold. A one-sided hot window still
+                // resets the streak, and the bad gate (>=30/>=25) is unchanged.
+                tierHealthy = retx < BQR_FALLBACK_HEALTHY_RETX_MID_PER_SEC
                         && noRx < BQR_FALLBACK_HEALTHY_NO_RX_MID_PER_SEC;
                 requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS;
                 holdMs = bqrFallbackHoldMs(state);

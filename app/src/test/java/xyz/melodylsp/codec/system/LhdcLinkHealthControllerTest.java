@@ -710,15 +710,16 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     @Test
-    public void midTierCountsRelaxedNoRxButKeepsRetxAndOneSidedHotGates() {
+    public void midTierCountsNonBadWindowsButKeepsOneSidedHotGates() {
         Recorder recorder = new Recorder();
         LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
         assertEquals(500, controller.snapshot(MAC, 10_000L).ceilingKbps);
 
-        // Decision 44 (feedback 233639): X3-family noRx 21-25 windows now count for the
-        // 500->900 tier; retx stays strict <24 and a one-sided hot noRx >= 25 resets.
+        // Decisions 44 + 46 (feedback 233639/023759): non-bad windows (retx<30 && noRx<25)
+        // count for the 500->900 tier; a one-sided hot window (retx>=30 or noRx>=25 alone)
+        // still resets.
         controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
         for (int i = 1; i <= 6; i++) {
             controller.onBqrSample(MAC, midTierRelaxedBqr(), 26_000L + i * 6_000L);  // 32..62
@@ -744,14 +745,27 @@ public final class LhdcLinkHealthControllerTest {
         }
         assertEquals(900, controller.snapshot(MAC, 200_000L).ceilingKbps);  // hold from 100s
 
-        // retx >= 24 still resets for the mid tier (strict <24 gate kept): the X3
-        // mid-band 26/23 sample counts for the strict 900 tier but not for 500->900.
+        // Decision 46 (feedback 023759): the X3 mid-band 26/23 sample now counts for the
+        // 500->900 tier too (recovery at the first window past the 60s hold).
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 220_000L);
         controller.onBqrSample(MAC, healthyBqr(), 230_000L);  // baseline
         for (int i = 1; i <= 10; i++) {
             controller.onBqrSample(MAC, midBandBqr(), 236_000L + i * 6_000L);  // 242..296
         }
-        assertEquals(500, controller.snapshot(MAC, 296_000L).ceilingKbps);
+        assertEquals(900, controller.snapshot(MAC, 296_000L).ceilingKbps);
+
+        // One-sided hot retx (33/23) still resets the mid-tier streak.
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 320_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 330_000L);  // baseline
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 336_000L + i * 6_000L);  // 342..372
+        }
+        controller.onBqrSample(MAC, strictOneSidedRetxBqr(), 378_000L);  // resets streak
+        assertEquals(500, controller.snapshot(MAC, 384_000L).ceilingKbps);
+        for (int i = 1; i <= 6; i++) {
+            controller.onBqrSample(MAC, midTierRelaxedBqr(), 384_000L + i * 6_000L);  // 390..420
+        }
+        assertEquals(900, controller.snapshot(MAC, 420_000L).ceilingKbps);  // hold from 320s
     }
 
     @Test
@@ -1906,8 +1920,9 @@ public final class LhdcLinkHealthControllerTest {
         }
         assertEquals(500, controller.snapshot(MAC, 34_000L).ceilingKbps);
 
-        // 6 deep-healthy windows plus an exactly-24.0/21.0 window at hold expiry: the
-        // strict < gate must reset, deferring recovery to the following six windows.
+        // 6 deep-healthy windows plus an exactly-30.0/21.0 window at hold expiry: retx at
+        // the bad gate is one-sided hot for the mid tier (decision 46, <30 gate), so it
+        // must reset, deferring recovery to the following six windows.
         controller.onBqrSample(MAC, healthyBqr(), 40_000L);        // baseline
         for (int i = 1; i <= 6; i++) {
             controller.onBqrSample(MAC, healthyBqr(), 46_000L + i * 6_000L);  // 52..82
@@ -2066,10 +2081,10 @@ public final class LhdcLinkHealthControllerTest {
                 30, 0, 192, 60, 0, -45, 10, 0, 0);
     }
 
-    /** 6 s window: exactly 24.0/21.0 — the BQR recovery boundary, strict < must NOT count. */
+    /** 6 s window: exactly 30.0/21.0 — one-sided hot retx at the bad gate: mid-tier <30 must NOT count. */
     private static LhdcLinkHealthController.BqrSample strictBoundaryBqr() {
         return new LhdcLinkHealthController.BqrSample(
-                30, 0, 144, 126, 0, -45, 10, 0, 0);
+                30, 0, 180, 126, 0, -45, 10, 0, 0);
     }
 
     /** Negative counters: numerically healthy rates but illegal fields (legalWindow gate). */
