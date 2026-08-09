@@ -717,9 +717,9 @@ public final class LhdcLinkHealthControllerTest {
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
         assertEquals(500, controller.snapshot(MAC, 10_000L).ceilingKbps);
 
-        // Decisions 44 + 46 (feedback 233639/023759): non-bad windows (retx<30 && noRx<25)
-        // count for the 500->900 tier; a one-sided hot window (retx>=30 or noRx>=25 alone)
-        // still resets.
+        // Decisions 44/46/47 (feedback 233639/023759/030818): windows at retx<30 &&
+        // noRx<28 count for the 500->900 tier; a one-sided hot window (retx>=30 or
+        // noRx>=28 alone) still resets.
         controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
         for (int i = 1; i <= 6; i++) {
             controller.onBqrSample(MAC, midTierRelaxedBqr(), 26_000L + i * 6_000L);  // 32..62
@@ -732,7 +732,8 @@ public final class LhdcLinkHealthControllerTest {
         // 74s window: 8 consecutive relaxed windows (32..74), hold (10s trigger + 60s) elapsed.
         assertTrue(recorder.fallbackEvents.contains("900:recovered:0:8"));
 
-        // One-sided hot noRx (23/26) resets the streak even after the hold.
+        // One-sided hot noRx (23/29, past the <28 decision-47 gate) resets the streak
+        // even after the hold.
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 100_000L);
         controller.onBqrSample(MAC, healthyBqr(), 110_000L);  // baseline
         for (int i = 1; i <= 6; i++) {
@@ -2063,10 +2064,10 @@ public final class LhdcLinkHealthControllerTest {
                 30, 0, 138, 138, 0, -45, 10, 0, 0);
     }
 
-    /** 6 s window: retx 23.0/noRx 26.0 — one-sided hot noRx: never recovery evidence. */
+    /** 6 s window: retx 23.0/noRx 29.0 — one-sided hot noRx: never recovery evidence (mid <28 gate). */
     private static LhdcLinkHealthController.BqrSample oneSidedNoRxBqr() {
         return new LhdcLinkHealthController.BqrSample(
-                30, 0, 138, 156, 0, -45, 10, 0, 0);
+                30, 0, 138, 174, 0, -45, 10, 0, 0);
     }
 
     /** 6 s window: retx 33.0/noRx 23.0 — one-sided hot retx: neutral for the strict tier. */
