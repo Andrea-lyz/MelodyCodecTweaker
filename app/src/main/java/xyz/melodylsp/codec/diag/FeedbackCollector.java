@@ -213,6 +213,10 @@ public final class FeedbackCollector {
         if (diag == null) return false;
         String sessionId = diag.getString(DiagnosticEvents.KEY_SESSION_ID, "");
         if (sessionId == null || sessionId.isEmpty()) return false;
+        // PR #10 review: the capture state must belong to the current session, not a stale
+        // leftover from an earlier one (fail-closed when the capture and session diverged).
+        String captureSession = diag.getString(RootBluetoothLogCapture.KEY_CAPTURE_SESSION, "");
+        if (!sessionId.equals(captureSession)) return false;
         String status = diag.getString(RootBluetoothLogCapture.KEY_CAPTURE_STATUS, "");
         return "started".equals(status)
                 || "collected".equals(status)
