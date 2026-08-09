@@ -739,10 +739,14 @@ public final class LhdcLinkHealthControllerTest {
         for (int i = 1; i <= 6; i++) {
             controller.onBqrSample(MAC, midTierRelaxedBqr(), 32_000L + i * 6_000L);  // 38..68
         }
+        // Decision-47 discrimination: the 26s (28.0/27.5) window counts, so the streak is
+        // 7 at 68s (the old <25 gate would keep it at 6 and never count that window).
+        assertEquals(7, controller.snapshot(MAC, 68_000L).bqrFallbackHealthyWindows);
         // 7 counted windows by 68s; hold (10s trigger + 60s) not yet elapsed.
         assertEquals(500, controller.snapshot(MAC, 68_000L).ceilingKbps);
         controller.onBqrSample(MAC, midTierRelaxedBqr(), 74_000L);
         assertEquals(900, controller.snapshot(MAC, 74_000L).ceilingKbps);
+        assertTrue(recorder.fallbackEvents.contains("900:recovered:0:8"));
     }
 
     @Test
@@ -767,6 +771,9 @@ public final class LhdcLinkHealthControllerTest {
             controller.onBqrSample(MAC, midBandBqr(), 92_000L + i * 6_000L);  // 98..140
         }
         assertEquals(1000, controller.snapshot(MAC, 140_000L).ceilingKbps);
+        // Decision-45 discrimination: the 80s one-sided window kept the streak (16 counted
+        // at recovery); the old reset-on-one-sided semantics would report 8.
+        assertTrue(recorder.fallbackEvents.contains("0:recovered:0:16"));
     }
 
     @Test
@@ -794,9 +801,13 @@ public final class LhdcLinkHealthControllerTest {
             controller.onBqrSample(MAC, sample(w[0], w[1]), t);
             t += 6_000L;
         }
-        // Longest non-bad run is 2: no recovery, and no step-down (no 4 consecutive bad).
+        // Longest counting run is 2 (28.3/26.3 is neutral for the strict tier): no
+        // recovery, and no step-down (no 4 consecutive bad).
         assertEquals(900, controller.snapshot(MAC, t).ceilingKbps);
-        assertTrue(recorder.fallbackEvents.stream().noneMatch(e -> e.endsWith(":recovered")));
+        // The publish channel carries "ceiling:bqr_fallback_recovered" on recovery; the
+        // hook path never fires notify, so the fallbackEvents list would stay empty anyway.
+        assertTrue(recorder.events.stream()
+                .noneMatch(e -> e.endsWith("bqr_fallback_recovered")));
     }
 
     @Test
@@ -838,6 +849,7 @@ public final class LhdcLinkHealthControllerTest {
         controller.onBqrSample(MAC, midTierRelaxedBqr(), 50_000L, false);
         assertEquals(3, controller.snapshot(MAC, 50_000L).bqrFallbackHealthyWindows);
         // Streaming resumes (start guard re-armed, but healthy counting is unaffected).
+        // (The start-guard re-arm itself is covered by resumeReArmsStartGuard.)
         for (int i = 1; i <= 4; i++) {
             controller.onBqrSample(MAC, midTierRelaxedBqr(), 56_000L + i * 6_000L);  // 62..80
         }
@@ -859,6 +871,7 @@ public final class LhdcLinkHealthControllerTest {
             controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);  // 32..50
         }
         assertEquals(4, controller.snapshot(MAC, 50_000L).bqrFallbackHealthyWindows);
+        controller.onBqrSample(MAC, midBandBqr(), 56_000L);  // keep the 6s cadence
         // Choppy pair during the capped recovery: recorded but never integrated.
         controller.onRemoteChoppyReport(MAC, 1, 60_000L);
         controller.onRemoteChoppyReport(MAC, 1, 61_000L);
@@ -881,9 +894,9 @@ public final class LhdcLinkHealthControllerTest {
         controller.activate(MAC, 100L);
 
         // Leaky trigger (choppy pair) at 24s.
-        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
-        controller.onRemoteChoppyReport(MAC, 1, 24_000L);
-        assertEquals(900, controller.snapshot(MAC, 24_000L).ceilingKbps);
+        controller.onRemoteChoppyReport(MAC, 1, 17_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 25_000L);
+        assertEquals(900, controller.snapshot(MAC, 25_000L).ceilingKbps);
 
         // 900 tier degrades: 4 bad windows (36..54) step to 500.
         controller.onBqrSample(MAC, bqrFallbackBad(), 30_000L);  // baseline
@@ -893,15 +906,17 @@ public final class LhdcLinkHealthControllerTest {
         assertEquals(500, controller.snapshot(MAC, 54_000L).ceilingKbps);
 
         // 500 tier: dead zone until 64s; non-bad windows from 66s; hold (54s + 60s) at 114s.
+        // The leaky cap recovers in parallel at 102s (6 windows + 60s hold from 25s).
         controller.onBqrSample(MAC, bqrFallbackBad(), 60_000L);  // dead zone skip
         for (int i = 1; i <= 8; i++) {
             controller.onBqrSample(MAC, midTierRelaxedBqr(), 66_000L + i * 6_000L);  // 72..114
         }
         assertEquals(900, controller.snapshot(MAC, 114_000L).ceilingKbps);
+        assertTrue(recorder.stateEvents.contains("500:leaky_bucket_recovered"));
 
         // 900 tier: 120s hold from 114s; non-bad plus one-sided-neutral windows.
         for (int i = 1; i <= 10; i++) {
-            controller.onBqrSample(MAC, midBandBqr(), 126_000L + i * 6_000L);  // 132..186
+            controller.onBqrSample(MAC, midBandBqr(), 120_000L + i * 6_000L);  // 126..180
         }
         controller.onBqrSample(MAC, strictOneSidedRetxBqr(), 192_000L);  // neutral
         for (int i = 1; i <= 10; i++) {
