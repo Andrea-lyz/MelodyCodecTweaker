@@ -92,6 +92,7 @@ need_tool() {
 
 need_tool awk
 need_tool logcat
+need_tool timeout
 
 HAVE_SU=0
 if command_exists su; then
@@ -173,17 +174,16 @@ LIVE_SOURCE="none"
 if [ "$LIVE_SECONDS" -gt 0 ]; then
     echo "正在监听新日志 ${LIVE_SECONDS} 秒..."
     echo "现在可以切换一次 LHDC 音质，或重连耳机来触发 encoder update。"
+    # PR #10 review: drive the capture with toybox timeout instead of backgrounding
+    # "su -c logcat" and killing the su wrapper — killing su left the real logcat
+    # process behind (PID mismatch), growing the live log file indefinitely.
     if [ "$HAVE_SU" = "1" ]; then
-        su -c "logcat -v time -b all" > "$LOG_LIVE" 2>/dev/null &
+        su -c "timeout $LIVE_SECONDS logcat -v time -b all" > "$LOG_LIVE" 2>/dev/null
         LIVE_SOURCE="root:logcat live"
     else
-        logcat -v time -b all > "$LOG_LIVE" 2>/dev/null &
+        timeout "$LIVE_SECONDS" logcat -v time -b all > "$LOG_LIVE" 2>/dev/null
         LIVE_SOURCE="direct:logcat live"
     fi
-    LOGCAT_PID=$!
-    sleep "$LIVE_SECONDS"
-    kill "$LOGCAT_PID" 2>/dev/null
-    wait "$LOGCAT_PID" 2>/dev/null
     echo
 fi
 
