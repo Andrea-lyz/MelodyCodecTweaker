@@ -249,6 +249,14 @@ public final class MasterSwitchActivity extends Activity {
         TrustedBroadcasts.send(this, intent);
     }
 
+    private void sendGovernorExperimentalEnabled(boolean enabled) {
+        Intent intent = new Intent(CodecIpc.ACTION_LHDC_DIAGNOSTIC_LIVE_CONTROL);
+        intent.setPackage(CodecIpc.BLUETOOTH_PKG);
+        intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+        intent.putExtra(CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, enabled);
+        TrustedBroadcasts.send(this, intent);
+    }
+
     private void pushSnapshotToPage() {
         if (!foreground || !pageReady || webView == null) return;
         String json = buildSnapshotJson().toString();
@@ -271,6 +279,8 @@ public final class MasterSwitchActivity extends Activity {
             root.put("enabled", modulePrefs.getBoolean(KEY_ENABLED, true));
             root.put("hideLauncherIcon",
                     modulePrefs.getBoolean(KEY_HIDE_LAUNCHER_ICON, false));
+            root.put("governorEnabled", modulePrefs.getBoolean(
+                    CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false));
             root.put("snapshotTakenAt", System.currentTimeMillis());
             root.put("recording", buildRecordingSnapshot());
             root.put("environment", cachedEnvironment != null
@@ -387,6 +397,22 @@ public final class MasterSwitchActivity extends Activity {
                         applied
                                 ? (hidden ? "桌面图标已隐藏" : "桌面图标已恢复")
                                 : "桌面图标状态更新失败",
+                        Toast.LENGTH_SHORT).show();
+                pushSnapshotToPage();
+            });
+        }
+
+        @JavascriptInterface
+        public void setGovernorEnabled(boolean enabled) {
+            runOnUiThread(() -> {
+                modulePrefs.edit()
+                        .putBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, enabled)
+                        .apply();
+                sendGovernorExperimentalEnabled(enabled);
+                Toast.makeText(MasterSwitchActivity.this,
+                        enabled
+                                ? "实验性功能已开启，自动码率保护生效"
+                                : "实验性功能已关闭，码率保护立即解除",
                         Toast.LENGTH_SHORT).show();
                 pushSnapshotToPage();
             });

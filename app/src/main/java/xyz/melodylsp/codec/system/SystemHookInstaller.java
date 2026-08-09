@@ -354,6 +354,21 @@ public final class SystemHookInstaller {
                     registerLhdcSessionReceiver(appContext);
                     NativeLhdcMemoryPatch.configureModuleContext(appContext);
                     NativeLhdcMemoryPatch.installGovernor();
+                    // Experimental governor switch: mirror the module preference so the
+                    // runtime flag matches the UI (default OFF in production builds).
+                    // getRemotePreferences reads the module process file (a bluetooth-process
+                    // getSharedPreferences would read the wrong package's prefs).
+                    boolean governorEnabled = false;
+                    try {
+                        governorEnabled = module.getRemotePreferences(CodecIpc.PREFS_MODULE)
+                                .getBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+                    } catch (Throwable t) {
+                        MLog.w("governor experimental prefs unavailable; default off", t);
+                    }
+                    linkHealthController.setGovernorEnabled(
+                            governorEnabled, SystemClock.elapsedRealtime());
+                    MLog.eventLogOnly(
+                            "lhdc.governor.experimental", "enabled", governorEnabled);
                     MLog.setDiagnosticContext(appContext, "bluetooth");
                     MLog.event("scope.system.context.ready");
                     ensureLeAudioBridge(appContext);
@@ -386,18 +401,29 @@ public final class SystemHookInstaller {
                         BuildConfig.APPLICATION_ID)) {
                     return;
                 }
-                boolean enabled = intent.getBooleanExtra(
-                        CodecIpc.EXTRA_DIAGNOSTIC_LIVE_ENABLED, false);
-                boolean wasActive = SystemClock.elapsedRealtime()
-                        < lhdcDiagnosticLiveUntilMs;
-                lhdcDiagnosticLiveUntilMs = enabled
-                        ? SystemClock.elapsedRealtime() + BQR_LIVE_SUBSCRIPTION_TTL_MS
-                        : 0L;
-                if (enabled != wasActive) {
-                    MLog.eventLogOnly("lhdc.link.live_control", "enabled", enabled);
+                // hasExtra: a governor-only broadcast must not disturb the live sample
+                // subscription state (review: otherwise toggling the switch killed it).
+                if (intent.hasExtra(CodecIpc.EXTRA_DIAGNOSTIC_LIVE_ENABLED)) {
+                    boolean enabled = intent.getBooleanExtra(
+                            CodecIpc.EXTRA_DIAGNOSTIC_LIVE_ENABLED, false);
+                    boolean wasActive = SystemClock.elapsedRealtime()
+                            < lhdcDiagnosticLiveUntilMs;
+                    lhdcDiagnosticLiveUntilMs = enabled
+                            ? SystemClock.elapsedRealtime() + BQR_LIVE_SUBSCRIPTION_TTL_MS
+                            : 0L;
+                    if (enabled != wasActive) {
+                        MLog.eventLogOnly("lhdc.link.live_control", "enabled", enabled);
+                    }
+                    if (enabled && !wasActive && lastLhdcDiagnosticLivePayload != null) {
+                        sendLhdcDiagnosticLivePayload(lastLhdcDiagnosticLivePayload);
+                    }
                 }
-                if (enabled && !wasActive && lastLhdcDiagnosticLivePayload != null) {
-                    sendLhdcDiagnosticLivePayload(lastLhdcDiagnosticLivePayload);
+                if (intent.hasExtra(CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED)) {
+                    boolean govEnabled = intent.getBooleanExtra(
+                            CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+                    linkHealthController.setGovernorEnabled(
+                            govEnabled, SystemClock.elapsedRealtime());
+                    MLog.eventLogOnly("lhdc.governor.experimental", "enabled", govEnabled);
                 }
             }
         };

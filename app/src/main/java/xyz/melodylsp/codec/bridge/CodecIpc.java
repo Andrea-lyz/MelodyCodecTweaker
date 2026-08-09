@@ -31,6 +31,12 @@ public final class CodecIpc {
     public static final String ACTION_LHDC_DIAGNOSTIC_LIVE_SAMPLE =
             "xyz.melodylsp.codec.action.LHDC_DIAGNOSTIC_LIVE_SAMPLE";
 
+    /** Module-wide SharedPreferences file shared by the UI and the bluetooth process. */
+    public static final String PREFS_MODULE = "module_prefs";
+    /** Experimental governor switch (default off); mirrored to the bluetooth process. */
+    public static final String KEY_GOVERNOR_EXPERIMENTAL_ENABLED =
+            "governor_experimental_enabled";
+
     public static final String EXTRA_TOKEN = "token";
     public static final String EXTRA_REQUEST_ID = "request_id";
     public static final String EXTRA_MAC = "mac";
@@ -77,6 +83,9 @@ public final class CodecIpc {
     public static final String EXTRA_LHDC_POLICY_CEILING_KBPS = "lhdc_policy_ceiling_kbps";
     public static final String EXTRA_DIAGNOSTIC_LIVE_ENABLED = "diagnostic_live_enabled";
     public static final String EXTRA_DIAGNOSTIC_LIVE_PAYLOAD = "diagnostic_live_payload";
+    /** Carried by {@link #ACTION_LHDC_DIAGNOSTIC_LIVE_CONTROL}: experimental governor state. */
+    public static final String EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED =
+            "governor_experimental_enabled";
 
     public static final String TOKEN = "mlcdc-codec-v1";
 

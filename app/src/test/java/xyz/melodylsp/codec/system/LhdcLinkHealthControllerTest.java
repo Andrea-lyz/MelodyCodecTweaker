@@ -709,6 +709,101 @@ public final class LhdcLinkHealthControllerTest {
         assertEquals(54_000L, ls.leakyFallbackHoldRemainingMs);
     }
 
+    // ---------- Experimental governor switch (decision 49) ----------
+
+    @Test
+    public void governorDisabledSkipsDowngradeEvaluation() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setGovernorEnabled(false, 200L);
+
+        // 5 bad windows must not trigger the BQR fallback while disabled.
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        for (int i = 0; i < 5; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L + i * 6_000L);  // 16..40
+        }
+        assertEquals(1000, controller.snapshot(MAC, 40_000L).ceilingKbps);
+        assertTrue(recorder.fallbackEvents.isEmpty());
+
+        // A choppy pair must not fill the leaky bucket while disabled.
+        controller.onRemoteChoppyReport(MAC, 1, 60_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 61_000L);
+        assertEquals(1000, controller.snapshot(MAC, 61_000L).ceilingKbps);
+        assertTrue(recorder.events.stream()
+                .noneMatch(e -> e.endsWith("leaky_bucket_triggered")));
+    }
+
+    @Test
+    public void governorDisableClearsActiveCapAndResetsEvidence() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+        assertEquals(900, controller.snapshot(MAC, 10_000L).ceilingKbps);
+
+        controller.setGovernorEnabled(false, 20_000L);
+        LhdcLinkHealthController.Snapshot after = controller.snapshot(MAC, 20_000L);
+        assertEquals(1000, after.ceilingKbps);
+        assertEquals(0, after.bqrFallbackHealthyWindows);
+        assertTrue(recorder.stateEvents.contains("1000:governor_experimental_disabled"));
+
+        // Enabling again resumes evaluation with fresh evidence (4 bad windows re-trigger).
+        controller.setGovernorEnabled(true, 30_000L);
+        controller.onBqrSample(MAC, bqrFallbackBad(), 36_000L);  // baseline
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 42_000L + i * 6_000L);  // 42..60
+        }
+        assertEquals(900, controller.snapshot(MAC, 60_000L).ceilingKbps);
+    }
+
+    @Test
+    public void governorDisableDropsHalfRecoveredStreak() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);  // baseline
+        for (int i = 1; i <= 3; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);  // 32..44
+        }
+        assertEquals(3, controller.snapshot(MAC, 44_000L).bqrFallbackHealthyWindows);
+
+        controller.setGovernorEnabled(false, 50_000L);
+        LhdcLinkHealthController.Snapshot after = controller.snapshot(MAC, 50_000L);
+        assertEquals(1000, after.ceilingKbps);
+        assertEquals(0, after.bqrFallbackHealthyWindows);
+    }
+
+    @Test
+    public void governorDisableAfterRealDowngradePublishesRestore() {
+        // Real downgrade path (publish happened), then disable: the restore goes through
+        // the publish channel and arms the post-switch guard, unlike the test-hook case.
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L + i * 6_000L);  // 16..34
+        }
+        assertEquals(900, controller.snapshot(MAC, 34_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("900:bqr_fallback_triggered"));
+
+        controller.setGovernorEnabled(false, 40_000L);
+        assertEquals(1000, controller.snapshot(MAC, 40_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("1000:governor_experimental_disabled"));
+        // The restore published a ceiling change, so the post-switch guard is armed until
+        // 50s: a choppy pair inside it must not re-trigger the leaky bucket once re-enabled.
+        controller.setGovernorEnabled(true, 45_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 46_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 47_000L);
+        assertEquals(1000, controller.snapshot(MAC, 47_000L).ceilingKbps);
+        assertTrue(recorder.events.stream()
+                .noneMatch(e -> e.endsWith("leaky_bucket_triggered")));
+    }
+
     // ---------- Phase 5: real-device replay & abnormal recovery (decision 48) ----------
 
     /** 6 s window: retx 28.0/noRx 27.5 — decision-47 band: counts for the mid tier. */

@@ -14,7 +14,6 @@ android {
         versionName = "2.2.0"
         buildConfigField("String", "LHDC_GOVERNOR_MODE", "\"adaptive_governor\"")
         buildConfigField("boolean", "LHDC_DYN_OBSERVE", "false")
-        buildConfigField("boolean", "LHDC_BQR_FALLBACK", "false")
 
         externalNativeBuild {
             cmake {
@@ -48,7 +47,6 @@ android {
             isMinifyEnabled = false
             buildConfigField("String", "LHDC_GOVERNOR_MODE", "\"bqr_fallback_ab\"")
             buildConfigField("boolean", "LHDC_DYN_OBSERVE", "true")
-            buildConfigField("boolean", "LHDC_BQR_FALLBACK", "true")
             externalNativeBuild {
                 cmake {
                     arguments += "-DMELODY_FIXED_1000_AB=ON"
