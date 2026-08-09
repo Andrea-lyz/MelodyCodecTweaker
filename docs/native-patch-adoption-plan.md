@@ -142,7 +142,9 @@ unsupported 分支）：
 3. 关键日志：
    - 不应再出现 `A2DP_CodecEquals: unsupported codec id 0x4c35053aff`；
    - `restart_output=false`（纯质量变化）；
-   - `native.patch.state.recv status=patched`（码率 branch 与等价补丁均生效）；
+   - `native.patch.state.recv status=patched fast_switch=patched`（码率 branch 与
+     快切等价补丁均生效；诊断页两行状态分别为 `native.patch.bitrate` /
+     `native.patch.fast_switch`）；
 4. 反馈包一份（含 root 蓝牙日志），离线核对。
 
 ## 8. 相关证据

@@ -71,6 +71,16 @@ public final class CodecIpc {
     public static final String EXTRA_NATIVE_PATCH_PATCHED = "native_patch_patched";
     public static final String EXTRA_NATIVE_PATCH_ORIGINAL = "native_patch_original";
     public static final String EXTRA_NATIVE_PATCH_SUCCESS = "native_patch_success";
+    public static final String EXTRA_NATIVE_PATCH_FAST_SWITCH_STATUS =
+            "native_patch_fast_switch_status";
+    public static final String EXTRA_NATIVE_PATCH_FAST_SWITCH_DETAIL =
+            "native_patch_fast_switch_detail";
+    public static final String EXTRA_NATIVE_PATCH_FAST_SWITCH_PATCHED =
+            "native_patch_fast_switch_patched";
+    public static final String EXTRA_NATIVE_PATCH_FAST_SWITCH_ORIGINAL =
+            "native_patch_fast_switch_original";
+    public static final String EXTRA_NATIVE_PATCH_FAST_SWITCH_SUCCESS =
+            "native_patch_fast_switch_success";
     public static final String EXTRA_LHDC_GOVERNOR_BITRATE_KBPS =
             "lhdc_governor_bitrate_kbps";
     public static final String EXTRA_GAME_MODE_ACTIVE = "game_mode_active";

@@ -487,9 +487,18 @@ public final class DiagnosticEvents {
                 || message.contains("evt=le.ws.")) {
             mark(editor, "bridge.le.ws", "registered", message, time);
         }
-        if (message.contains("evt=lhdc.memory_patch")
-                || message.contains("evt=native.patch.state.recv")) {
-            mark(editor, "native.patch", stateFromMessage(message), message, time);
+        String event = eventName(message);
+        if ("lhdc.memory_patch".equals(event)) {
+            mark(editor, "native.patch.bitrate", stateFromMessage(message), message, time);
+        } else if ("lhdc.memory_patch.fast_switch".equals(event)) {
+            mark(editor, "native.patch.fast_switch", stateFromMessage(message), message, time);
+        } else if ("native.patch.state.recv".equals(event)) {
+            mark(editor, "native.patch.bitrate", stateFromMessage(message), message, time);
+            String fastSwitchStatus = valueOf(message, "fast_switch");
+            if (fastSwitchStatus != null && !fastSwitchStatus.isEmpty()) {
+                mark(editor, "native.patch.fast_switch",
+                        stateFromPatchStatus(fastSwitchStatus), message, time);
+            }
         }
         if (message.contains("evt=diag.root_capture")) {
             String captureStatus = message.contains("status=started")
@@ -851,6 +860,15 @@ public final class DiagnosticEvents {
                 || message.contains("success=false")) {
             return "attention";
         }
+        return "seen";
+    }
+
+    /** Maps a raw patch status value (patched/already_patched/pending/failed/unsupported). */
+    private static String stateFromPatchStatus(String status) {
+        if ("patched".equals(status) || "already_patched".equals(status)) return "ok";
+        if ("pending".equals(status)) return "pending";
+        if ("failed".equals(status)) return "failed";
+        if ("unsupported".equals(status)) return "attention";
         return "seen";
     }
 

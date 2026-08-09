@@ -24,7 +24,8 @@
            - 诊断状态 20 项 addStatusRow（scope.host / host.controller /
             hook.host / inject.detail / inject.onespace / scope.bluetooth /
             bridge.codec / bridge.le.bt / scope.wirelesssettings /
-             bridge.le.ws / native.patch / lhdc.link.bqr / lhdc.link.choppy /
+             bridge.le.ws / native.patch.bitrate / native.patch.fast_switch /
+             lhdc.link.bqr / lhdc.link.choppy /
              lhdc.link.queue / lhdc.link.shadow / codec.write / remember.write /
             remember.replay / last.warning / last.error）
           - 环境信息 5 项（模块版本 / 系统 / 三个宿主包版本）
@@ -607,8 +608,16 @@
 
       <div class="row">
         <div>
-          <div class="lbl">Native 内存补丁</div>
+          <div class="lbl">码率 branch 补丁</div>
           <div class="sub">evt=lhdc.memory_patch status=patched</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>patched</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">快切等价补丁</div>
+          <div class="sub">evt=lhdc.memory_patch.fast_switch status=patched</div>
         </div>
         <span class="pill ok"><span class="dot"></span>patched</span>
       </div>

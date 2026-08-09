@@ -112,6 +112,7 @@ public final class CodecController {
     private final Map<String, Integer> lhdcPoliciesByMac = new HashMap<>();
     private BroadcastReceiver memorySnapshotReceiver;
     private volatile boolean nativePatchUnsupported;
+    private String lastNativePatchFastSwitchStatus = "";
     private int lhdcGovernorBitrateKbps;
     private boolean governorBitratePollScheduled;
     private final Runnable governorBitratePoll = this::runGovernorBitratePoll;
@@ -393,19 +394,33 @@ public final class CodecController {
         String status = intent.getStringExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS);
         int patched = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, -1);
         int original = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, -1);
+        String fastSwitchStatus = intent.getStringExtra(
+                CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_STATUS);
+        int fastSwitchPatched = intent.getIntExtra(
+                CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_PATCHED, -1);
+        int fastSwitchOriginal = intent.getIntExtra(
+                CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_ORIGINAL, -1);
+        if (fastSwitchStatus == null) fastSwitchStatus = "";
         int bitrateKbps = intent.getIntExtra(
                 CodecIpc.EXTRA_LHDC_GOVERNOR_BITRATE_KBPS, 0);
         boolean bitrateChanged = lhdcGovernorBitrateKbps != bitrateKbps;
         boolean nextUnsupported = "unsupported".equals(status)
                 && patched == 0
                 && original == 0;
-        boolean stateChanged = bitrateChanged || nativePatchUnsupported != nextUnsupported;
+        boolean fastSwitchChanged = !fastSwitchStatus.equals(lastNativePatchFastSwitchStatus);
+        boolean stateChanged = bitrateChanged
+                || nativePatchUnsupported != nextUnsupported
+                || fastSwitchChanged;
         lhdcGovernorBitrateKbps = Math.max(0, bitrateKbps);
         nativePatchUnsupported = nextUnsupported;
+        lastNativePatchFastSwitchStatus = fastSwitchStatus;
         Object[] telemetry = {
                 "status", status,
                 "patched", patched,
                 "original", original,
+                "fast_switch", fastSwitchStatus,
+                "fast_switch_patched", fastSwitchPatched,
+                "fast_switch_original", fastSwitchOriginal,
                 "bitrateKbps", lhdcGovernorBitrateKbps,
                 "unsupported", nativePatchUnsupported
         };

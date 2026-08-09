@@ -376,7 +376,8 @@ adb logcat -s MelodyCodecLsp:V
 - `evt=codec.updated.hooks`：蓝牙侧编解码器更新 Hook 是否安装。
 - `evt=scope.wirelesssettings.context.ready`：无线设置作用域是否加载。
 - `le.melody.state.recv`：LE Audio 状态是否回传到 Melody。
-- `evt=lhdc.memory_patch`：LHDC V5 运行时内存补丁加载、命中和验证状态。
+- `evt=lhdc.memory_patch`：码率 branch 补丁加载、命中和验证状态。
+- `evt=lhdc.memory_patch.fast_switch`：LHDC V5 快切等价补丁加载、命中和验证状态。
 - `evt=lhdc.governor.install` / `LhdcGovernorNative`：编码器回调 owner 扫描、策略切换和码率升降档。
 - `evt=lhdc.bqr`：BQR 链路样本、健康窗口、当前探测上限和两个升档边界的锁定状态。
 - `evt=remember.write`：按耳机记忆是否写入。
