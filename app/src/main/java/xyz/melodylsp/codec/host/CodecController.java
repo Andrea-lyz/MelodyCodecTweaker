@@ -1209,12 +1209,17 @@ public final class CodecController {
      * background so OPPO's slow optional confirmation path never blocks the visible switch.
      */
     private void showCodecModePicker(Subscription sub, Object sourcePref) {
+        // LC3 runs over the LE transport: the codec mode picker only lists classic A2DP tiers
+        // (LHDC/AAC/SBC) and must not open while LC3 is the active codec. This applies to every
+        // injected surface (OneSpace + DetailMain) because they share this controller.
+        if (shouldRenderLeAudioActive(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
             Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
             return;
         }
+        if (snapshot.activeCodecType == CodecLabelTable.CODEC_LC3) return;
         if (!isCodecModeSwitchAvailable(snapshot)) {
             Toast.makeText(context,
                     Strings.TOAST_CODEC_MODE_UNSUPPORTED, Toast.LENGTH_SHORT).show();
@@ -1287,6 +1292,7 @@ public final class CodecController {
      * (vendor codec quirk on every OPPO LHDC variant).
      */
     private void showQualityPicker(Subscription sub, Object sourcePref) {
+        if (shouldRenderLeAudioActive(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
@@ -1524,6 +1530,7 @@ public final class CodecController {
     }
 
     private void showSampleRatePicker(Subscription sub, Object sourcePref) {
+        if (shouldRenderLeAudioActive(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
