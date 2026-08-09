@@ -48,4 +48,18 @@ public final class DiagnosticEventReceiverTest {
         assertEquals("未发现", DiagnosticEvents.defaultStatus("last.warning"));
         assertEquals("未发现", DiagnosticEvents.defaultStatus("last.error"));
     }
+
+    @Test
+    public void statusEssentialEventsAreIdentified() {
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.memory_patch status=patched success=true"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.memory_patch.fast_switch status=unsupported"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=native.patch.state.recv status=patched fast_switch=patched"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=remember.snapshot.begin reason=request count=1"));
+        assertFalse(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=codec.bt.set codec=ldac result=0"));
+    }
 }

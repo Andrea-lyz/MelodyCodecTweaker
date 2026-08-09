@@ -242,7 +242,8 @@ public final class MLog {
             rememberStickyDiagnostic(stickyEventName, priority, diagnosticMessage, time);
         }
         boolean persistNow = persistDiagnostic
-                && (isDiagnosticRecordingActive(time) || isMemoryMirrorEventName(stickyEventName));
+                && (isDiagnosticRecordingActive(time)
+                || isStatusEssentialEventName(stickyEventName));
         if (persistNow) {
             Context context = diagnosticContext;
             if (context != null) {
@@ -254,12 +255,17 @@ public final class MLog {
     }
 
     /**
-     * Memory-mirror events are low-frequency state snapshots that must stay visible on the
-     * diagnostic page even outside a recording session; they are exempt from the recording
-     * gate so the remember card can always refresh.
+     * Status-essential events are low-frequency state snapshots that must stay visible on the
+     * diagnostic page even outside a recording session. Besides the remember-card mirror, the
+     * native patch results (bitrate branch + fast-switch equivalence) are captured at hook
+     * time so the page shows whether the patch took effect without starting a recording.
      */
-    static boolean isMemoryMirrorEventName(String eventName) {
-        return eventName != null && eventName.startsWith("remember.snapshot.");
+    static boolean isStatusEssentialEventName(String eventName) {
+        if (eventName == null) return false;
+        if (eventName.startsWith("remember.snapshot.")) return true;
+        if ("lhdc.memory_patch".equals(eventName)) return true;
+        if ("lhdc.memory_patch.fast_switch".equals(eventName)) return true;
+        return "native.patch.state.recv".equals(eventName);
     }
 
     private static String prefix() {

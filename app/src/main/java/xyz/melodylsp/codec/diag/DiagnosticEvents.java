@@ -221,6 +221,19 @@ public final class DiagnosticEvents {
     }
 
     /**
+     * True when the message carries a remember-card mirror snapshot or a native patch status
+     * event. These are recorded outside a diagnostic session (status-only) so the page's
+     * remember card and native patch rows always reflect the last known state, independent of
+     * the recording session.
+     */
+    static boolean isStatusEssentialEvent(String message) {
+        if (message == null) return false;
+        return message.contains("evt=remember.snapshot.")
+                || message.contains("evt=lhdc.memory_patch")
+                || message.contains("evt=native.patch.state.recv");
+    }
+
+    /**
      * Applies a remember-card mirror snapshot without touching the recording event ring. Used
      * by the receiver when no diagnostic session is active.
      */
@@ -230,6 +243,21 @@ public final class DiagnosticEvents {
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = sp.edit();
         mirrorMemory(sp, editor, message, time);
+        editor.apply();
+    }
+
+    /**
+     * Applies status-row classification without touching the recording event ring. Used by the
+     * receiver when no diagnostic session is active so hook-time native patch state stays
+     * visible on the page.
+     */
+    static void recordStatusEssential(
+            Context context, String scope, String message, long time) {
+        if (context == null || message == null || message.isEmpty()) return;
+        message = limit(message, MAX_MESSAGE_CHARS);
+        SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = sp.edit();
+        classify(editor, safe(scope), message, Log.INFO, time);
         editor.apply();
     }
 
