@@ -576,8 +576,20 @@ final class LhdcLinkHealthController {
             state.bqrFallbackHealthyWindows = 0;
             state.leakyFallbackHealthyWindows = 0;
             if (!enabled) {
+                // Abandon the governor entirely: clear every active cap, learned boundary
+                // lock and transient bookkeeping so the link returns to the peer ceiling
+                // and a later re-enable starts from a completely fresh state.
+                clearBoundary(state.to900);
+                clearBoundary(state.to1000);
                 state.bqrFallbackCapKbps = 0;
                 state.leakyFallbackCapKbps = 0;
+                state.bqrFallbackSinceMs = 0L;
+                state.bqrFallbackRecoveredMs = 0L;
+                state.bqrFallbackEscalationLevel = 0;
+                state.bqrFastFailUntilMs = 0L;
+                state.bqrFastFailQueueSinceMs = 0L;
+                state.leakyFallbackSinceMs = 0L;
+                state.leakyRecoveredMs = 0L;
                 state.choppyBucket = 0.0;
                 state.choppyBucketLastDecayMs = 0L;
                 state.downgradeDeadZoneUntilMs = 0L;

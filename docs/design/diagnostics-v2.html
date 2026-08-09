@@ -1341,12 +1341,12 @@
     // Fail open: a single card renderer must never leave the whole page invisible.
     byId('diagnostics-page').classList.remove('loading');
     lastSnapshot = s;
-  const enabledSwitch = document.querySelector('input[data-enabled]');
-  const hideSwitch = document.querySelector('input[data-hide-launcher]');
-  const governorSwitch = document.querySelector('input[data-governor-enabled]');
-  enabledSwitch.checked = !!s.enabled;
-  hideSwitch.checked = !!s.hideLauncherIcon;
-  governorSwitch.checked = !!s.governorEnabled;
+    const enabledSwitch = document.querySelector('input[data-enabled]');
+    const hideSwitch = document.querySelector('input[data-hide-launcher]');
+    const governorSwitch = document.querySelector('input[data-governor-enabled]');
+    enabledSwitch.checked = !!s.enabled;
+    hideSwitch.checked = !!s.hideLauncherIcon;
+    governorSwitch.checked = !!s.governorEnabled;
     byId('module-status-text').textContent = s.enabled
       ? '已启用。重启无线耳机 App 后会注入音质控制项。'
       : '已停用。重启无线耳机 App 后宿主页会恢复原状。';

@@ -37,8 +37,8 @@ jobs:
         run: ./gradlew :app:assembleRelease
 
       # The artifact is a signed release build; the name no longer claims "dev".
-      # Note: the experimental governor (auto bitrate protection) defaults OFF in
-      # release builds — users enable it from the module diagnostics page.
+      # Note: the experimental governor (auto bitrate protection) defaults OFF at
+      # runtime — users enable it from the module diagnostics page.
       - name: Prepare artifact name
         id: meta
         run: |

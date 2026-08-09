@@ -304,11 +304,13 @@ never mistake an automatic downgrade for a malfunction:
 
 ## 9. Known boundaries and trade-offs
 
-- **Experimental switch (default OFF)**: the governor ships as an experimental feature.
-  Release builds start with it disabled; users enable "Experimental: auto bitrate
-  protection" from the module diagnostics page — the switch syncs to the bluetooth
-  process immediately. Turning it off clears every active cap at once (bitrate returns to
-  the peer ceiling) and stops evaluation, while choppy/BQR stay recorded for diagnostics.
+- **Experimental switch (default OFF)**: the governor ships as an experimental feature,
+  disabled at runtime by default (release and debug alike). Users enable "Experimental:
+  auto bitrate protection" from the module diagnostics page — the switch syncs to the
+  bluetooth process immediately and survives bluetooth-process restarts. Turning it off
+  clears every active cap, learned boundary lock and recovery evidence at once (bitrate
+  returns to the device's capability ceiling) and stops evaluation, while choppy/BQR
+  stay recorded for diagnostics.
 - **400 tier dormant**: the disaster breaker (noRx ≥ 110/s) runs in shadow mode and a
   real sample has never been observed; if such magnitudes ever appear, the 400→500
   recovery path must be device-verified before enabling it;
