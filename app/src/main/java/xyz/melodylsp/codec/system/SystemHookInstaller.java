@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Binder;
 import android.os.Handler;
@@ -356,15 +357,7 @@ public final class SystemHookInstaller {
                     NativeLhdcMemoryPatch.installGovernor();
                     // Experimental governor switch: mirror the module preference so the
                     // runtime flag matches the UI (default OFF in production builds).
-                    // getRemotePreferences reads the module process file (a bluetooth-process
-                    // getSharedPreferences would read the wrong package's prefs).
-                    boolean governorEnabled = false;
-                    try {
-                        governorEnabled = module.getRemotePreferences(CodecIpc.PREFS_MODULE)
-                                .getBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false);
-                    } catch (Throwable t) {
-                        MLog.w("governor experimental prefs unavailable; default off", t);
-                    }
+                    boolean governorEnabled = readGovernorExperimentalEnabled(appContext);
                     linkHealthController.setGovernorEnabled(
                             governorEnabled, SystemClock.elapsedRealtime());
                     MLog.eventLogOnly(
@@ -421,6 +414,7 @@ public final class SystemHookInstaller {
                 if (intent.hasExtra(CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED)) {
                     boolean govEnabled = intent.getBooleanExtra(
                             CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+                    persistGovernorExperimentalEnabled(appContext, govEnabled);
                     linkHealthController.setGovernorEnabled(
                             govEnabled, SystemClock.elapsedRealtime());
                     MLog.eventLogOnly("lhdc.governor.experimental", "enabled", govEnabled);
@@ -438,6 +432,42 @@ public final class SystemHookInstaller {
             lhdcDiagnosticLiveControlReceiver = receiver;
         } else {
             MLog.w("LHDC foreground diagnostic control receiver unavailable");
+        }
+    }
+
+    /**
+     * Local (bluetooth-process) prefs survive process restarts even when the module process
+     * is not running — {@code getRemotePreferences} needs the module process alive and
+     * silently returns defaults when it is not (feedback 215917: the switch did not survive
+     * a bluetooth restart). The module prefs remain the UI's source of truth; the local
+     * mirror is refreshed on every broadcast.
+     */
+    private static final String GOVERNOR_LOCAL_PREFS = "melody_codec_governor";
+
+    private boolean readGovernorExperimentalEnabled(Context context) {
+        SharedPreferences local = context.getSharedPreferences(
+                GOVERNOR_LOCAL_PREFS, Context.MODE_PRIVATE);
+        if (local.contains(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED)) {
+            return local.getBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+        }
+        // First boot since install: fall back to the module process pipe (may be offline).
+        try {
+            return module.getRemotePreferences(CodecIpc.PREFS_MODULE)
+                    .getBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+        } catch (Throwable t) {
+            MLog.w("governor experimental prefs unavailable; default off", t);
+            return false;
+        }
+    }
+
+    private static void persistGovernorExperimentalEnabled(Context context, boolean enabled) {
+        try {
+            context.getSharedPreferences(GOVERNOR_LOCAL_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, enabled)
+                    .apply();
+        } catch (Throwable t) {
+            MLog.w("governor experimental prefs persist failed", t);
         }
     }
 
