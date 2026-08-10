@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.widget.Toast;
 
 import java.io.File;
@@ -54,6 +55,8 @@ public final class ConnectionStateReplayer {
     static final long REPLAY_DELAY_MS = 1_500L;
     static final long ACTIVE_READY_REPLAY_DELAY_MS = 100L;
     private static final long REPLAY_VERIFY_DELAY_MS = 2_000L;
+    /** 同一回放片段（多调度源 + 重试）在窗口内只弹一次适配提醒。 */
+    private static final long REPLAY_ADVISORY_DEDUP_MS = 60_000L;
     private static final long GAME_MODE_EXIT_REPLAY_DELAY_MS = 800L;
     private static final long GAME_MODE_LIVE_SBC_FALLBACK_MS = 180_000L;
     private static final long GAME_MODE_EXIT_PROBE_DELAY_MS = 5_000L;
@@ -72,6 +75,7 @@ public final class ConnectionStateReplayer {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final Map<String, PendingReplay> pendingReplays = new HashMap<>();
     private final Map<String, Long> replayGenerations = new HashMap<>();
+    private final Map<String, Long> replayAdvisoryLastShownMs = new HashMap<>();
     private final Map<String, Set<Integer>> gameModeActiveTypes = new HashMap<>();
     private final Map<String, Long> gameModeFallbackUntilMs = new HashMap<>();
     private final Map<String, GameModeProbeSchedule> gameModeProbeSchedules = new HashMap<>();
@@ -953,13 +957,23 @@ public final class ConnectionStateReplayer {
             String advisory = NativePatchAdvisory.replayToast(
                     transportRequest.codecSpecific1 & 0xFFL);
             if (advisory != null) {
-                // dispatchReplay runs on the replay worker thread; toasts require a looper.
-                mainHandler.post(() ->
-                        Toast.makeText(context, advisory, Toast.LENGTH_SHORT).show());
-                MLog.event("replay.advisory",
-                        "mac", A2dpRouteReadiness.redactMac(mac),
-                        "attempt", attempt,
-                        "toast", advisory);
+                // 同一回放片段（connected_ready / startup bootstrap / 重试等多调度源）
+                // 在窗口内只弹一次，避免 23 秒内连弹 6 次。
+                if (shouldShowReplayAdvisory(
+                        replayAdvisoryLastShownMs, mac, SystemClock.elapsedRealtime())) {
+                    // dispatchReplay runs on the replay worker thread; toasts require a looper.
+                    mainHandler.post(() ->
+                            Toast.makeText(context, advisory, Toast.LENGTH_SHORT).show());
+                    MLog.event("replay.advisory",
+                            "mac", A2dpRouteReadiness.redactMac(mac),
+                            "attempt", attempt,
+                            "toast", advisory);
+                } else {
+                    MLog.event("replay.advisory.dedup",
+                            "mac", A2dpRouteReadiness.redactMac(mac),
+                            "attempt", attempt,
+                            "toast", advisory);
+                }
             }
         }
         bridge.setCodec(transportRequest, () -> isReplayStillCurrent(mac, stored, generation))
@@ -991,6 +1005,18 @@ public final class ConnectionStateReplayer {
             return 1000;
         }
         return 0;
+    }
+
+    /**
+     * 回放适配提醒去重：同一 MAC 在 {@link #REPLAY_ADVISORY_DEDUP_MS} 窗口内只放行一次。
+     * 独立静态方法便于单测。
+     */
+    static boolean shouldShowReplayAdvisory(
+            Map<String, Long> lastShownMs, String mac, long nowMs) {
+        Long last = lastShownMs.get(mac);
+        if (last != null && nowMs - last < REPLAY_ADVISORY_DEDUP_MS) return false;
+        lastShownMs.put(mac, nowMs);
+        return true;
     }
 
     private void scheduleReplayRetry(
