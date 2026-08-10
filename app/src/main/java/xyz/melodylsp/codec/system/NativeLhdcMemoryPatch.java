@@ -129,6 +129,13 @@ final class NativeLhdcMemoryPatch {
     }
 
     static synchronized PatchResult apply() {
+        // Toast-matrix 设备验证门：debug 构建且显式开启时模拟补丁未适配（release 恒 false，
+        // 且此处 DEBUG 二次门控保证 release 永不生效）。
+        if (BuildConfig.DEBUG && BuildConfig.TOAST_TEST_BLOCK_BITRATE) {
+            PatchResult blocked = PatchResult.unsupported(0, 0);
+            lastResult = blocked;
+            return blocked;
+        }
         PatchResult result;
         try {
             result = applyUnchecked();
@@ -145,6 +152,11 @@ final class NativeLhdcMemoryPatch {
     }
 
     static synchronized PatchResult applyQualitySwitchGuard() {
+        if (BuildConfig.DEBUG && BuildConfig.TOAST_TEST_BLOCK_FAST_SWITCH) {
+            PatchResult blocked = PatchResult.unsupported(0, 0);
+            lastQualitySwitchResult = blocked;
+            return blocked;
+        }
         PatchResult result;
         try {
             result = applyQualitySwitchGuardUnchecked();

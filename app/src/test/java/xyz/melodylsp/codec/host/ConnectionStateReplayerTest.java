@@ -4,6 +4,9 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
+import java.util.HashMap;
+import java.util.Map;
+
 import org.junit.Test;
 
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
@@ -26,6 +29,22 @@ public final class ConnectionStateReplayerTest {
     @Test
     public void activeDeviceReadyDoesNotDelayAlreadyFasterReplay() {
         assertEquals(50L, ConnectionStateReplayer.replayDelayAfterActiveReady(50L));
+    }
+
+    @Test
+    public void replayAdvisoryDedupsWithinWindowPerMac() {
+        Map<String, Long> lastShown = new HashMap<>();
+        assertTrue(ConnectionStateReplayer.shouldShowReplayAdvisory(
+                lastShown, "AA:BB:CC:DD:EE:01", 1_000L));
+        // 窗口内重复调度 / 重试 → 去重
+        assertFalse(ConnectionStateReplayer.shouldShowReplayAdvisory(
+                lastShown, "AA:BB:CC:DD:EE:01", 20_000L));
+        // 窗口过期后再次放行
+        assertTrue(ConnectionStateReplayer.shouldShowReplayAdvisory(
+                lastShown, "AA:BB:CC:DD:EE:01", 61_000L));
+        // 不同 MAC 互不影响
+        assertTrue(ConnectionStateReplayer.shouldShowReplayAdvisory(
+                lastShown, "AA:BB:CC:DD:EE:02", 21_000L));
     }
 
     @Test
