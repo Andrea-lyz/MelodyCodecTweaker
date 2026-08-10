@@ -1,6 +1,7 @@
 package xyz.melodylsp.codec.system;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import java.io.File;
@@ -122,6 +123,78 @@ public final class NativeLhdcMemoryPatchTest {
         assertEquals(0, countMatches(image, spec.patched));
     }
 
+    @Test
+    public void allQualitySwitchSpecsAreBoundedConsistentAndDistinct() {
+        NativeLhdcMemoryPatch.CodeBlockSpec[] specs =
+                NativeLhdcMemoryPatch.qualitySwitchSpecsForTest();
+        assertEquals(5, specs.length);
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (int i = 0; i < specs.length; i++) {
+            NativeLhdcMemoryPatch.CodeBlockSpec spec = specs[i];
+            assertEquals(108, spec.original.length);
+            assertEquals(spec.original.length, spec.patched.length);
+            assertEquals(0x14000024, spec.safeGateInstruction);
+            assertTrue("safe gate must branch forward", spec.safeGateInstruction != 0);
+            assertTrue("names must be unique", names.add(spec.name));
+            assertEquals("replacement tail must branch from +0x68 to equal +0x98",
+                    0x30, branchOffset(readIntLe(spec.patched, 0x68)));
+            assertEquals("first reject branch at +0x10 must target +0x90",
+                    0x80, conditionalBranchOffset(readIntLe(spec.patched, 0x10)));
+            for (int j = i + 1; j < specs.length; j++) {
+                assertFalse("orig blocks must be pairwise distinct",
+                        java.util.Arrays.equals(spec.original, specs[j].original));
+            }
+        }
+    }
+
+    @Test
+    public void groupBSpecsUseX28AndStackOffset60() {
+        NativeLhdcMemoryPatch.CodeBlockSpec plc =
+                NativeLhdcMemoryPatch.qualitySwitchSpecForTestName(
+                        "lhdcv5_quality_equals_plc110_1608300");
+        NativeLhdcMemoryPatch.CodeBlockSpec rmx =
+                NativeLhdcMemoryPatch.qualitySwitchSpecForTestName(
+                        "lhdcv5_quality_equals_rmx6688");
+        NativeLhdcMemoryPatch.CodeBlockSpec ref =
+                NativeLhdcMemoryPatch.qualitySwitchSpecForTest();
+        // Group B: CIE pointer register x28 (ldur w11,[x28,#9] at +0x50)
+        assertEquals(0xb840938b, readIntLe(plc.patched, 0x50));
+        assertEquals(0xb840938b, readIntLe(rmx.patched, 0x50));
+        // Group B: stack loads shifted -0x10 vs Group A (-0x70..-0x67 -> -0x60..-0x57)
+        assertEquals(0x385a03aa, readIntLe(plc.patched, 0x14));
+        assertEquals(0x385a03aa, readIntLe(rmx.patched, 0x14));
+        // Group A keeps x21 at +0x50; Group B differs
+        assertEquals(0xb84092ab, readIntLe(ref.patched, 0x50));
+        assertFalse(java.util.Arrays.equals(plc.patched, ref.patched));
+    }
+
+    @Test
+    public void everyBuildSpecMatchesItsLibraryUniquelyWhenAvailable()
+            throws Exception {
+        File root = findWorkspaceRoot();
+        if (root == null) return;
+        String[][] samples = {
+                {"lhdcv5_quality_equals_op15", "OnePlus 15/libbluetooth_jni_op15.so"},
+                {"lhdcv5_quality_equals_pjz110_1608301",
+                        "PJZ110_16.0.8.301/libbluetooth_jni.so"},
+                {"lhdcv5_quality_equals_plc110_1608300",
+                        "PLC110_16.0.8.300(CN01B90P01)/libbluetooth_jni.so"},
+                {"lhdcv5_quality_equals_rmx6688",
+                        "realme RMX6688/libbluetooth_jni.so"},
+        };
+        for (String[] sample : samples) {
+            File lib = new File(root, sample[1]);
+            if (!lib.isFile()) continue;
+            byte[] image = Files.readAllBytes(lib.toPath());
+            NativeLhdcMemoryPatch.CodeBlockSpec spec =
+                    NativeLhdcMemoryPatch.qualitySwitchSpecForTestName(sample[0]);
+            assertEquals(sample[0] + " must match exactly once",
+                    1, countMatches(image, spec.original));
+            assertEquals(sample[0] + " must not be pre-patched",
+                    0, countMatches(image, spec.patched));
+        }
+    }
+
     private static NativeLhdcMemoryPatch.PatternSpec findSpec(String name) {
         for (NativeLhdcMemoryPatch.PatternSpec spec : NativeLhdcMemoryPatch.patternsForTest()) {
             if (spec.name.equals(name)) return spec;
@@ -176,6 +249,12 @@ public final class NativeLhdcMemoryPatchTest {
         int immediate = instruction & 0x03ffffff;
         if ((immediate & 0x02000000) != 0) immediate |= 0xfc000000;
         return immediate * 4;
+    }
+
+    private static int conditionalBranchOffset(int instruction) {
+        int imm19 = (instruction >> 5) & 0x7ffff;
+        if ((imm19 & 0x40000) != 0) imm19 |= ~0x7ffff;
+        return imm19 * 4;
     }
 
     @Test

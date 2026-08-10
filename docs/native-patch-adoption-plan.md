@@ -1,6 +1,7 @@
 # LHDC V5 Native 补丁适配计划（码率 branch + 快切等价补丁）
 
-> 状态：2026-08-09 审查完成，等价补丁 4 构建待实施；2026-08-10 新增宿主适配提醒需求（已确认，待实施）。
+> 状态：2026-08-09 审查完成；2026-08-10 等价补丁 5 构建全部实施（含宿主适配提醒），
+> 待真机验证。
 > 相关代码：`app/src/main/java/xyz/melodylsp/codec/system/NativeLhdcMemoryPatch.java`；
 > 样本与脚本：`native_research/`；决策记录：`fix-plan-20260805-BQR-protective-downgrade.md`。
 
@@ -93,10 +94,10 @@ unsupported 分支）：
 | 独立构建 | 机型 / 系统 | 码率 branch | 快切等价补丁 |
 | ---- | ---- | ---- | ---- |
 | PJZ110_1609401 | PJZ110 16.0.9.401 / OnePlus 13（.402 一加 11 共用 spec） | ✅ | ✅ 已适配 + 真机验证 |
-| OP15/Ace6T | OnePlus 15 / Ace 6T C16.0.7.201 | ✅ | ❌ 待适配 |
-| PJZ110_1608301/PLK110 | PJZ110 16.0.8.301 / PLK110（一加 Ace 6T） | ✅ | ❌ 待适配 |
-| PLC110 | PLC110 16.0.8.300 | ✅ | ❌ 待适配 |
-| RMX6688 | realme RMX6688（MTK） | ✅ | ❌ 待适配 |
+| OP15/Ace6T | OnePlus 15 / Ace 6T C16.0.7.201 | ✅ | ✅ 已适配（待真机验证） |
+| PJZ110_1608301/PLK110 | PJZ110 16.0.8.301 / PLK110（一加 Ace 6T） | ✅ | ✅ 已适配（待真机验证） |
+| PLC110 | PLC110 16.0.8.300 | ✅ | ✅ 已适配（待真机验证） |
+| RMX6688 | realme RMX6688（MTK） | ✅ | ✅ 已适配（待真机验证） |
 
 ## 5. 等价补丁实施计划
 
@@ -114,12 +115,15 @@ unsupported 分支）：
 
 ### 5.2 实施步骤
 
-1. 新增 4 个 `CodeBlockSpec`（`lhdcv5_quality_equals_op15 / _pjz110_1608301 /
-   _plc110_1608300 / _rmx6688`），orig = 各构建 default 块等长字节，patch = 语义模板
-   适配寄存器 / 栈偏移 / 跳转目标，不足等长处以原尾部指令补齐；
-2. 单测：每个 spec 原样唯一命中、patch 后语义等价、与 PJZ110_1609401 模板指令一致性；
-3. 构建（debug/release）+ 静态验证；
-4. 真机验证（见 §7）。
+1. ~~新增 4 个 `CodeBlockSpec`~~（已实施，2026-08-10）：`lhdcv5_quality_equals_op15 /
+   _pjz110_1608301 / _plc110_1608300 / _rmx6688` + 参考 spec 组成 5 项表，orig = 各构建
+   default 块等长字节（108B），patch = 语义模板。实测确认 5 构建 reject/accept 尾跳转
+   （+0x90/+0x98）结构同构，仅分组差异：A 组（OP15/PJZ110_1608301/1609401）x21 +
+   x29-#0x70；B 组（PLC110/RMX6688）x28 + x29-#0x60（-0x70..-0x67 → -0x60..-0x57）；
+2. ~~单测~~（已实施）：每个 spec 原样在对应样本唯一命中、patch 结构一致（长度/分支
+   目标/分组编码）、与参考模板一致性；
+3. ~~构建 + 静态验证~~（已通过）：`testDebugUnitTest` + `assembleDebug`；
+4. 真机验证（见 §7，待各机型用户反馈包）。
 
 ### 5.3 宿主侧适配提醒（toast 矩阵）— 已实施并通过真机验证（2026-08-10）
 
