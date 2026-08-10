@@ -1,3 +1,7 @@
+id=xyz.melodylsp.codec
+name=欧加耳机音质助手
+author=Andrea
+description=为 OPPO/OnePlus 官方「无线耳机」面板补充协议、播放质量、采样率与 LE Audio 控制，并优化 LHDC 音质优先体验。
 minApiVersion=101
 targetApiVersion=101
 staticScope=true
