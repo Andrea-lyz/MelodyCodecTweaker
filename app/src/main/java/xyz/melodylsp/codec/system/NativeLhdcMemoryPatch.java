@@ -65,27 +65,79 @@ final class NativeLhdcMemoryPatch {
                     hex("1c000014")),
     };
     /**
-     * ColorOS 16.0.3.401/.402 PJZ110 inlines A2DP codec equality but omits LHDC V5. The original
-     * block is the unsupported-codec logger reached with CodecId 0x4c35053aff; the replacement
-     * reproduces the older OPlus LHDC V5 equality mask. It accepts only a valid current LHDC V5
-     * CIE whose sample-rate/channel/feature fields match the target, while deliberately ignoring
-     * the quality/bitrate bits. Every other codec or material CIE change falls through to the
+     * ColorOS 16 inlines A2DP codec equality but omits LHDC V5 on every known version line.
+     * Each entry is the unsupported-codec logger default block (reached with CodecId
+     * 0x4c35053aff) for one build; the replacement reproduces the older OPlus LHDC V5
+     * equality mask. It accepts only a valid current LHDC V5 CIE whose
+     * sample-rate/channel/feature fields match the target, while deliberately ignoring the
+     * quality/bitrate bits. Every other codec or material CIE change falls through to the
      * original restart path.
      *
-     * <p>This is intentionally an exact whole-block signature for the evidence build. An OTA that
-     * recompiles the function is unsupported instead of receiving a guessed patch.</p>
+     * <p>Group A (CIE pointer x21, CIE on stack x29-#0x70): OP15/Ace6T 16.0.7.201,
+     * PJZ110 16.0.8.301 (+ PLK110), PJZ110 16.0.9.401 (+ .402). Group B (x28, x29-#0x60):
+     * PLC110 16.0.8.300, RMX6688. The reject/accept tails (+0x90/+0x98) are structurally
+     * identical across all five builds, so only the register/stack-offset encodings differ.
+     *
+     * <p>These are intentionally exact whole-block signatures for the evidence builds. An OTA
+     * that recompiles the function is unsupported instead of receiving a guessed patch.</p>
      */
-    private static final CodeBlockSpec LHDC_V5_QUALITY_SWITCH_SPEC = new CodeBlockSpec(
-            "lhdcv5_quality_equals_pjz110_1609401_1609402",
-            hex("68ac805289b2ffd029613191a88316b8c8b1ffd008353e91a92102a9e8018052"
-                    + "a90302d11f2003d50aa60210a93900f9aaa107a929008052aa0301d141b0ff90"
-                    + "21b4139183b5ffd0638c2a91a26302d1a5c302d1c000805264038052a92900a9"
-                    + "a80900f99d2b17940a000014"),
-            hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa0359385f350071a1030054"
-                    + "aa2359385ffd037141030054aa3359b84ba780525f010b6bc1020054aa735978"
-                    + "ab8689525f010b6b41020054aa9359b8ab9240b84a010b4aabe680520b02b872"
-                    + "5f010b6a610100540c000014"),
-            0x14000024);
+    private static final CodeBlockSpec[] LHDC_V5_QUALITY_SWITCH_SPECS = {
+            new CodeBlockSpec(
+                    "lhdcv5_quality_equals_pjz110_1609401_1609402",
+                    hex("68ac805289b2ffd029613191a88316b8c8b1ffd008353e91a92102a9e8018052"
+                            + "a90302d11f2003d50aa60210a93900f9aaa107a929008052aa0301d141b0ff90"
+                            + "21b4139183b5ffd0638c2a91a26302d1a5c302d1c000805264038052a92900a9"
+                            + "a80900f99d2b17940a000014"),
+                    hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa0359385f350071a1030054"
+                            + "aa2359385ffd037141030054aa3359b84ba780525f010b6bc1020054aa735978"
+                            + "ab8689525f010b6b41020054aa9359b8ab9240b84a010b4aabe680520b02b872"
+                            + "5f010b6a610100540c000014"),
+                    0x14000024),
+            new CodeBlockSpec(
+                    "lhdcv5_quality_equals_op15",
+                    hex("68ac8052a9b2ffd029a12491a88316b8e8b1ffd008093491a92102a9e8018052"
+                            + "a90302d11f2003d50aa60210a93900f9aaa107a929008052aa0301d161b0ff90"
+                            + "21b01191a3b5ffd063a00e91a26302d1a5c302d1c000805264038052a92900a9"
+                            + "a80900f9592717940a000014"),
+                    hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa0359385f350071a1030054"
+                            + "aa2359385ffd037141030054aa3359b84ba780525f010b6bc1020054aa735978"
+                            + "ab8689525f010b6b41020054aa9359b8ab9240b84a010b4aabe680520b02b872"
+                            + "5f010b6a610100540c000014"),
+                    0x14000024),
+            new CodeBlockSpec(
+                    "lhdcv5_quality_equals_pjz110_1608301",
+                    hex("68ac805289b2ffd029f93091a88316b8c8b1ffd008193e91a92102a9e8018052"
+                            + "a90302d11f2003d50aa60210a93900f9aaa107a929008052aa0301d141b0ff90"
+                            + "2144139183b5ffd063942a91a26302d1a5c302d1c000805264038052a92900a9"
+                            + "a80900f9092917940a000014"),
+                    hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa0359385f350071a1030054"
+                            + "aa2359385ffd037141030054aa3359b84ba780525f010b6bc1020054aa735978"
+                            + "ab8689525f010b6b41020054aa9359b8ab9240b84a010b4aabe680520b02b872"
+                            + "5f010b6a610100540c000014"),
+                    0x14000024),
+            new CodeBlockSpec(
+                    "lhdcv5_quality_equals_plc110_1608300",
+                    hex("68ac805249b5fff029fd0d918ab4fff04add1b912b008052a88317b8a8c301d1"
+                            + "01b3ff9021c02991a92902a91f2003d58a9c0210e901805243b8fff063a41891"
+                            + "a22302d1a58302d1a82906a9a80301d1c000805264038052a93900f9ab2100a9"
+                            + "a90900f933e519940a000014"),
+                    hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa035a385f350071a1030054"
+                            + "aa235a385ffd037141030054aa335ab84ba780525f010b6bc1020054aa735a78"
+                            + "ab8689525f010b6b41020054aa935ab88b9340b84a010b4aabe680520b02b872"
+                            + "5f010b6a610100540c000014"),
+                    0x14000024),
+            new CodeBlockSpec(
+                    "lhdcv5_quality_equals_rmx6688",
+                    hex("68ac805289b5fff029150091cab4fff04aa510912b008052a88317b8a8c301d1"
+                            + "41b3ff90212c2891a92902a91f2003d58a9c0210e901805283b8ffd063ec3b91"
+                            + "a22302d1a58302d1a82906a9a80301d1c000805264038052a93900f9ab2100a9"
+                            + "a90900f9dfe219940a000014"),
+                    hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa035a385f350071a1030054"
+                            + "aa235a385ffd037141030054aa335ab84ba780525f010b6bc1020054aa735a78"
+                            + "ab8689525f010b6b41020054aa935ab88b9340b84a010b4aabe680520b02b872"
+                            + "5f010b6a610100540c000014"),
+                    0x14000024),
+    };
     private static final int MAX_RANGE_BYTES = 64 * 1024 * 1024;
     private static final int NATIVE_PATCH_OK = 0;
     private static final int NATIVE_PATCH_ALREADY_APPLIED = 1;
@@ -640,8 +692,19 @@ final class NativeLhdcMemoryPatch {
         if (ranges.isEmpty()) {
             return PatchResult.pending("library_not_mapped");
         }
+        for (CodeBlockSpec spec : LHDC_V5_QUALITY_SWITCH_SPECS) {
+            PatchResult result = applyQualitySwitchSpecUnchecked(ranges, spec);
+            if (result != null) return result;
+        }
+        return PatchResult.unsupported(0, 0);
+    }
 
-        CodeBlockSpec spec = LHDC_V5_QUALITY_SWITCH_SPEC;
+    /**
+     * Applies one version-line spec when its whole-block signature uniquely matches the mapped
+     * library; returns null when this build is not the target (another spec may match).
+     */
+    private static PatchResult applyQualitySwitchSpecUnchecked(
+            List<MapRange> ranges, CodeBlockSpec spec) throws Exception {
         long originalAddress = 0L;
         int originalCount = 0;
         int patchedCount = 0;
@@ -662,7 +725,7 @@ final class NativeLhdcMemoryPatch {
             return PatchResult.alreadyPatched(patchedCount, originalCount, spec.name);
         }
         if (originalCount != 1 || patchedCount != 0 || originalAddress == 0L) {
-            return PatchResult.unsupported(patchedCount, originalCount);
+            return null;
         }
 
         MapRange patchRange = findRange(ranges, originalAddress);
@@ -1226,7 +1289,18 @@ final class NativeLhdcMemoryPatch {
 
     /** Visible for tests. */
     static CodeBlockSpec qualitySwitchSpecForTest() {
-        return LHDC_V5_QUALITY_SWITCH_SPEC;
+        return LHDC_V5_QUALITY_SWITCH_SPECS[0];
+    }
+
+    static CodeBlockSpec[] qualitySwitchSpecsForTest() {
+        return LHDC_V5_QUALITY_SWITCH_SPECS;
+    }
+
+    static CodeBlockSpec qualitySwitchSpecForTestName(String name) {
+        for (CodeBlockSpec spec : LHDC_V5_QUALITY_SWITCH_SPECS) {
+            if (spec.name.equals(name)) return spec;
+        }
+        throw new IllegalArgumentException("unknown quality-switch spec " + name);
     }
 
     private static final class MapRange {
