@@ -1,0 +1,1747 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>OPlus Headset Audio Helper · 诊断 v3</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <style>
+    /* ─────────────────────────────────────────────────────────────
+       设计目标
+       v3：信息元素与视觉风格沿用 v2，按分类组织内容，底部导航栏切换，
+       导航栏适配 Android 手势沉浸（safe-area-inset-bottom）。
+       分类：
+         - 概览：模块激活状态 / 模块开关 / 隐藏图标 / 环境信息 / 关键状态 / 记忆信息
+         - 状态：诊断状态 22 项
+         - 链路：实验性开关 / BQR 实时环境（KPI + 边界 + 理由）/ BQR 历史窗口
+         - 反馈：反馈工具（记录 / 反馈包 / 记忆快照）/ 最近事件 12 行
+       1. HTML 通过 JavaScriptInterface 读取诊断快照；只有用户操作开关或按钮时
+          才请求宿主写入，不在后台轮询或触发日志。
+       2. 实时环境 = 最近一次 BQR；历史窗口 = 当前 Activity 前台会话的内存样本。
+          页面在前台时订阅已有 BQR 数据，离开页面后立即退订并停止心跳。
+       3. 与 LhdcLinkHealthController 的 reason 列表对齐：
+          healthy_recovery_probe / native_upgrade_applied /
+          probe_bqr_severe / probe_bqr_sustained_bad / probe_queue_full /
+          probe_queue_congested / probe_stream_idle / probe_choppy /
+          boundary_locked / boundary_stable / quick_failure /
+          stream_session / device_active
+       4. 与 MasterSwitchActivity.refresh() 字段一一对应：
+          - 模块总开关 (KEY_ENABLED)
+          - 隐藏桌面图标 (KEY_HIDE_LAUNCHER_ICON)
+          - 反馈工具卡片（会话状态 / 记录按钮态 / 重抓 Melody 快照）
+           - 诊断状态 22 项 addStatusRow（scope.host / host.controller /
+            hook.host / inject.detail / inject.onespace / scope.bluetooth /
+            bridge.codec / bridge.le.bt / scope.wirelesssettings /
+             bridge.le.ws / native.patch.bitrate / native.patch.fast_switch /
+             diag.root.capture / lhdc.link.bqr / lhdc.link.choppy /
+             lhdc.link.queue / lhdc.link.shadow / codec.write / remember.write /
+            remember.replay / last.warning / last.error）
+          - 环境信息 5 项（模块版本 / 系统 / 三个宿主包版本，各作用域右侧显示 hook 标记）
+          - 记忆信息（当前 Melody 真实记忆 + 上次记忆恢复链路）
+          - 最近事件 12 行
+           - LHDC BQR 实时环境 6 个 KPI + 边界状态 + reason
+          - LHDC BQR 历史窗口 sparkline
+       ───────────────────────────────────────────────────────────── */
+    :root {
+      --bg: #f6f7fb;
+      --card: #ffffff;
+      --line: #e5eaf2;
+      --text: #151b26;
+      --subtext: #687385;
+      --muted: #8b96aa;
+      --blue: #0a84ff;
+      --blue-soft: #eaf3ff;
+      --green: #1f9d63;
+      --green-soft: #e7f5ee;
+      --orange: #d9822b;
+      --orange-soft: #fbecd8;
+      --red: #d64545;
+      --red-soft: #fbe3e3;
+      --purple: #7c5cff;
+      --shadow: 0 1px 2px rgba(20,27,38,.04), 0 8px 24px rgba(20,27,38,.05);
+      --radius: 18px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0f1218; --card: #161a23; --line: #232a36;
+        --text: #e7eaf0; --subtext: #a4adbd; --muted: #6b7589;
+        --blue-soft: #122a4a; --green-soft: #0f2b1f;
+        --orange-soft: #2a1f12; --red-soft: #2c1717;
+        --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { background: var(--bg); }
+    body {
+      margin: 0;
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+        "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei",
+        Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .page {
+      max-width: 720px; margin: 0 auto;
+      padding: calc(18px + env(safe-area-inset-top)) 18px
+        calc(96px + env(safe-area-inset-bottom));
+    }
+
+    /* header */
+    .header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+    .header .logo {
+      width: 56px; height: 56px; border-radius: 16px;
+      background: linear-gradient(135deg, var(--blue), #5aa7ff);
+      display: grid; place-items: center;
+      color: white; font-weight: 700; font-size: 22px;
+      box-shadow: 0 8px 16px rgba(10,132,255,.25);
+    }
+    .header h1 { margin: 0; font-size: 24px; letter-spacing: -.01em; }
+    .header p { margin: 4px 0 0; color: var(--subtext); font-size: 14px; }
+
+    /* card primitive */
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 18px;
+      box-shadow: var(--shadow);
+      margin-top: 14px;
+    }
+    .card h2 {
+      margin: 0 0 4px;
+      font-size: 17px;
+      letter-spacing: -.01em;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .card .hint { color: var(--subtext); font-size: 13px; }
+    .card + .card { margin-top: 14px; }
+
+    /* status pill */
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 12px; font-weight: 600;
+      letter-spacing: .02em;
+      border: 1px solid transparent;
+    }
+    .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .pill.ok    { color: var(--green);  background: var(--green-soft); }
+    .pill.warn  { color: var(--orange); background: var(--orange-soft); }
+    .pill.err   { color: var(--red);    background: var(--red-soft); }
+    .pill.idle  { color: var(--muted);  background: rgba(0,0,0,.04); }
+    .pill.info  { color: var(--blue);   background: var(--blue-soft); }
+
+    /* module switch row */
+    .switch-row { display: flex; align-items: center; justify-content: space-between; }
+    .switch-row .label strong { font-size: 16px; }
+    .switch-row .label p { margin: 4px 0 0; color: var(--subtext); font-size: 13px; }
+    /* CSS-only iOS-ish switch */
+    .switch { position: relative; width: 46px; height: 28px; flex: none; }
+    .switch input { display: none; }
+    .switch span {
+      position: absolute; inset: 0; cursor: pointer;
+      background: #d8dde7; border-radius: 999px;
+      transition: background .15s;
+    }
+    .switch span::before {
+      content: ""; position: absolute;
+      left: 3px; top: 3px; width: 22px; height: 22px;
+      background: white; border-radius: 50%;
+      transition: transform .18s cubic-bezier(.4,.2,.2,1);
+      box-shadow: 0 1px 2px rgba(0,0,0,.18);
+    }
+    .switch input:checked + span { background: var(--blue); }
+    .switch input:checked + span::before { transform: translateX(18px); }
+
+    /* primary buttons */
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    .btn {
+      flex: 1 1 calc(50% - 5px);
+      min-width: 140px;
+      padding: 12px 14px; border-radius: 14px; font-weight: 600;
+      font-size: 14px; cursor: pointer; border: 1px solid transparent;
+      transition: transform .12s, box-shadow .12s;
+    }
+    .btn.primary { background: var(--blue); color: white; border-color: transparent; }
+    .btn.primary:hover { box-shadow: 0 8px 16px rgba(10,132,255,.25); }
+    .btn.ghost { background: var(--blue-soft); color: var(--blue); }
+    .btn:active { transform: translateY(1px); }
+    .btn:disabled { opacity: .55; cursor: default; box-shadow: none; }
+
+    /* grid of small KPIs */
+    .kpis { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+    @media (min-width: 540px) { .kpis { grid-template-columns: repeat(4, 1fr); } }
+    .kpi {
+      padding: 14px; border-radius: 14px;
+      background: linear-gradient(180deg, rgba(10,132,255,.04), transparent);
+      border: 1px solid var(--line);
+    }
+    .kpi .v { font-size: 22px; font-weight: 700; letter-spacing: -.02em; }
+    .kpi .l { font-size: 12px; color: var(--subtext); margin-top: 2px; }
+    .kpi .u { font-size: 11px; color: var(--muted); }
+    .kpi.good    { background: linear-gradient(180deg, rgba(31,157,99,.08), transparent); }
+    .kpi.warn    { background: linear-gradient(180deg, rgba(217,130,43,.10), transparent); }
+    .kpi.bad     { background: linear-gradient(180deg, rgba(214,69,69,.10), transparent); }
+    .kpi.idle    { background: rgba(0,0,0,.02); }
+
+    /* session bar */
+    .session { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+    .session code {
+      font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", monospace;
+      font-size: 13px; color: var(--subtext);
+    }
+    .session .timer {
+      margin-left: auto;
+      font-variant-numeric: tabular-nums;
+      font-size: 13px; color: var(--subtext);
+    }
+
+    /* section header inside card */
+    .section-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin: 6px 0 12px;
+    }
+    .section-head h3 { margin: 0; font-size: 14px; color: var(--subtext); font-weight: 600; letter-spacing: .04em; text-transform: uppercase; }
+
+    /* status list */
+    .status-grid { display: grid; grid-template-columns: 1fr; gap: 0; }
+    .status-grid .row {
+      display: grid; grid-template-columns: 1fr auto; gap: 10px;
+      padding: 12px 0;
+      border-top: 1px dashed var(--line);
+      align-items: start;
+    }
+    .status-grid .row:first-child { border-top: none; padding-top: 0; }
+    .status-grid .row .lbl { font-weight: 600; }
+    .status-grid .row .sub { color: var(--subtext); font-size: 13px; }
+    .status-grid .row time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .status-grid .row code {
+      display: block; margin-top: 6px;
+      font-family: ui-monospace, SFMono-Regular, monospace;
+      font-size: 12px; color: var(--subtext);
+      word-break: break-all; white-space: pre-wrap;
+    }
+
+    /* BQR detail layout */
+    .bqr-grid {
+      display: grid; gap: 10px;
+      grid-template-columns: repeat(4, 1fr);
+    }
+    @media (max-width: 480px) {
+      .bqr-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    /* environment gauge */
+    .env-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; align-items: center; padding: 8px 0; }
+    .env-row .name { color: var(--subtext); font-size: 13px; }
+    .env-row .bar-wrap {
+      position: relative; height: 20px; display: flex; align-items: center;
+    }
+    .env-row .bar {
+      height: 8px; border-radius: 999px; background: var(--line); overflow: hidden; flex: 1;
+    }
+    .env-row .bar > i {
+      display: block; height: 100%;
+      background: linear-gradient(90deg, var(--green), var(--blue));
+    }
+    .env-row .bar > i.warn { background: linear-gradient(90deg, var(--orange), var(--red)); }
+    .env-row .bar > i.blocked { background: var(--muted); opacity: .45; }
+    .env-row .bar > i.testing { background: linear-gradient(90deg, var(--blue), #72b7ff); }
+    .env-row .bar > i.unsupported {
+      background: var(--muted); opacity: .55;
+    }
+    .env-row .val { font-variant-numeric: tabular-nums; font-size: 13px; color: var(--subtext); }
+    .env-row .lock-icon {
+      position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+      width: 20px; height: 20px; pointer-events: none; z-index: 2;
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted);
+    }
+    .env-row .lock-icon svg { width: 16px; height: 16px; }
+
+    /* history trend chart */
+    .history {
+      height: 86px; padding: 8px 0 4px;
+    }
+    .history svg {
+      display: block; width: 100%; height: 100%; overflow: visible;
+    }
+    .history .grid-line {
+      stroke: var(--line); stroke-width: 1; vector-effect: non-scaling-stroke;
+    }
+    .history .series {
+      fill: none; stroke-width: 2; vector-effect: non-scaling-stroke;
+      stroke-linecap: round; stroke-linejoin: round;
+    }
+    .history .series.retx  { stroke: var(--blue); }
+    .history .series.norx  { stroke: var(--orange); }
+    .history .series.queue { stroke: var(--red); }
+    .history-legend { display: flex; gap: 16px; font-size: 12px; color: var(--subtext); margin-top: 6px; flex-wrap: wrap; }
+    .history-legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+
+    /* recent events */
+    .event {
+      display: grid; grid-template-columns: 76px 56px 1fr; gap: 8px;
+      padding: 8px 0; border-top: 1px solid var(--line);
+      font-size: 13px;
+    }
+    .event:first-child { border-top: none; }
+    .event time { color: var(--muted); font-variant-numeric: tabular-nums; }
+    .event .lvl { font-weight: 700; }
+    .event .lvl.I { color: var(--blue); }
+    .event .lvl.W { color: var(--orange); }
+    .event .lvl.E { color: var(--red); }
+    .event .msg { font-family: ui-monospace, SFMono-Regular, monospace; color: var(--subtext); word-break: break-all; }
+
+    /* reason chips */
+    .reason {
+      display: inline-flex; gap: 4px; align-items: center;
+      padding: 4px 8px; border-radius: 999px; font-size: 12px; font-weight: 600;
+      background: var(--blue-soft); color: var(--blue);
+      max-width: 100%; overflow-wrap: anywhere; word-break: break-word;
+    }
+    .reason.locked { background: var(--red-soft); color: var(--red); }
+    .reason.stable { background: var(--green-soft); color: var(--green); }
+    .reason.queued { background: var(--orange-soft); color: var(--orange); }
+    .reason.idle   { background: rgba(0,0,0,.04); color: var(--muted); }
+
+    /* Reason timeline for the current Bluetooth-process run. Only reasons
+       that actually occurred are rendered; each row keeps the raw keyword,
+       a plain-language explanation, the latest time and an in-memory count. */
+    .reason-list { display: grid; gap: 8px; margin-top: 4px; }
+    .reason-row {
+      display: flex; flex-direction: column; align-items: stretch;
+      gap: 7px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(0,0,0,.015);
+    }
+    .reason-row .head {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    }
+    .reason-row .head .name {
+      font-weight: 600; font-size: 13px; letter-spacing: .01em;
+    }
+    .reason-row .desc {
+      color: var(--subtext); font-size: 13px; line-height: 1.55;
+    }
+    .reason-row .when {
+      display: flex; align-items: baseline; justify-content: flex-end; gap: 8px;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px; color: var(--muted);
+      text-align: right;
+    }
+    .reason-row .when strong {
+      color: var(--text); font-size: 13px;
+    }
+    @media (min-width: 720px) {
+      .reason-row {
+        display: grid;
+        grid-template-columns: minmax(180px, 1.1fr) minmax(240px, 2fr) auto;
+        align-items: center;
+      }
+      .reason-row .when { display: block; white-space: nowrap; }
+      .reason-row .when strong { display: block; }
+    }
+
+    /* footer note */
+    .footnote {
+      margin-top: 18px; padding: 12px 14px;
+      background: rgba(0,0,0,.02); border-radius: 12px;
+      color: var(--subtext); font-size: 12px;
+      min-width: 0; overflow-wrap: anywhere; word-break: break-word;
+    }
+    .footnote code {
+      white-space: normal; overflow-wrap: anywhere; word-break: break-word;
+    }
+
+    /* tabs (for BQR / history switch) */
+    .tabs { display: flex; gap: 6px; margin-top: 8px; }
+    .tabs button {
+      flex: 1; padding: 8px 0; border: 1px solid var(--line);
+      background: var(--card); color: var(--subtext);
+      border-radius: 10px; cursor: pointer; font-size: 13px;
+    }
+    .tabs button.active {
+      background: var(--blue-soft); color: var(--blue);
+      border-color: transparent; font-weight: 600;
+    }
+    @media (max-width: 480px) {
+      #history .section-head { flex-direction: column; align-items: stretch; }
+      #history .tabs { width: 100%; }
+    }
+
+    /* tiny visualizations */
+    .pulse { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--green); animation: pulse 2s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: .35; transform: scale(.85); }
+    }
+    .row-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+    .page.loading { opacity: 0; }
+    .page { transition: opacity .12s ease; }
+
+    /* ── v3: 分类面板（底部导航切换） ── */
+    .panel { display: none; }
+    .panel.active { display: block; }
+
+    /* ── v3: 底部导航栏（Android 手势沉浸适配） ──
+       外层固定到底部并把背景延伸到手势条区域；内层按钮避开安全区。 */
+    .tabbar {
+      position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
+      background: var(--card);
+      border-top: 1px solid var(--line);
+      box-shadow: 0 -8px 24px rgba(20,27,38,.06);
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .tabbar-inner {
+      display: flex;
+      max-width: 720px; margin: 0 auto;
+      padding: 8px 10px 6px;
+    }
+    .tab {
+      flex: 1;
+      display: flex; flex-direction: column; align-items: center; gap: 3px;
+      padding: 6px 0 4px;
+      background: none; border: none; cursor: pointer;
+      color: var(--muted);
+      font-size: 11px; font-weight: 600; letter-spacing: .01em;
+      -webkit-tap-highlight-color: transparent;
+      transition: color .15s;
+    }
+    .tab svg {
+      width: 23px; height: 23px;
+      fill: none; stroke: currentColor;
+      stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round;
+    }
+    .tab.active { color: var(--blue); }
+    .tab:active { opacity: .7; }
+
+    /* ── v3: 环境信息作用域 hook 标记 ── */
+    .env-value { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+    .scope-mark {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 20px; height: 20px; border-radius: 50%;
+      font-size: 12px; font-weight: 700; flex: none;
+    }
+    .scope-mark.ok   { color: var(--green); background: var(--green-soft); }
+    .scope-mark.err  { color: var(--red);   background: var(--red-soft); }
+    .scope-mark.idle { color: var(--muted); background: rgba(0,0,0,.04); }
+
+    /* ── v3: 概览关键状态速览 ── */
+    .key-status-grid {
+      display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px;
+      margin-top: 10px;
+    }
+    .key-status-item {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 9px 11px;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: rgba(0,0,0,.015);
+    }
+    .key-status-item .name { font-size: 13px; font-weight: 600; }
+
+    /* ── v3: 记忆卡头部操作区 ── */
+    .memory-head-actions { display: flex; align-items: center; gap: 8px; }
+    .btn.memory-refresh {
+      flex: none; min-width: 0;
+      padding: 6px 12px; font-size: 12px; border-radius: 999px;
+    }
+
+    /* ── v3: 记忆信息卡片化排版 ── */
+    .memory-list { display: grid; gap: 8px; margin-top: 4px; }
+    .memory-note { color: var(--muted); font-size: 12px; }
+    .memory-item {
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(0,0,0,.015);
+    }
+    .memory-mac { font-size: 12px; font-weight: 600; color: var(--subtext); }
+    .memory-codec { margin-top: 4px; font-size: 15px; font-weight: 700; }
+    .memory-time {
+      margin-top: 4px; font-size: 12px; color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+  </style>
+</head>
+<body>
+<div class="page loading" id="diagnostics-page">
+
+  <!-- ═══════════════ Header ═══════════════ -->
+  <header class="header">
+    <div class="logo">M</div>
+    <div>
+      <h1>欧加耳机音质助手</h1>
+      <p>音质控制、LE Audio、诊断反馈集中在这里</p>
+    </div>
+  </header>
+
+  <main class="panels">
+
+  <!-- ═══════════════ 概览：开关与反馈 ═══════════════ -->
+  <section class="panel active" data-panel="overview">
+
+  <!-- ═══════════════ 模块激活状态（v3 新增） ═══════════════ -->
+  <section class="card" id="module-active">
+    <div class="switch-row">
+      <div class="label">
+        <strong>模块激活状态</strong>
+        <p id="module-active-detail">当前版本：2.2.0</p>
+      </div>
+      <span class="pill ok" id="module-active-pill"><span class="dot"></span>已激活</span>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 模块开关 ═══════════════ -->
+  <section class="card">
+    <div class="switch-row">
+      <div class="label">
+        <strong>模块总开关</strong>
+        <p>控制模块整体启停；关闭后所有作用域 Hook 停用（注入、桥接、治理均不生效）。</p>
+      </div>
+      <label class="switch">
+        <input type="checkbox" checked data-enabled>
+        <span></span>
+      </label>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 桌面图标 ═══════════════ -->
+  <section class="card">
+    <div class="switch-row">
+      <div class="label">
+        <strong>隐藏桌面图标</strong>
+        <p>隐藏后仍可从 LSPosed、系统应用详情或已打开页面进入诊断页。再次打开进入可恢复。</p>
+      </div>
+      <label class="switch">
+        <input type="checkbox" data-hide-launcher>
+        <span></span>
+      </label>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 环境信息 ═══════════════ -->
+  <section class="card">
+    <h2>环境信息</h2>
+    <div class="status-grid" id="environment-grid">
+      <div class="row">
+        <div class="lbl">模块版本</div>
+        <code>2.2.0 (23)</code>
+      </div>
+      <div class="row">
+        <div class="lbl">系统</div>
+        <code>OnePlus PJZ110 / Android 16</code>
+      </div>
+      <div class="row">
+        <div class="lbl">无线耳机</div>
+        <div class="env-value"><code>15.4.0 (15400030)</code><span class="scope-mark ok" title="作用域已挂载">✓</span></div>
+      </div>
+      <div class="row">
+        <div class="lbl">蓝牙</div>
+        <div class="env-value"><code>16.2.0 (16200012)</code><span class="scope-mark idle" title="等待作用域上报">—</span></div>
+      </div>
+      <div class="row">
+        <div class="lbl">无线设置</div>
+        <div class="env-value"><code>13.1.0 (13100240)</code><span class="scope-mark err" title="作用域未正确挂载">✗</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 关键状态速览（v3 新增） ═══════════════ -->
+  <section class="card" id="key-status">
+    <h2>关键状态</h2>
+    <p class="hint">从诊断状态中甄选的关键项，仅显示名称与状态；完整列表见「状态」页。</p>
+    <div class="key-status-grid" id="key-status-grid">
+      <div class="key-status-item"><span class="name">码率 branch 补丁</span><span class="scope-mark ok">✓</span></div>
+      <div class="key-status-item"><span class="name">快切等价补丁</span><span class="scope-mark ok">✓</span></div>
+      <div class="key-status-item"><span class="name">页面 Hook</span><span class="scope-mark ok">✓</span></div>
+      <div class="key-status-item"><span class="name">DetailMain 注入</span><span class="scope-mark idle">—</span></div>
+      <div class="key-status-item"><span class="name">OneSpace 注入</span><span class="scope-mark ok">✓</span></div>
+      <div class="key-status-item"><span class="name">LHDC BQR Hook</span><span class="scope-mark ok">✓</span></div>
+      <div class="key-status-item"><span class="name">LHDC choppy Hook</span><span class="scope-mark ok">✓</span></div>
+      <div class="key-status-item"><span class="name">LHDC queue Hook</span><span class="scope-mark ok">✓</span></div>
+    </div>
+  </section>
+
+  <!-- ═══════════════ 记忆信息 ═══════════════ -->
+  <section class="card">
+    <h2>记忆信息</h2>
+    <div class="section-head">
+      <h3>当前 Melody 真实记忆</h3>
+      <div class="memory-head-actions">
+        <span class="pill idle" id="memory-state"><span class="dot"></span>等待快照</span>
+        <button class="btn ghost memory-refresh" id="memory-button">重抓</button>
+      </div>
+    </div>
+    <div class="memory-list" id="memory-remembered">
+      <div class="memory-note">来源：Melody 私有 SharedPreferences @ 08-10 00:45:49</div>
+      <div class="memory-item">
+        <div class="memory-mac">40:**:**:**:**:50</div>
+        <div class="memory-codec">LHDC / 音质优先 / 192 kHz</div>
+        <div class="memory-time">更新时间 08-10 00:45:49</div>
+      </div>
+      <div class="memory-item">
+        <div class="memory-mac">AA:BB:CC:DD:EE:01</div>
+        <div class="memory-codec">LDAC / 自适应 / 96 kHz</div>
+        <div class="memory-time">更新时间 07-28 22:14:55</div>
+      </div>
+    </div>
+
+    <div class="section-head" style="margin-top:14px"><h3>上次记忆恢复链路</h3></div>
+    <div class="status-grid" id="memory-replay">
+      <div class="row">
+        <code>07-28 22:14:51 evt=replay.bootstrap.scan devices=2
+07-28 22:14:53 evt=replay.schedule mac=AA:BB:CC:DD:EE:01 delay=900ms
+07-28 22:14:54 evt=replay.pending_ready mac=AA:BB:CC:DD:EE:01
+07-28 22:14:55 evt=replay.applied mac=AA:BB:CC:DD:EE:01 codec=ldac rate=96k outcome=CONFIRMED</code>
+      </div>
+    </div>
+  </section>
+
+  </section><!-- /overview -->
+
+  <!-- ═══════════════ 链路：BQR 实时环境 + 历史窗口 ═══════════════ -->
+  <section class="panel" data-panel="link">
+
+  <!-- ═══════════════ 码率拥塞治理器（实验性） ═══════════════ -->
+  <section class="card">
+    <div class="switch-row">
+      <div class="label">
+        <strong>码率拥塞治理器（实验性）</strong>
+        <p>开启后「音质优先」会按链路证据自动降档保护、环境恢复后自动升回，默认关闭。</p>
+        <p>实验性功能，移动/干扰环境下可能出现短暂降码率。</p>
+      </div>
+      <label class="switch">
+        <input type="checkbox" data-governor-enabled>
+        <span></span>
+      </label>
+    </div>
+  </section>
+
+  <!-- ═══════════════ BQR 实时环境（新增） ═══════════════ -->
+  <section class="card" id="bqr">
+    <div class="section-head">
+      <h3>LHDC 链路 · BQR 实时环境</h3>
+      <span class="pill idle" id="bqr-activity"><span class="pulse"></span>等待数据</span>
+    </div>
+
+    <div class="bqr-grid">
+      <div class="kpi good">
+        <div class="v" id="bqr-retx">—</div>
+        <div class="l">重传 / 秒</div>
+        <div class="u">健康上限 ≤ 60</div>
+      </div>
+      <div class="kpi good">
+        <div class="v" id="bqr-norx">—</div>
+        <div class="l">No-Rx / 秒</div>
+        <div class="u">健康上限 ≤ 60</div>
+      </div>
+      <div class="kpi">
+        <div class="v" id="bqr-unused-afh">— / 79</div>
+        <div class="l">未用 AFH 信道</div>
+        <div class="u">健康上限 ≤ 49</div>
+      </div>
+      <div class="kpi">
+        <div class="v" id="bqr-usable-afh">— / 79</div>
+        <div class="l">可用 AFH</div>
+        <div class="u">健康 ≥ 30</div>
+      </div>
+      <div class="kpi">
+        <div class="v" id="bqr-queue">—</div>
+        <div class="l">编码队列</div>
+        <div class="u">占用 0–45</div>
+      </div>
+      <div class="kpi">
+        <div class="v" id="bqr-choppy-capability">未知</div>
+        <div class="l">Remote choppy</div>
+        <div class="u">按当前蓝牙进程观察</div>
+      </div>
+    </div>
+
+    <p class="hint" id="bqr-evidence" style="margin-top:14px">
+      等待有效 BQR 样本。
+    </p>
+
+    <div class="section-head" style="margin-top:18px">
+      <h3>边界状态</h3>
+      <span class="pill info" id="bqr-ceiling">当前上限 —</span>
+    </div>
+
+    <div class="env-row">
+      <div class="name">500 → 900</div>
+      <div class="bar-wrap"><div class="bar"><i id="boundary-500-900-bar" style="width:0%"></i></div><span class="lock-icon" id="boundary-500-900-lock" style="display:none"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg></span></div>
+      <span class="val" id="boundary-500-900-value">未知</span>
+    </div>
+    <div class="env-row">
+      <div class="name">900 → 1000</div>
+      <div class="bar-wrap"><div class="bar"><i id="boundary-900-1000-bar" style="width:0%"></i></div><span class="lock-icon" id="boundary-900-1000-lock" style="display:none"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg></span></div>
+      <span class="val" id="boundary-900-1000-value">未知</span>
+    </div>
+    <p class="hint" style="margin-top:10px">
+      · 已恢复 = 该档位当前可达；<br>
+      · 恢复中 = 正在积累健康窗口向该档恢复；<br>
+      · 等待低档恢复 = 需先恢复低一档；<br>
+      · 已锁定 = 历史学习锁定的边界；<br>
+      · 试探中/验证中 = 升档试探进行中；<br>
+      · 不支持 = 设备能力确认达不到该档。
+    </p>
+
+    <div class="section-head" style="margin-top:18px">
+      <h3>最近事件理由</h3>
+    </div>
+    <div class="reason-list" id="reason-list">
+      <div class="empty">等待前台 BQR 数据…</div>
+    </div>
+
+    <p class="footnote" style="margin-top:18px">
+      数据来自 <code>LhdcLinkHealthController</code> 经 <code>SystemHookInstaller.handleBluetoothQualityReport</code>
+      转发的已有 BQR 样本。
+    </p>
+  </section>
+
+  <!-- ═══════════════ BQR 历史窗口（新增） ═══════════════ -->
+  <section class="card" id="history">
+    <div class="section-head">
+      <h3>LHDC 链路 · BQR 历史窗口</h3>
+      <div class="tabs">
+        <button class="active" data-history-window="300000">5 分钟</button>
+        <button data-history-window="1800000">30 分钟</button>
+        <button data-history-window="0">全程</button>
+      </div>
+    </div>
+
+    <div class="history" id="history-bars">
+      <!-- generated by JS from the current foreground Activity's in-memory BQR samples -->
+    </div>
+    <div class="history-legend">
+      <span><span class="swatch" style="background:var(--blue)"></span>重传 / 秒</span>
+      <span><span class="swatch" style="background:var(--orange)"></span>No-Rx / 秒</span>
+      <span><span class="swatch" style="background:var(--red)"></span>队列占用 %</span>
+      <span style="margin-left:auto" id="history-summary">采样: 0</span>
+    </div>
+
+    <p class="footnote">
+      聚合规则：从本次页面前台收到的实时样本按时间窗口分箱，
+      每个桶分别聚合重传、No-Rx 与队列占用峰值，再绘制成三条趋势线。
+    </p>
+  </section>
+  </section><!-- /link -->
+
+  <!-- ═══════════════ 状态：诊断状态 + 环境信息 ═══════════════ -->
+  <section class="panel" data-panel="status">
+
+  <!-- ═══════════════ 诊断状态 ═══════════════ -->
+  <section class="card">
+    <h2>诊断状态</h2>
+    <p class="hint">每次模块 hook 生效时会更新最近一次事件。</p>
+    <p class="hint">颜色：<span class="pill ok">ok</span> <span class="pill warn">pending</span> <span class="pill err">attention</span></p>
+
+    <div class="status-grid" id="status-grid">
+      <div class="row">
+        <div>
+          <div class="lbl">无线耳机作用域</div>
+          <div class="sub">scope.host.start / scope.host.context.ready</div>
+          <code>07-28 22:14:02 scope.host.start resolved=...</code>
+        </div>
+        <span class="pill ok"><span class="dot"></span>loaded</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">Host 控制器</div>
+          <div class="sub">evt=controller.ready</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>ready</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">蓝牙作用域</div>
+          <div class="sub">com.android.bluetooth · a2dp / codec hooks</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>loaded</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">A2DP Bridge</div>
+          <div class="sub">evt=system.bridge.registered</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>registered</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">码率 branch 补丁</div>
+          <div class="sub">evt=lhdc.memory_patch status=patched</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>patched</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">快切等价补丁</div>
+          <div class="sub">evt=lhdc.memory_patch.fast_switch status=patched</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>patched</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">最近写入</div>
+          <div class="sub">codec.write · path=A · success=true</div>
+          <code>07-28 22:18:31 evt=a2dp.setCodecConfigPreference codec=ldac rate=96k</code>
+        </div>
+        <span class="pill ok"><span class="dot"></span>ok</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">最近警告</div>
+          <div class="sub">Path-A LHDC accepted but not confirmed (transient)</div>
+          <code>07-28 22:18:14 Path-A setCodec failed retry=2</code>
+        </div>
+        <span class="pill warn"><span class="dot"></span>warning</span>
+      </div>
+
+      <div class="row">
+        <div>
+          <div class="lbl">最近错误</div>
+          <div class="sub">尚未发生 ERROR 级别事件</div>
+        </div>
+        <span class="pill idle"><span class="dot"></span>none</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">页面 Hook</div>
+          <div class="sub">preference.fragment.hooked / detailmain / onespace / activity.scan.registered</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>hooked</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">DetailMain 注入</div>
+          <div class="sub">hires_anchored.injected / detailmain_fallback.injected</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>injected</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">OneSpace 注入</div>
+          <div class="sub">evt=onespace.injected</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>injected</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">LE Audio 蓝牙桥</div>
+          <div class="sub">le.bt.receiver.registered · le.bt.*</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>registered</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">无线设置作用域</div>
+          <div class="sub">scope.wirelesssettings.start / context.ready</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>loaded</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">LE Audio 无线设置桥</div>
+          <div class="sub">le.ws.receiver.registered · le.ws.*</div>
+        </div>
+        <span class="pill ok"><span class="dot"></span>registered</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">记忆写入</div>
+          <div class="sub">remember.write · remember.set · remember.snapshot.*</div>
+          <code>07-28 22:14:55 evt=remember.set mac=AA:BB:CC:DD:EE:01 codec=ldac rate=96k</code>
+        </div>
+        <span class="pill ok"><span class="dot"></span>ok</span>
+      </div>
+      <div class="row">
+        <div>
+          <div class="lbl">重连重放</div>
+          <div class="sub">replay.bootstrap.scan / replay.schedule / replay.applied</div>
+          <code>07-28 22:14:55 evt=replay.applied outcome=CONFIRMED</code>
+        </div>
+        <span class="pill ok"><span class="dot"></span>ok</span>
+      </div>
+    </div>
+  </section>
+
+  </section><!-- /status -->
+
+  <!-- ═══════════════ 反馈：记录与反馈包 ═══════════════ -->
+  <section class="panel" data-panel="feedback">
+
+  <!-- ═══════════════ 反馈工具 ═══════════════ -->
+  <section class="card">
+    <h2>反馈工具</h2>
+    <p class="hint">反馈包会包含时间线、结构化事件、状态快照和可用日志。</p>
+
+    <!-- 正在记录中：显示会话 ID、倒计时，并提供"停止记录"按钮 -->
+    <div class="session" data-state="recording" id="recording-session">
+      <span class="pill ok"><span class="dot"></span>正在记录</span>
+      <code id="recording-id">—</code>
+      <span class="timer" id="recording-timer">—</span>
+    </div>
+
+    <!-- 未开始记录时显示这一段，由 JS 根据 isRecording 切换 -->
+    <div class="session" data-state="idle" id="idle-session" hidden>
+      <span class="pill idle"><span class="dot"></span>未在记录</span>
+      <code>—</code>
+      <span class="timer">诊断 receiver 已禁用，平时不会在后台采集</span>
+    </div>
+
+    <div class="actions">
+      <button class="btn primary" data-record-btn id="record-button">开始记录问题</button>
+      <button class="btn ghost" id="feedback-button">生成反馈包</button>
+    </div>
+    <div class="footnote">
+      怎么抓反馈：①点「开始记录问题」；②正常操作复现问题（播放/切换/断连重连等）；③点「生成反馈包」。
+      反馈包内含时间线、结构化事件、状态快照与可用日志。
+    </div>
+  </section>
+
+  <!-- ═══════════════ 最近事件 ═══════════════ -->
+  <section class="card">
+    <h2>最近事件</h2>
+    <p class="hint">从尾部反向展示；最近 12 条。原始事件按容量滚动保留。</p>
+
+    <div id="events">
+      <div class="event"><time>22:18:31</time><span class="lvl I">I</span><span class="msg">evt=a2dp.setCodecConfigPreference codec=ldac rate=96k success=true</span></div>
+      <div class="event"><time>22:18:29</time><span class="lvl I">I</span><span class="msg">evt=lhdc.link.bqr_summary mac=AA:BB:CC:DD:EE:01 retx=8 norx=2 afh_unused=22</span></div>
+      <div class="event"><time>22:18:23</time><span class="lvl I">I</span><span class="msg">evt=lhdc.link.probe_ceiling mac=AA:BB:CC:DD:EE:01 ceiling=900 reason=healthy_recovery_probe</span></div>
+      <div class="event"><time>22:18:11</time><span class="lvl W">W</span><span class="msg">Path-A LHDC accepted but not confirmed retry=2</span></div>
+      <div class="event"><time>22:18:09</time><span class="lvl I">I</span><span class="msg">evt=codec.bt.set codec=ldac rate=96k path=A confirmed=true</span></div>
+      <div class="event"><time>22:18:02</time><span class="lvl I">I</span><span class="msg">evt=lhdc.link.governor_event mac=AA:BB:CC:DD:EE:01 event=QUICK_FAILURE from=900 to=1000</span></div>
+      <div class="event"><time>22:17:55</time><span class="lvl I">I</span><span class="msg">evt=replay.applied mac=AA:BB:CC:DD:EE:01 codec=ldac rate=96k outcome=CONFIRMED</span></div>
+    </div>
+  </section>
+
+  </section><!-- /feedback -->
+  </main>
+
+</div>
+
+<!-- ═══════════════ 底部导航栏（Android 手势沉浸） ═══════════════ -->
+<nav class="tabbar" id="tabbar" aria-label="诊断分类">
+  <div class="tabbar-inner">
+    <button class="tab active" data-tab="overview">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+      <span>概览</span>
+    </button>
+    <button class="tab" data-tab="status">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.5 2.5L16 9.5"/></svg>
+      <span>状态</span>
+    </button>
+    <button class="tab" data-tab="link">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l2.5-6 4 12 2.5-6h5"/></svg>
+      <span>链路</span>
+    </button>
+    <button class="tab" data-tab="feedback">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+      <span>反馈</span>
+    </button>
+  </div>
+</nav>
+
+<script>
+  const bridge = window.MelodyDiagBridge;
+  const HISTORY_BUCKETS = 24;
+  const REASONS = [
+    ['healthy_recovery_probe', '主动试探', 'active', '健康窗口与低队列达标，开放下一档码率上限'],
+    ['native_upgrade_applied', '实际升档', 'active', 'getter 已确认实际到达更高的目标码率，进入稳定性验证'],
+    ['peer_ceiling_detected', '能力检测', 'stable', 'getter 确认设备无法到达目标档位，已按实际能力收敛上限'],
+    ['probe_bqr_severe', '环境严重恶化', 'locked', 'BQR 出现严重重传、No-Rx 或 AFH 信道不足，立即撤回'],
+    ['probe_bqr_sustained_bad', '环境持续恶化', 'queued', '连续多个 BQR 窗口变差，完成迟滞判断后撤回'],
+    ['probe_queue_full', '队列打满', 'locked', '蓝牙缓冲队列达到硬上限，立即保护降档'],
+    ['probe_queue_congested', '队列积压', 'queued', '队列占用超过 90% 并持续 300ms，撤回当前探测'],
+    ['probe_stream_idle', '音乐暂停', 'idle', '当前没有 A2DP 音频流，关闭临时探测'],
+    ['probe_choppy', '声音卡顿', 'locked', '收到耳机侧卡顿回报，立即保护链路'],
+    ['boundary_locked', '升级门槛锁定', 'locked', '同一升级边界连续失败，暂时停留在上一档'],
+    ['boundary_stable', '升级门槛解除', 'stable', '实际升档后稳定运行，清除该边界的失败证据'],
+    ['quick_failure', '快速失败', 'queued', '升档后很快发生拥塞，进入对应 native 退避'],
+    ['stream_session', '播放会话更新', 'stable', 'native 捕获到新的编码器代际，临时证据已重置'],
+    ['device_active', '设备激活', 'stable', '当前活动耳机切换，加载该设备的链路学习状态'],
+    ['remote_choppy', '耳机侧卡顿上报', 'locked', '耳机主动上报可闻卡顿，治理器据此保护'],
+    ['native_quality_start_retry_', '会话启动重试', 'queued', '首写未生效后的重试写入'],
+    ['native_quality_start_', '会话启动写档', 'stable', '流会话建立时 native 写入初始档位'],
+    ['native_probe_ceiling_restore_', '实际恢复', 'stable', 'native 已把码率写回目标档位'],
+    ['native_probe_ceiling_', '实际降档', 'locked', 'native 已把码率写入更低档位'],
+    ['native_remote_choppy_', '实际降档(choppy)', 'locked', 'choppy 触发的 native 实际降档'],
+    ['native_queue_full_', '实际降档(队列满)', 'locked', '队列打满触发的 native 实际降档'],
+    ['native_queue_critical_', '实际降档(队列积压)', 'locked', '队列积压触发的 native 实际降档'],
+    ['native_stable_upgrade_', '实际升档', 'active', '稳定升档已写入并确认']
+  ];
+  let lastSnapshot = null;
+  let historyWindowMs = 300000;
+  let timer = null;
+
+  function byId(id) { return document.getElementById(id); }
+  function number(value, fallback) {
+    if (value === null || value === undefined || value === '') {
+      return fallback === undefined ? 0 : fallback;
+    }
+    const n = Number(value);
+    return Number.isFinite(n) ? n : (fallback === undefined ? 0 : fallback);
+  }
+  function fmtRate(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return '—';
+    return n.toFixed(1).replace(/\.0$/, '');
+  }
+  function fmtRelative(time) {
+    if (!time) return '—';
+    const diff = Math.max(0, Date.now() - Number(time));
+    const min = Math.floor(diff / 60000);
+    if (min < 1) return '刚刚';
+    if (min < 60) return min + ' 分钟前';
+    const h = Math.floor(min / 60);
+    if (h < 24) return h + ' 小时前';
+    return Math.floor(h / 24) + ' 天前';
+  }
+  function fmtClock(time) {
+    if (!time) return '—';
+    const d = new Date(Number(time));
+    const two = v => String(v).padStart(2, '0');
+    return two(d.getMonth() + 1) + '-' + two(d.getDate()) + ' '
+      + two(d.getHours()) + ':' + two(d.getMinutes()) + ':' + two(d.getSeconds());
+  }
+  function setPill(element, state, text, pulse) {
+    if (!element) return;
+    element.className = 'pill ' + state;
+    element.textContent = '';
+    const dot = document.createElement('span');
+    dot.className = pulse ? 'pulse' : 'dot';
+    element.appendChild(dot);
+    element.appendChild(document.createTextNode(text));
+  }
+  function statusTier(status) {
+    const normalized = String(status || '').trim().toLowerCase();
+    if (status === '未发现'
+        || ['ok','ready','loaded','hooked','injected','registered','patched','active','armed'].includes(normalized)) return 'ok';
+    if (['attention','error','failed'].includes(normalized)) return 'err';
+    if (['pending','warning','would_protect'].includes(normalized)) return 'warn';
+    return 'idle';
+  }
+
+  function displayStatus(item) {
+    const status = String(item && item.status || '').trim();
+    if (status) return status;
+    const key = String(item && item.key || '');
+    if (key === 'last.warning' || key === 'last.error') return '未发现';
+    return '尚未采集';
+  }
+
+  function statusSubtext(item, status) {
+    if (item && item.time) return fmtClock(item.time);
+    if (status === '未发现') {
+      return item && item.key === 'last.error'
+        ? '本次诊断未记录到错误'
+        : '本次诊断未记录到警告';
+    }
+    if (status === '本次未触发') return '本次会话未触发对应路径';
+    if (status === '等待状态') return '等待对应作用域上报状态';
+    return '尚未采集（不代表模块未生效）';
+  }
+  function setKpi(id, value, tier) {
+    const el = byId(id);
+    if (!el) return;
+    el.textContent = value;
+    const card = el.parentElement;
+    if (card) card.className = 'kpi ' + tier;
+  }
+  function clear(element) {
+    if (!element) return;
+    while (element.firstChild) element.removeChild(element.firstChild);
+  }
+  function empty(container, text) {
+    clear(container);
+    const el = document.createElement('div');
+    el.className = 'empty';
+    el.textContent = text;
+    container.appendChild(el);
+  }
+
+  function renderRecording(s) {
+    const rec = s.recording || {};
+    const active = !!rec.active;
+    byId('recording-session').hidden = !active;
+    byId('idle-session').hidden = active;
+    byId('recording-id').textContent = rec.id || '—';
+    if (active) {
+      const remain = Math.max(0, number(rec.expiresAt) - Date.now());
+      const min = Math.floor(remain / 60000);
+      const sec = Math.floor((remain % 60000) / 1000);
+      byId('recording-timer').textContent = '剩余 ' + min + ':' + String(sec).padStart(2, '0');
+    } else {
+      const idleTimer = byId('idle-session').querySelector('.timer');
+      idleTimer.textContent = rec.id
+        ? '上次记录 ' + fmtRelative(rec.startedAt)
+        : '诊断 receiver 已禁用，平时不会在后台采集';
+    }
+    const record = byId('record-button');
+    record.textContent = active ? '停止记录' : '开始记录问题';
+    const feedback = byId('feedback-button');
+    feedback.disabled = !!s.feedbackBusy;
+    feedback.textContent = s.feedbackBusy ? '正在打包…' : '生成反馈包';
+  }
+
+  function fmtCountdown(ms) {
+    const totalSec = Math.max(1, Math.round(ms / 1000));
+    if (totalSec >= 60) {
+      const min = Math.floor(totalSec / 60);
+      const sec = totalSec % 60;
+      return min + ' 分' + (sec > 0 ? ' ' + sec + ' 秒' : '');
+    }
+    return totalSec + ' 秒';
+  }
+
+  function renderBoundary(prefix, state, progress) {
+    const bar = byId(prefix + '-bar');
+    const value = byId(prefix + '-value');
+    const lock = byId(prefix + '-lock');
+    if (!bar || !value) return;
+    const states = {
+      unknown:   ['未知', 'var(--muted)', ''],
+      locked:    ['已锁定', 'var(--red)', 'warn'],
+      blocked:   ['等待低档恢复', 'var(--muted)', 'blocked'],
+      recovering: ['恢复中', 'var(--blue)', 'testing'],
+      probing:   ['试探中', 'var(--blue)', 'testing'],
+      verifying: ['验证中', 'var(--blue)', 'testing'],
+      restored:  ['已恢复', 'var(--green)', ''],
+      unsupported: ['不支持', 'var(--muted)', 'unsupported']
+    };
+    const current = states[state] || states.unknown;
+    // Phase 5: a recovering bar fills with the recovery progress (0..1); other states
+    // are full (unknown stays empty).
+    const fill = state === 'unknown' ? 0
+      : (state === 'recovering' && Number.isFinite(progress))
+          ? Math.max(0, Math.min(1, progress))
+          : 1;
+    bar.style.width = (fill * 100).toFixed(1) + '%';
+    bar.className = current[2];
+    if (lock) lock.style.display = state === 'unsupported' ? '' : 'none';
+    const aria = {
+      unknown: '状态未知',
+      locked: '已锁定',
+      blocked: '等待低档恢复',
+      recovering: '恢复中',
+      probing: '试探中',
+      verifying: '验证中',
+      restored: '已恢复',
+      unsupported: '不支持 1000 kbps'
+    }[state] || '状态未知';
+    bar.setAttribute('aria-label', aria);
+    value.textContent = (state === 'recovering' && Number.isFinite(progress))
+      ? current[0] + ' ' + Math.round(fill * 100) + '%'
+      : current[0];
+    value.style.color = current[1];
+  }
+
+  function renderBqr(bqr) {
+    const data = bqr || {};
+    const latest = data.latest && typeof data.latest === 'object' ? data.latest : null;
+    const activity = byId('bqr-activity');
+    if (!latest) {
+      setPill(activity, 'idle', '等待数据', false);
+      setKpi('bqr-retx', '—', 'idle');
+      setKpi('bqr-norx', '—', 'idle');
+      setKpi('bqr-unused-afh', '— / 79', 'idle');
+      setKpi('bqr-usable-afh', '— / 79', 'idle');
+      setKpi('bqr-queue', '—', 'idle');
+      setKpi('bqr-choppy-capability', '未知', 'idle');
+      byId('bqr-evidence').textContent =
+        '等待有效 BQR 样本。';
+      byId('bqr-ceiling').textContent = '当前上限 —';
+      renderBoundary('boundary-500-900', 'unknown');
+      renderBoundary('boundary-900-1000', 'unknown');
+    } else {
+      const age = Math.max(0, Date.now() - number(latest.time));
+      const streaming = !!latest.streaming;
+      setPill(activity,
+        age > 20000 ? 'warn' : (streaming ? 'ok' : 'idle'),
+        age > 20000 ? '等待新样本' : (streaming ? '活动' : '已暂停'),
+        age <= 20000 && streaming);
+      const retx = number(latest.retransmissionsPerSec, NaN);
+      const norx = number(latest.noRxPerSec, NaN);
+      const unused = number(latest.unusedAfh, 0);
+      const usable = number(latest.usableAfh, 0);
+      const queue = Math.max(0, number(latest.queue, 0));
+      const queueCapacity = Math.max(1, number(latest.queueCapacity, 45));
+      const choppyCapability = latest.choppyCapabilityState || 'UNKNOWN';
+      setKpi('bqr-retx', fmtRate(retx), !Number.isFinite(retx) ? 'idle' : retx <= 30 ? 'good' : retx <= 60 ? 'warn' : 'bad');
+      setKpi('bqr-norx', fmtRate(norx), !Number.isFinite(norx) ? 'idle' : norx <= 30 ? 'good' : norx <= 60 ? 'warn' : 'bad');
+      setKpi('bqr-unused-afh', unused + ' / 79', unused <= 22 ? 'good' : unused <= 49 ? 'warn' : 'bad');
+      setKpi('bqr-usable-afh', usable + ' / 79', usable >= 30 ? 'good' : usable >= 20 ? 'warn' : 'bad');
+      const queueRatio = queue / queueCapacity;
+      setKpi('bqr-queue', queue + ' / ' + queueCapacity,
+        queueRatio >= 1 ? 'bad' : queueRatio >= 0.9 ? 'warn' : 'good');
+      setKpi('bqr-choppy-capability',
+        choppyCapability === 'OBSERVED' ? '已观察到' : '未知',
+        choppyCapability === 'OBSERVED' ? 'good' : 'idle');
+      const bqrFallbackCapKbps = number(latest.bqrFallbackCapKbps, 0);
+      const leakyCapKbps = number(latest.leakyFallbackCapKbps, 0);
+      // Most restrictive active protective cap (BQR fallback or leaky bucket); 0 = none.
+      const activeCapKbps = bqrFallbackCapKbps > 0 && leakyCapKbps > 0
+        ? Math.min(bqrFallbackCapKbps, leakyCapKbps)
+        : Math.max(bqrFallbackCapKbps, leakyCapKbps);
+      // Phase 5: which protective mechanism drives the active cap and its recovery.
+      const bqrProgressActive = bqrFallbackCapKbps > 0
+        && (leakyCapKbps === 0 || bqrFallbackCapKbps <= leakyCapKbps);
+      const recoveryStreak = bqrProgressActive
+        ? number(latest.bqrFallbackHealthyWindows, 0)
+        : number(latest.leakyFallbackHealthyWindows, 0);
+      const recoveryRequired = bqrProgressActive
+        ? number(latest.bqrFallbackRequiredHealthyWindows, 0)
+        : number(latest.leakyFallbackRequiredHealthyWindows, 0);
+      const recoveryHoldRemainingMs = bqrProgressActive
+        ? number(latest.bqrFallbackHoldRemainingMs, 0)
+        : number(latest.leakyFallbackHoldRemainingMs, 0);
+      if (activeCapKbps > 0) {
+        const sourceText = bqrProgressActive
+          ? 'BQR 保护' : '链路波动保护（漏桶）';
+        let countdownText;
+        if (recoveryRequired > 0 && recoveryStreak >= recoveryRequired) {
+          countdownText = recoveryHoldRemainingMs > 0
+            ? '窗口已达标，将在 ' + fmtCountdown(recoveryHoldRemainingMs) + '后再次尝试'
+            : '窗口已达标，等待切换';
+        } else if (recoveryRequired > 0) {
+          const shown = Math.min(recoveryStreak, recoveryRequired);
+          countdownText = '恢复中：' + shown + '/' + recoveryRequired + ' 健康窗'
+            + (recoveryHoldRemainingMs > 0
+                ? ' · 驻留剩余 ' + fmtCountdown(recoveryHoldRemainingMs) : '');
+          if (bqrProgressActive && activeCapKbps <= 500 && activeCapKbps > 400) {
+            countdownText += '（连续失败后驻留递增）';
+          }
+        } else {
+          countdownText = '等待健康证据';
+        }
+        byId('bqr-evidence').textContent =
+          sourceText + '降档已生效，当前上限 ' + activeCapKbps
+          + ' kbps；' + countdownText + '。';
+      } else if (retx > 60 || norx > 60 || unused > 49 || queueRatio >= 0.9) {
+        byId('bqr-evidence').textContent =
+          '链路压力较高，尚无保护降档证据；RF-only 不会触发强制降档。';
+      } else {
+        byId('bqr-evidence').textContent =
+          '链路与编码队列均正常，保持当前码率治理行为。';
+      }
+      const ceiling = number(latest.ceilingKbps);
+      const effectiveCeiling = number(latest.effectiveCeilingKbps, ceiling);
+      const peerCeiling = number(latest.peerCeilingKbps, 0);
+      const phase = latest.probePhase || 'stable';
+      const bitrateVerification = latest.bitrateVerification || 'none';
+      let phaseLabel = {
+        locked: '已受限',
+        probing: '正在试探',
+        verifying: '正在验证',
+        stable: '状态稳定'
+      }[phase] || '状态更新中';
+      // Protective cap: probePhase=stable but ceiling is capped below normal
+      if (phase === 'stable' && activeCapKbps > 0 && ceiling <= activeCapKbps) {
+        phaseLabel = '降档';
+      }
+      if (bitrateVerification === 'pending') phaseLabel = '正在验证';
+      else if (bitrateVerification === 'getter_mismatch') phaseLabel = '能力受限';
+      else if (bitrateVerification === 'getter_unavailable'
+          || bitrateVerification === 'getter_read_failed') phaseLabel = '状态未核验';
+      // A confirmed peer ceiling (e.g. 900) must cap the displayed value even when a stale or
+      // racing payload still carries ceilingKbps=1000.
+      const displayCeiling = peerCeiling > 0
+        ? Math.min(effectiveCeiling, peerCeiling) : effectiveCeiling;
+      byId('bqr-ceiling').textContent =
+        '当前上限 ' + displayCeiling + ' kbps · ' + phaseLabel;
+
+      const lowerLocked = !!latest.lock500to900;
+      const upperLocked = !!latest.lock900to1000;
+      const peerKnown = peerCeiling > 0;
+      const upperSupported = !!latest.boundary900To1000Supported;
+      const probeState = phase === 'verifying' ? 'verifying' : 'probing';
+      const probing900 = (phase === 'probing' || phase === 'verifying') && ceiling === 900;
+      const probing1000 = (phase === 'probing' || phase === 'verifying') && ceiling === 1000;
+      // 500 -> 900 bar = status of the 900 tier (first match wins).
+      let lowerState;
+      if (peerKnown && peerCeiling <= 500) {
+        lowerState = 'unsupported';       // device max confirmed at 500
+      } else if (lowerLocked) {
+        lowerState = 'locked';            // learned boundary lock
+      } else if (probing900) {
+        lowerState = probeState;          // probe toward 900 in flight
+      } else if (activeCapKbps === 500) {
+        lowerState = 'recovering';        // 500->900 is the active recovery path
+      } else if (activeCapKbps === 400) {
+        lowerState = 'blocked';           // must recover 400->500 first
+      } else {
+        lowerState = 'restored';          // ceiling >= 900: the 900 tier is already there
+      }
+      // 900 -> 1000 bar = status of the 1000 tier (first match wins).
+      let upperState;
+      if (peerKnown && !upperSupported) {
+        upperState = 'unsupported';       // device max confirmed below 1000
+      } else if (upperLocked) {
+        upperState = 'locked';            // learned boundary lock
+      } else if (activeCapKbps === 900) {
+        upperState = 'recovering';        // 900->1000 is the active recovery path
+      } else if (activeCapKbps === 500 || activeCapKbps === 400
+          || lowerLocked || probing900) {
+        upperState = 'blocked';           // must recover the 900 tier first
+      } else if (probing1000) {
+        upperState = probeState;          // probe toward 1000 in flight
+      } else if (peerKnown && upperSupported) {
+        upperState = 'restored';          // ceiling >= 1000: the 1000 tier is already there
+      } else {
+        upperState = 'unknown';
+      }
+      // Phase 5: a recovering bar fills with the window progress (streak / required).
+      const barProgress = recoveryRequired > 0
+        ? Math.min(recoveryStreak, recoveryRequired) / recoveryRequired : null;
+      renderBoundary('boundary-500-900', lowerState,
+        lowerState === 'recovering' ? barProgress : null);
+      renderBoundary('boundary-900-1000', upperState,
+        upperState === 'recovering' ? barProgress : null);
+    }
+    renderReasons(data.reasonCounts || {}, data.reasonTimes || {});
+    renderHistory(data.history || []);
+  }
+
+  function renderReasons(counts, times) {
+    const holder = byId('reason-list');
+    clear(holder);
+    const entries = Object.keys(counts).concat(Object.keys(times));
+    const occurred = REASONS
+      .filter(entry => entries.some(key => key === entry[0] || key.startsWith(entry[0])))
+      .sort((a, b) => {
+        const ta = Object.keys(times).filter(k => k === a[0] || k.startsWith(a[0]))
+          .map(k => number(times[k], 0)).sort((x, y) => y - x)[0] || 0;
+        const tb = Object.keys(times).filter(k => k === b[0] || k.startsWith(b[0]))
+          .map(k => number(times[k], 0)).sort((x, y) => y - x)[0] || 0;
+        return tb - ta;
+      });
+    if (!occurred.length) {
+      empty(holder, '本次蓝牙运行尚未出现拥塞治理事件');
+      return;
+    }
+    occurred.forEach(entry => {
+      const [key, label, tier, desc] = entry;
+      const matched = entries.filter(k => k === key || k.startsWith(key));
+      const count = matched.reduce((sum, k) => sum + number(counts[k], 0), 0);
+      const lastTime = matched.map(k => number(times[k], 0))
+        .sort((x, y) => y - x)[0] || 0;
+      const row = document.createElement('div');
+      row.className = 'reason-row';
+      const head = document.createElement('div');
+      head.className = 'head';
+      const chip = document.createElement('span');
+      chip.className = 'reason ' + tier;
+      chip.textContent = key;
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = label;
+      head.append(chip, name);
+      const detail = document.createElement('div');
+      detail.className = 'desc';
+      detail.textContent = desc;
+      const when = document.createElement('div');
+      when.className = 'when';
+      const strong = document.createElement('strong');
+      strong.textContent = fmtRelative(lastTime);
+      when.appendChild(strong);
+      when.appendChild(document.createTextNode(count
+        ? '本次运行 ' + count + ' 次' : '已发生'));
+      row.append(head, detail, when);
+      holder.appendChild(row);
+    });
+  }
+
+  function renderHistory(history) {
+    const now = Date.now();
+    const filtered = (Array.isArray(history) ? history : []).filter(sample =>
+      !historyWindowMs || now - number(sample.time) <= historyWindowMs);
+    const buckets = Array.from({length: HISTORY_BUCKETS}, () => ({
+      retx: 0, norx: 0, queue: 0, count: 0
+    }));
+    if (filtered.length) {
+      const first = historyWindowMs
+        ? now - historyWindowMs
+        : Math.min.apply(null, filtered.map(v => number(v.time)));
+      const span = Math.max(1, now - first);
+      filtered.forEach(sample => {
+        const idx = Math.max(0, Math.min(HISTORY_BUCKETS - 1,
+          Math.floor((number(sample.time) - first) / span * HISTORY_BUCKETS)));
+        const cap = Math.max(1, number(sample.queueCapacity, 45));
+        const queue = Math.max(0, number(sample.queue, 0)) / cap * 100;
+        buckets[idx].count++;
+        buckets[idx].retx = Math.max(buckets[idx].retx,
+          Math.max(0, number(sample.retransmissionsPerSec, 0)));
+        buckets[idx].norx = Math.max(buckets[idx].norx,
+          Math.max(0, number(sample.noRxPerSec, 0)));
+        buckets[idx].queue = Math.max(buckets[idx].queue, queue);
+      });
+    }
+    const holder = byId('history-bars');
+    clear(holder);
+    const scalePeak = Math.max(100, ...buckets.flatMap(bucket =>
+      [bucket.retx, bucket.norx, bucket.queue]));
+    const activeBuckets = buckets
+      .map((bucket, index) => Object.assign({index}, bucket))
+      .filter(bucket => bucket.count > 0);
+    const svgNs = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(svgNs, 'svg');
+    svg.setAttribute('viewBox', '0 0 100 60');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    [4, 30, 56].forEach(y => {
+      const line = document.createElementNS(svgNs, 'line');
+      line.setAttribute('x1', '0');
+      line.setAttribute('x2', '100');
+      line.setAttribute('y1', String(y));
+      line.setAttribute('y2', String(y));
+      line.setAttribute('class', 'grid-line');
+      svg.appendChild(line);
+    });
+    [['retx', 'retx'], ['norx', 'norx'], ['queue', 'queue']].forEach(series => {
+      if (!activeBuckets.length) return;
+      const points = activeBuckets.map(bucket => {
+        const x = activeBuckets.length === 1
+          ? 50 : bucket.index / (HISTORY_BUCKETS - 1) * 100;
+        const y = 56 - Math.min(1, bucket[series[1]] / scalePeak) * 52;
+        return [x, y];
+      });
+      if (points.length === 1) {
+        points.unshift([Math.max(0, points[0][0] - 2), points[0][1]]);
+        points.push([Math.min(100, points[1][0] + 2), points[1][1]]);
+      }
+      const polyline = document.createElementNS(svgNs, 'polyline');
+      polyline.setAttribute('class', 'series ' + series[0]);
+      polyline.setAttribute('points', points.map(point =>
+        point[0].toFixed(2) + ',' + point[1].toFixed(2)).join(' '));
+      svg.appendChild(polyline);
+    });
+    holder.appendChild(svg);
+    const retxAvg = filtered.length
+      ? filtered.reduce((sum, v) => sum + number(v.retransmissionsPerSec), 0) / filtered.length
+      : 0;
+    const norxAvg = filtered.length
+      ? filtered.reduce((sum, v) => sum + number(v.noRxPerSec), 0) / filtered.length
+      : 0;
+    const queuePeak = buckets.reduce((peak, bucket) => Math.max(peak, bucket.queue), 0);
+    byId('history-summary').textContent = '采样: ' + filtered.length
+      + ' / 重传均值 ' + retxAvg.toFixed(1)
+      + ' / No-Rx 均值 ' + norxAvg.toFixed(1)
+      + ' / 队列峰值 ' + queuePeak.toFixed(1) + '%';
+  }
+
+  function renderStatuses(rows) {
+    const holder = byId('status-grid');
+    clear(holder);
+    (rows || []).forEach(item => {
+      const status = displayStatus(item);
+      const row = document.createElement('div');
+      row.className = 'row';
+      const content = document.createElement('div');
+      const label = document.createElement('div');
+      label.className = 'lbl';
+      label.textContent = item.label || item.key || '—';
+      const sub = document.createElement('div');
+      sub.className = 'sub';
+      sub.textContent = statusSubtext(item, status);
+      content.append(label, sub);
+      if (item.detail) {
+        const code = document.createElement('code');
+        code.textContent = item.detail;
+        content.appendChild(code);
+      }
+      const pill = document.createElement('span');
+      setPill(pill, statusTier(status), status, false);
+      row.append(content, pill);
+      holder.appendChild(row);
+    });
+  }
+
+  /* ── v3: 概览顶部模块激活状态卡，由现有快照字段派生 ── */
+  function renderModuleActive(s) {
+    const pill = byId('module-active-pill');
+    const detail = byId('module-active-detail');
+    if (!pill || !detail) return;
+    const rows = Array.isArray(s.statuses) ? s.statuses : [];
+    const host = rows.find(item => item.key === 'scope.host');
+    const hostStatus = String(host && host.status || '').trim();
+    const env = s.environment || {};
+    // environment.module 形如 "2.2.0 (23)"，只取版本名部分。
+    const rawVersion = String(env.module || '').trim();
+    const versionName = rawVersion.split(' (')[0].trim() || '未知';
+    detail.textContent = '当前版本：' + versionName;
+    if (hostStatus === 'loaded' || hostStatus === 'ok') {
+      setPill(pill, 'ok', '已激活', false);
+    } else if (hostStatus === 'attention' || hostStatus === 'failed') {
+      setPill(pill, 'err', '未激活', false);
+    } else {
+      setPill(pill, 'idle', '等待激活', false);
+    }
+  }
+
+  function appendInfoRow(holder, labelText, value) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    const label = document.createElement('div');
+    label.className = 'lbl';
+    label.textContent = labelText;
+    const code = document.createElement('code');
+    code.textContent = value || '—';
+    row.append(label, code);
+    holder.appendChild(row);
+  }
+
+  /* ── v3: 状态标记：ok 系 → 绿勾，attention/failed → 红叉，其余灰横线 ── */
+  function scopeMark(status) {
+    const s = String(status || '').trim();
+    if (['ok','ready','loaded','hooked','injected','registered',
+         'patched','active','armed'].includes(s)) return ['ok', '✓'];
+    if (s === 'attention' || s === 'failed' || s === 'error') return ['err', '✗'];
+    return ['idle', '—'];
+  }
+
+  /* ── v3: 概览关键状态速览（名称 + 状态标记，无详细数据） ── */
+  const KEY_STATUS_ITEMS = [
+    ['native.patch.bitrate', '码率 branch 补丁'],
+    ['native.patch.fast_switch', '快切等价补丁'],
+    ['hook.host', '页面 Hook'],
+    ['inject.detail', 'DetailMain 注入'],
+    ['inject.onespace', 'OneSpace 注入'],
+    ['lhdc.link.bqr', 'LHDC BQR Hook'],
+    ['lhdc.link.choppy', 'LHDC choppy Hook'],
+    ['lhdc.link.queue', 'LHDC queue Hook']
+  ];
+  function renderKeyStatus(statuses) {
+    const holder = byId('key-status-grid');
+    if (!holder) return;
+    clear(holder);
+    const rows = Array.isArray(statuses) ? statuses : [];
+    KEY_STATUS_ITEMS.forEach(entry => {
+      const statusRow = rows.find(item => item.key === entry[0]);
+      const mark = scopeMark(statusRow && statusRow.status);
+      const item = document.createElement('div');
+      item.className = 'key-status-item';
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = entry[1];
+      const icon = document.createElement('span');
+      icon.className = 'scope-mark ' + mark[0];
+      icon.textContent = mark[1];
+      item.append(name, icon);
+      holder.appendChild(item);
+    });
+  }
+
+  function renderEnvironment(env, statuses) {
+    const holder = byId('environment-grid');
+    clear(holder);
+    appendInfoRow(holder, '模块版本', env.module);
+    appendInfoRow(holder, '系统', env.system);
+    const rows = Array.isArray(statuses) ? statuses : [];
+    const scopeKeys = [
+      ['无线耳机', 'scope.host', env.melody],
+      ['蓝牙', 'scope.bluetooth', env.bluetooth],
+      ['无线设置', 'scope.wirelesssettings', env.wirelessSettings]
+    ];
+    scopeKeys.forEach(entry => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const label = document.createElement('div');
+      label.className = 'lbl';
+      label.textContent = entry[0];
+      const wrap = document.createElement('div');
+      wrap.className = 'env-value';
+      const code = document.createElement('code');
+      code.textContent = entry[2] || '—';
+      const statusRow = rows.find(item => item.key === entry[1]);
+      const mark = scopeMark(statusRow && statusRow.status);
+      const span = document.createElement('span');
+      span.className = 'scope-mark ' + mark[0];
+      span.textContent = mark[1];
+      span.title = mark[0] === 'ok' ? '作用域已挂载'
+        : mark[0] === 'err' ? '作用域未正确挂载' : '等待作用域上报';
+      wrap.append(code, span);
+      row.append(label, wrap);
+      holder.appendChild(row);
+    });
+  }
+  /* ── v3: 记忆条目卡片化；raw 明细行不再展示 ── */
+  function renderMemoryRemembered(holder, text) {
+    const raw = String(text || '').replace(/\n\s*raw:.*/g, '');
+    const blocks = raw.split(/\n{2,}/).map(b => b.trim()).filter(Boolean);
+    if (!blocks.length) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = text || '尚未收到 Melody 私有数据里的真实记忆快照。';
+      holder.appendChild(empty);
+      return;
+    }
+    blocks.forEach(block => {
+      const lines = block.split('\n').map(l => l.trim()).filter(Boolean);
+      const first = lines[0] || '';
+      if (first.startsWith('来源：')) {
+        const note = document.createElement('div');
+        note.className = 'memory-note';
+        note.textContent = first;
+        holder.appendChild(note);
+        return;
+      }
+      const colon = first.indexOf('：');
+      const mac = colon > 0 ? first.slice(0, colon) : '';
+      const summary = colon > 0 ? first.slice(colon + 1) : first;
+      const item = document.createElement('div');
+      item.className = 'memory-item';
+      const macEl = document.createElement('div');
+      macEl.className = 'memory-mac';
+      macEl.textContent = mac || '—';
+      const codecEl = document.createElement('div');
+      codecEl.className = 'memory-codec';
+      codecEl.textContent = summary;
+      item.append(macEl, codecEl);
+      const timeLine = lines.find(l => l.startsWith('更新时间'));
+      if (timeLine) {
+        const timeEl = document.createElement('div');
+        timeEl.className = 'memory-time';
+        timeEl.textContent = timeLine.replace(/^更新时间[:：]\s*/, '更新时间 ');
+        item.appendChild(timeEl);
+      }
+      holder.appendChild(item);
+    });
+  }
+  function renderMemory(memory) {
+    const data = memory || {};
+    const remembered = byId('memory-remembered');
+    const replay = byId('memory-replay');
+    clear(remembered);
+    clear(replay);
+    renderMemoryRemembered(remembered, data.remembered);
+    appendInfoRow(replay, '上次记忆恢复链路', data.replay);
+    const hasMemory = data.remembered && !data.remembered.startsWith('尚未');
+    setPill(byId('memory-state'), hasMemory ? 'ok' : 'idle', hasMemory ? '已读取' : '等待快照', false);
+  }
+  function renderEvents(events) {
+    const holder = byId('events');
+    clear(holder);
+    if (!events || !events.length) {
+      empty(holder, '尚未采集到诊断事件；这不代表模块未生效。');
+      return;
+    }
+    events.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'event';
+      const time = document.createElement('time');
+      time.textContent = item.time || '—';
+      const level = document.createElement('span');
+      level.className = 'lvl ' + (item.level || 'I');
+      level.textContent = item.level || 'I';
+      const message = document.createElement('span');
+      message.className = 'msg';
+      message.textContent = item.message || '';
+      row.append(time, level, message);
+      holder.appendChild(row);
+    });
+  }
+
+  function applySnapshot(s) {
+    if (!s || typeof s !== 'object') return;
+    // Fail open: a single card renderer must never leave the whole page invisible.
+    byId('diagnostics-page').classList.remove('loading');
+    lastSnapshot = s;
+    const enabledSwitch = document.querySelector('input[data-enabled]');
+    const hideSwitch = document.querySelector('input[data-hide-launcher]');
+    const governorSwitch = document.querySelector('input[data-governor-enabled]');
+    enabledSwitch.checked = !!s.enabled;
+    hideSwitch.checked = !!s.hideLauncherIcon;
+    governorSwitch.checked = !!s.governorEnabled;
+    renderRecording(s);
+    renderBqr(s.bqr);
+    renderStatuses(s.statuses || []);
+    renderEnvironment(s.environment || {}, s.statuses || []);
+    renderModuleActive(s);
+    renderKeyStatus(s.statuses || []);
+    renderMemory(s.memory || {});
+    renderEvents(s.events || []);
+  }
+
+  function applyJson(raw) {
+    if (!raw) return;
+    try { applySnapshot(typeof raw === 'string' ? JSON.parse(raw) : raw); }
+    catch (_) {
+      byId('diagnostics-page').classList.remove('loading');
+      /* keep the previous good frame */
+    }
+  }
+  function refresh() {
+    if (!bridge || typeof bridge.refresh !== 'function') return;
+    applyJson(bridge.refresh());
+  }
+  function start() {
+    if (!bridge) {
+      byId('diagnostics-page').classList.remove('loading');
+      return;
+    }
+    if (timer) return;
+    refresh();
+    timer = setInterval(refresh, 4000);
+  }
+  function stop() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  document.querySelector('input[data-enabled]').addEventListener('change', event => {
+    if (bridge && bridge.setEnabled) bridge.setEnabled(!!event.target.checked);
+  });
+  document.querySelector('input[data-hide-launcher]').addEventListener('change', event => {
+    if (bridge && bridge.setHideLauncherIcon) bridge.setHideLauncherIcon(!!event.target.checked);
+  });
+  document.querySelector('input[data-governor-enabled]').addEventListener('change', event => {
+    if (bridge && bridge.setGovernorEnabled) bridge.setGovernorEnabled(!!event.target.checked);
+  });
+  byId('record-button').addEventListener('click', () => {
+    if (bridge && bridge.toggleRecording) bridge.toggleRecording();
+  });
+  byId('feedback-button').addEventListener('click', () => {
+    if (bridge && bridge.generateFeedback) bridge.generateFeedback();
+  });
+  byId('memory-button').addEventListener('click', () => {
+    if (bridge && bridge.requestMemorySnapshot) bridge.requestMemorySnapshot();
+  });
+  document.querySelectorAll('[data-history-window]').forEach(button => {
+    button.addEventListener('click', () => {
+      document.querySelectorAll('[data-history-window]').forEach(v => v.classList.remove('active'));
+      button.classList.add('active');
+      historyWindowMs = number(button.dataset.historyWindow, 300000);
+      renderHistory(lastSnapshot && lastSnapshot.bqr ? lastSnapshot.bqr.history : []);
+    });
+  });
+  /* ── v3: 底部导航切换（不重置任何渲染状态） ── */
+  document.querySelectorAll('.tab').forEach(button => {
+    button.addEventListener('click', () => switchTab(button.dataset.tab));
+  });
+  function switchTab(name) {
+    document.querySelectorAll('.panel').forEach(panel =>
+      panel.classList.toggle('active', panel.dataset.panel === name));
+    document.querySelectorAll('.tab').forEach(button =>
+      button.classList.toggle('active', button.dataset.tab === name));
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') start(); else stop();
+  });
+  window.MelodyDiagnostics = { start, stop, applyJson };
+  if (document.visibilityState === 'visible') start();
+</script>
+</body>
+</html>
