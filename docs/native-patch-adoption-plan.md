@@ -121,7 +121,7 @@ unsupported 分支）：
 3. 构建（debug/release）+ 静态验证；
 4. 真机验证（见 §7）。
 
-### 5.3 宿主侧适配提醒（toast 矩阵）— 需求已确认 2026-08-10，待实施
+### 5.3 宿主侧适配提醒（toast 矩阵）— 已实施并通过真机验证（2026-08-10）
 
 背景：宿主面板**切换到「音质优先」（固定 1000/900）**时，按码率 branch（B）与快切
 等价（F）补丁的适配状态给出差异化反馈——两个补丁只与「切到音质优先」相关（B 管固定
@@ -161,6 +161,17 @@ unsupported 分支）：
 
 实现范围（待开工）：`Strings` 新文案 + `CodecController` 状态跟踪 / 提醒判定（抽可测
 静态方法）+ 单测 + 构建 + qwen 审查 + 新分支 PR；本矩阵随等价补丁适配一并交付。
+
+验证记录（2026-08-10，PJZ110 16.0.9.401，分支 feat/lhdc-patch-advisory-toast）：
+- 真屏蔽门：`BuildConfig.DEBUG && TOAST_TEST_BLOCK_BITRATE/FAST_SWITCH` 时补丁流程整体
+  短路（so 不打补丁），仅把 unsupported 上报宿主喂 toast；debug 专用（-P 构建字段 +
+  DEBUG 双门控），release 恒失效；
+- 屏蔽包实测：block-bitrate / block-fastswitch / block-both 三包均按矩阵弹出对应 toast；
+  block-fastswitch 包系统日志确认 `A2DP_CodecEquals: unsupported codec id 0x4c35053aff`
+  + `restart_output=true` + `BTA_AvReconfig` 真实发生（补丁确未打），1000 稳态播放仍
+  流畅——F 缺失的卡顿取决于重建后启动拥塞，提醒属保守设计；
+- 回放连弹修复：真机实测 23s 内连弹 6 次（多调度源 + 重试），已按 MAC 加 60s 去重窗口，
+  一次回放片段只弹一次；跨窗口独立回放仍每次弹。
 
 ## 6. 版本漂移策略
 
