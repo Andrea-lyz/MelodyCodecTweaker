@@ -16,6 +16,35 @@
 
 The module primarily targets `com.oplus.melody` on ColorOS / OPlus devices, working alongside the `com.android.bluetooth` and `com.oplus.wirelesssettings` scopes for more stable state reading and writing.
 
+## 2.3.0 Update Highlights (since 2.2.0)
+
+**LHDC V5 fast-switch equivalence patch (native memory patch)**
+
+- Fixes ColorOS 16's `A2DP_CodecEquals` missing the LHDC V5 dispatch: pure quality-tier switches are no longer forced to rebuild the output (previously "environment supports the highest bitrate but switching stutters" — startup congestion after rebuilding the AVDTP link).
+- Covers every known version line: PJZ110 16.0.9.401/.402 (device-verified), OP15/Ace6T 16.0.7.201, PJZ110 16.0.8.301/PLK110, PLC110 16.0.8.300, RMX6688 (MTK); the bitrate-branch patch also gains RMX6688 (MTK) support and a semantic-scan fallback.
+- The diagnostics page now shows the patch state as two separate rows — **Bitrate Branch Patch** and **Fast-Switch Equivalence Patch** — captured at hook time without needing a recording session.
+
+**Host-side adaptation advisories**
+
+- Switching to "Sound Quality Priority" now reports the patch adaptation state: "Not Adapted, Please Contact Developer" (after a failed write) or "Not Fully Adapted — Severe Stutter May Occur" (shown when selected).
+- Memory replay of Sound Quality Priority gets the same advisory (covers patch invalidation after system updates, avoiding silent degradation); the same replay episode only notifies once within a 60-second window.
+
+**Diagnostics page v3**
+
+- Four-tab bottom navigation (Overview / Status / Link / Feedback) with Android gesture-immersion (edge-to-edge) support.
+- Overview adds: module activation status, environment scope hook marks (✓/✗/—), a key-status snapshot, and memory cards; the Status tab supports manual refresh (re-queries patch state on demand).
+
+**Bitrate congestion governor (experimental)**
+
+- New experimental switch (off by default, toggled from the diagnostics page, persisted across Bluetooth process restarts).
+- Phase N rebuild: unified Target_Cap transactions with a single Java decision brain; layered triggers (choppy leaky bucket, 8-second leap window, disaster shadow sentinels, BQR valid gate, start/switch guards); stepped downgrades, downgrade dead zones and tiered asymmetric recovery; recovery countdown UI with progress-filled boundary bars.
+- Refined recovery thresholds: mid-tier 500→900 recovery relaxes the No-Rx gate (non-bad evidence), the strict 900→1000 tier tolerates one-sided hot windows, and hold times escalate with failure history.
+
+**Other fixes**
+
+- With LE Audio / LC3 active, the OneSpace and DetailMain panels no longer open the quality picker.
+- Diagnostics details: bottom-nav deformation on scroll, scrollbar, replay-chain display, root-log status copy.
+
 ## 2.1.0 Update Highlights
 
 - LHDC playback quality is fixed to three user-facing strategies: **Adaptive, Connection Priority, and Sound Quality Priority**, no longer exposing raw quality codes directly to users.
@@ -73,18 +102,17 @@ The desktop icon is visible by default. To hide it from the launcher, enable "Hi
 
 ## Built-in Diagnostics Page
 
-The desktop entry opens the built-in diagnostics page, which primarily includes:
+The desktop entry opens the built-in diagnostics page. The v3 layout uses a four-tab bottom
+navigation (Overview / Status / Link / Feedback) with Android gesture-immersion support:
 
-- Module main switch.
-- Hide desktop icon toggle.
-- Module version, device model, Android version, and related app versions.
-- "Wireless Headphones" scope status, page hook, and main panel / OneSpace injection status.
-- Bluetooth scope, A2DP Bridge, wireless settings scope, and LE Audio bridge status.
-- LHDC V5 native memory patch, recent writes, memory writes, and reconnection replay status.
-- "Start Recording Issue" and "Generate Feedback Package" feedback actions.
-- Recent structured event timeline.
+- **Overview**: module activation status, module master switch, hide-desktop-icon toggle, environment info (with hook ✓/✗ marks for the three host scopes), key-status snapshot, and memory info (current Melody memory + the most recent replay chain).
+- **Status**: 22 diagnostic states (scopes / page hooks / injection / A2DP and LE Audio bridges / native patches / writes / memory / replay, etc.) with a manual refresh button that re-queries patch state on demand.
+- **Link**: the experimental bitrate congestion governor switch, live LHDC BQR environment (KPIs + boundary states + event reasons), and the BQR history window.
+- **Feedback**: recording session, feedback package generation, and the recent structured event timeline.
 
 Structured diagnostics do not continuously collect data in the background by default, nor do they repeatedly launch the module process for logging. Clicking "Start Recording Issue" initiates a time-limited recording of up to 30 minutes; it stops immediately after generating a feedback package or automatically upon timeout. A diagnostic status showing "Not Yet Collected" simply means no corresponding events have occurred during the current recording session, not that the module or LSPosed scopes are inactive.
+
+Diagnostic status rows are fully decoupled from feedback recording: normal usage (connecting a headset, opening panels, switching quality, writing memory, etc.) updates the relevant status rows immediately; high-frequency activity events (live BQR samples, remote choppy reports, etc.) still only enter the event ring during a recording session to avoid frequent disk writes.
 
 If you encounter issues like "Page not injected", "Switch failed", "LE Audio status not refreshing", or "Memory not restored after reconnection", it is recommended to click "Start Recording Issue", reproduce the problem once, and then click "Generate Feedback Package". Screenshots of the diagnostics page are also useful for quickly determining whether the issue stems from inactive scopes, lost page hooks, missing Bluetooth bridge signals, missed native patches, or non-functional wireless settings bridges.
 
@@ -113,7 +141,7 @@ Follow this workflow before submitting feedback; regular users can proceed in or
 1. Confirm the module is enabled in LSPosed with `com.oplus.melody`, `com.android.bluetooth`, `com.oplus.wirelesssettings`, and `com.android.settings` scopes checked.
 2. Grant root access to "OPlus Headset Audio Helper" in your root manager (KernelSU / Magisk / APatch); feedback packages can still be generated without root, but will lack the critical Bluetooth stack logs.
 3. Open the "OPlus Headset Audio Helper" diagnostics page and click "Start Recording Issue". If a root permission prompt appears, allow it.
-4. Return to the "Wireless Headphones" page and reproduce the issue once (e.g., switching LHDC quality / sample rate, switching AAC / SBC / LHDC, disconnecting/reconnecting the headset, toggling LE Audio, or waiting for "Not Adapted, Please Contact Developer").
+4. Return to the "Wireless Headphones" page and reproduce the issue once (e.g., switching LHDC quality / sample rate, switching AAC / SBC / LHDC, disconnecting/reconnecting the headset, toggling LE Audio, or waiting for "Not Adapted, Please Contact Developer" / "Not Fully Adapted — Severe Stutter May Occur").
 5. Return to the diagnostics page and click "Generate Feedback Package".
 6. Send the generated `OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip` to the developer.
 
