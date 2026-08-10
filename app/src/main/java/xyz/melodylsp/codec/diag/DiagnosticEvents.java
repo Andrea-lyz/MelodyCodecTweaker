@@ -366,6 +366,9 @@ public final class DiagnosticEvents {
         if ("last.warning".equals(key) || "last.error".equals(key)) {
             return "未发现";
         }
+        if ("diag.root.capture".equals(key)) {
+            return "未记录";
+        }
         if ("inject.detail".equals(key)
                 || "inject.onespace".equals(key)
                 || "scope.wirelesssettings".equals(key)

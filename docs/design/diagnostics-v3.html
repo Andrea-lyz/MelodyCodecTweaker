@@ -71,6 +71,7 @@
     }
     * { box-sizing: border-box; }
     html, body { background: var(--bg); }
+    html, body { overscroll-behavior: none; }
     body {
       margin: 0;
       color: var(--text);
@@ -1051,6 +1052,7 @@
         ? '本次诊断未记录到错误'
         : '本次诊断未记录到警告';
     }
+    if (status === '未记录') return '尚未进行 root 蓝牙日志记录（随录制会话启动）';
     if (status === '本次未触发') return '本次会话未触发对应路径';
     if (status === '等待状态') return '等待对应作用域上报状态';
     return '尚未采集（不代表模块未生效）';
@@ -1578,6 +1580,22 @@
     });
   }
   /* ── v3: 记忆条目卡片化；raw 明细行不再展示 ── */
+  /* ── v3: 上次记忆恢复链路只显示最近一次回放片段 ── */
+  function lastReplayEpisode(text) {
+    const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length <= 8) return lines.join('\n');
+    const toMin = line => {
+      const m = line.match(/^(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})/);
+      if (!m) return -1;
+      return ((+m[1] * 32 + +m[2]) * 24 + +m[3]) * 60 + +m[4];
+    };
+    let start = 0;
+    for (let i = lines.length - 1; i > 0; i--) {
+      if (toMin(lines[i]) - toMin(lines[i - 1]) >= 60) { start = i; break; }
+    }
+    const episode = lines.slice(start);
+    return (episode.length > 12 ? episode.slice(episode.length - 12) : episode).join('\n');
+  }
   function renderMemoryRemembered(holder, text) {
     const raw = String(text || '').replace(/\n\s*raw:.*/g, '');
     const blocks = raw.split(/\n{2,}/).map(b => b.trim()).filter(Boolean);
@@ -1627,7 +1645,7 @@
     clear(remembered);
     clear(replay);
     renderMemoryRemembered(remembered, data.remembered);
-    appendInfoRow(replay, '上次记忆恢复链路', data.replay);
+    appendInfoRow(replay, '上次记忆恢复链路', lastReplayEpisode(data.replay));
     const hasMemory = data.remembered && !data.remembered.startsWith('尚未');
     setPill(byId('memory-state'), hasMemory ? 'ok' : 'idle', hasMemory ? '已读取' : '等待快照', false);
   }

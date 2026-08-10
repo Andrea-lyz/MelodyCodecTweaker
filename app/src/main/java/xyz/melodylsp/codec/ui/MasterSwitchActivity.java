@@ -16,6 +16,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.View;
 import android.webkit.JavascriptInterface;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
@@ -187,6 +188,9 @@ public final class MasterSwitchActivity extends Activity {
     private WebView createWebView() {
         WebView view = new WebView(this);
         view.setBackgroundColor(LIGHT_BG);
+        // 关闭框架层 overscroll 拉伸/辉光：edge-to-edge 下滚动到顶/底时
+        // 整个 WebView（含 position:fixed 的底部导航）会被 ROM 拉伸变形。
+        view.setOverScrollMode(View.OVER_SCROLL_NEVER);
         WebSettings settings = view.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(false);

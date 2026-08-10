@@ -57,6 +57,11 @@
 | V3-27 | 概览开关顺序对调 + 开关语义归位 | 用户评审 2026-08-10 | 示例已实现 | 顺序：模块激活状态 → 模块总开关 → 隐藏桌面图标；模块总开关副行固定为「控制模块整体启停；关闭后所有作用域 Hook 停用（注入、桥接、治理均不生效）」（原动态状态文本移除，由激活状态卡承担）；激活状态卡不带额外说明 | 语义依据 `MelodyCodecLspEntry.moduleEnabled()`：四个作用域 Hook 安装全部受其门控；原 V3-17 中「隐藏图标在激活状态下方」的顺序被本条取代；JS 中 `module-status-text` 动态赋值已移除 |
 | V3-28 | 诊断状态行数修正：23 → 22（三方核对差异） | 三方核对 2026-08-10 | 示例已实现 | 示例注释与计划中的状态行数统一为 22 项，键列表移除不存在的 `game.mode` | 代码事实：`MasterSwitchActivity.STATUS_ROWS` 实为 22 行（无 `game.mode` / `dexkit` 行）；`game.mode` 与 `dexkit` 键仅被 `classify` 写入、未展示为行 |
 | V3-29 | v3 接线：URL 切换 + 手势沉浸 + 状态脱钩（含 V3-18 Java 侧） | 计划 Phase B 2026-08-10 | 已接线待验证 | `DIAGNOSTICS_URL` 指向 `diagnostics-v3.html`；Activity edge-to-edge（`setDecorFitsSystemWindows(false)` + 透明系统栏 + 亮色图标）；V3-15 状态豁免名单；`rememberedSummary` 不再输出 raw 行 | 单测扩展通过；真机验证见 Phase C |
+| V3-30 | 底部导航随页面滚动拉扯/形变修复 | 真机反馈 2026-08-10 | 已接线待验证 | 滚动到页面顶/底部时底部操作栏保持固定不形变 | 根因：edge-to-edge 下框架层 overscroll 拉伸（Android 12+ stretch 效果）会拉动整个 WebView（含 fixed 元素）；修复：`WebView.setOverScrollMode(OVER_SCROLL_NEVER)` + HTML `overscroll-behavior: none` |
+| V3-31 | 「上次记忆恢复链路」只显示最近一次回放片段 | 真机反馈 2026-08-10 | 已接线待验证 | 恢复链路卡不再显示全部历史日志；仅展示最近一次回放（相邻间隔 ≥ 60s 切分片段，上限 12 行） | 底层 `KEY_MEMORY_REPLAY_CHAIN` 保留完整（反馈包仍含全量），仅展示层截取 |
+| V3-32 | root 蓝牙持续日志行默认文案改为「未记录」 | 真机反馈 2026-08-10 | 已接线待验证 | 非录制会话下该行显示「未记录」（副文案：随录制会话启动），不再显示「等待状态」 | 该行状态由 `diag.root_capture` 驱动，天然会话绑定；仅文案语义修正 |
+
+> 真机反馈（2026-08-10）：LHDC BQR/choppy/queue Hook 与 BQR 影子保护行在非录制期显示「等待状态」——机制已确认：四类 hook 事件（`lhdc.link.bqr_hooks` / `lhdc.governor.choppy_hooks` / `lhdc.governor.queue_hooks` / `lhdc.link.stage_d`）均已在 V3-15 豁免名单内，事件在**蓝牙进程启动**时打点；安装 APK 后需重启蓝牙进程（或重启手机）使新代码生效，重启后这些行应在无录制会话时即显示 hooked/armed。若重启后仍为等待状态，再抓反馈包排查。
 
 ## 4.5 三方核对（计划 / v3 示例 / 实际代码）
 
