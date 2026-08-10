@@ -258,6 +258,10 @@ public final class DiagnosticEvents {
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = sp.edit();
         classify(editor, safe(scope), message, Log.INFO, time);
+        // Replay-family events also mirror the reconnect chain into the memory card (and any
+        // remember.snapshot.* that reaches this path is mirrored too), so the overview memory
+        // card stays fresh outside a recording session.
+        mirrorMemory(sp, editor, message, time);
         editor.apply();
     }
 

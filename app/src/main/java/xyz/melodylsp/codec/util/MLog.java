@@ -266,6 +266,7 @@ public final class MLog {
     public static boolean isStatusEssentialEventName(String eventName) {
         if (eventName == null) return false;
         if (eventName.startsWith("remember.snapshot.")) return true;
+        if (eventName.startsWith("remember.write")) return true;
         if (eventName.startsWith("replay.")) return true;
         if (eventName.startsWith("write.")) return true;
         if (eventName.startsWith("dexkit.")) return true;
@@ -303,7 +304,6 @@ public final class MLog {
             case "lhdc.governor.choppy_hooks":
             case "lhdc.governor.queue_hooks":
             case "lhdc.link.bqr_hooks":
-            case "remember.write":
             case "remember.set":
                 return true;
             default:
