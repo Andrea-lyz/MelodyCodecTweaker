@@ -148,6 +148,13 @@ final class NativeLhdcMemoryPatch {
     private static volatile boolean nativeLoaded;
     private static volatile PatchResult lastResult;
     private static volatile PatchResult lastQualitySwitchResult;
+    /**
+     * Specs inside one group share identical patched bytes, so a later rescan cannot attribute
+     * an already-applied block by signature alone. Remember the spec this process applied so
+     * diagnostics report the actual build line instead of the first table entry. In-memory
+     * patches do not survive process death, so process-local state is always accurate here.
+     */
+    private static volatile String appliedQualitySwitchSpecName;
     private static volatile boolean governorInstalled;
     private static volatile int governorPolicy = LhdcQualityPolicy.ADAPTIVE;
     /**
@@ -722,7 +729,9 @@ final class NativeLhdcMemoryPatch {
         }
 
         if (patchedCount == 1 && originalCount == 0) {
-            return PatchResult.alreadyPatched(patchedCount, originalCount, spec.name);
+            String applied = appliedQualitySwitchSpecName;
+            return PatchResult.alreadyPatched(patchedCount, originalCount,
+                    applied != null ? applied : spec.name);
         }
         if (originalCount != 1 || patchedCount != 0 || originalAddress == 0L) {
             return null;
@@ -767,8 +776,13 @@ final class NativeLhdcMemoryPatch {
             return PatchResult.failed("verify_failed");
         }
         if (nativeResult == NATIVE_PATCH_ALREADY_APPLIED) {
-            return PatchResult.alreadyPatched(Math.max(1, patchedCount), 0, spec.name);
+            if (appliedQualitySwitchSpecName == null) {
+                appliedQualitySwitchSpecName = spec.name;
+            }
+            return PatchResult.alreadyPatched(Math.max(1, patchedCount), 0,
+                    appliedQualitySwitchSpecName);
         }
+        appliedQualitySwitchSpecName = spec.name;
         return PatchResult.patched(originalAddress, patchedCount, originalCount, spec.name);
     }
 
