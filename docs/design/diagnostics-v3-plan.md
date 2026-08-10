@@ -34,7 +34,7 @@
 | V3-04 | 实验性「自动码率保护」开关移至链路 tab 顶部 | 用户评审 2026-08-10 | 示例已实现 | 概览不再含该开关；链路顺序：实验性开关 → BQR 实时环境 → BQR 历史窗口；开关绑定逻辑不变 | 与链路治理内容同屏，便于开关与实时链路证据对照 |
 | V3-05 | 环境信息行移除宿主包名括号 | 用户评审 2026-08-10 | 示例已实现 | 环境信息三行标签仅显示「无线耳机 / 蓝牙 / 无线设置」，不再带 `(com.oplus.melody)` 等包名；实时渲染（`renderEnvironment`）同步 | 包名仍可在反馈包 / 日志中溯源 |
 | V3-06 | 环境信息作用域右侧显示 hook 状态标记 | 用户评审 2026-08-10 | 示例已实现 | 无线耳机 / 蓝牙 / 无线设置三行版本数据右侧显示圆形标记：`scope.host` / `scope.bluetooth` / `scope.wirelesssettings` 为 loaded/ok 等 → 绿勾 ✓；attention/failed → 红叉 ✗；其余 → 灰色横线 — | 标记复用现有状态行数据，不引入新数据源；**数据依赖 V3-07**（否则非录制期间恒为灰横线） |
-| V3-07 | 作用域 hook 状态事件豁免录制门控（V3-06 数据支撑） | 用户评审 2026-08-10（V3-06 衍生） | 登记 | 非录制会话期间，`scope.host.start` / `scope.host.context.ready` / `scope.system.start` / `scope.system.context.ready` / `scope.wirelesssettings.start` / `scope.wirelesssettings.context.ready`（含 `diag.scope.snapshot`）等作用域状态事件照常写入状态行，使环境信息标记实时反映 hook 结果 | 实现机制同 native 补丁状态豁免（`MLog.isStatusEssentialEventName` + `DiagnosticEventReceiver` 状态必需名单）；作用域事件均为进程启动时的低频事件，无环污染风险；接线阶段实施 |
+| V3-07 | 作用域 hook 状态事件豁免录制门控（V3-06 数据支撑） | 用户评审 2026-08-10（V3-06 衍生） | 已接线待验证 | 非录制会话期间，`scope.host.start` / `scope.host.context.ready` / `scope.system.start` / `scope.system.context.ready` / `scope.wirelesssettings.start` / `scope.wirelesssettings.context.ready`（含 `diag.scope.snapshot`）等作用域状态事件照常写入状态行，使环境信息标记实时反映 hook 结果 | 实现机制同 native 补丁状态豁免（`MLog.isStatusEssentialEventName` + `DiagnosticEventReceiver` 状态必需名单）；作用域事件均为进程启动时的低频事件，无环污染风险；由 V3-15 一并实施 |
 | V3-08 | 导航顺序调整：链路移至记录之后、反馈之前 | 用户评审 2026-08-10 | 示例已实现 | 底部导航顺序为 概览 / 状态 / 记录 / 链路 / 反馈 | 面板 DOM 顺序与导航顺序无关（显示由 JS 控制），仅调整导航按钮顺序 |
 | V3-09 | 实验性开关改名为「码率拥塞治理器（实验性）」 | 用户评审 2026-08-10 | 示例已实现 | 链路 tab 顶部开关标题显示「码率拥塞治理器（实验性）」，描述文字与开关绑定不变 | 仅诊断页文案调整；开关键（`data-governor-enabled`）与宿主侧无关，无联动影响 |
 | V3-10 | 移除治理器描述中的「（1000→900→500 阶梯）」 | 用户评审 2026-08-10 | 示例已实现 | 开关描述不再提及固定码率阶梯 | 阶梯随设备能力而定（如 900 上限耳机无 1000 档），原描述不准确 |
@@ -42,7 +42,7 @@
 | V3-12 | 边界状态描述改为逐条列表 | 用户评审 2026-08-10 | 示例已实现 | BQR 边界状态说明按「· 」逐条换行展示六项（已恢复/恢复中/等待低档恢复/已锁定/试探中验证中/不支持） | 文案内容不变，仅排版 |
 | V3-13 | 移除 BQR 两张卡片脚注中的订阅/退订说明句 | 用户评审 2026-08-10 | 示例已实现 | 实时环境脚注不再含「页面进入前台才订阅…不依赖问题记录会话」；历史窗口脚注不再含「离开页面后停止接收，不写入诊断 pref」 | 其余脚注内容保留 |
 | V3-14 | 概览新增「关键状态」速览卡（环境信息下方） | 用户评审 2026-08-10 | 示例已实现 | 环境信息下方显示 8 项关键状态（码率 branch / 快切等价 / 页面 Hook / DetailMain 注入 / OneSpace 注入 / LHDC BQR / choppy / queue Hook），仅名称 + 状态标记（✓/✗/—），无详细数据；数据复用现有状态行 | 关键项清单集中定义（`KEY_STATUS_ITEMS`），后续可按需增删 |
-| V3-15 | 诊断状态行与反馈录制全面脱钩解耦 | 用户评审 2026-08-10 | 登记 | 用户正常使用（连接耳机、打开面板、切换音质、写记忆等）触发相关状态事件时，状态行（`status.*`）即时更新，不依赖「开始记录问题」会话；录制期间行为不变 | 见下方「V3-15 实施方案」 |
+| V3-15 | 诊断状态行与反馈录制全面脱钩解耦 | 用户评审 2026-08-10 | 已接线待验证 | 用户正常使用（连接耳机、打开面板、切换音质、写记忆等）触发相关状态事件时，状态行（`status.*`）即时更新，不依赖「开始记录问题」会话；录制期间行为不变 | 已实施：`MLog.isStatusEssentialEventName` + `DiagnosticEvents.isStatusEssentialEvent` 名单扩展（作用域/hook/注入/桥/写入/重放/dexkit/补丁）；高频活性事件（`codec.bt.reply`、`le.bt.*`、`bqr_summary`、`remote_choppy`、`probe_ceiling` 等）仍录制门控 |
 | V3-16 | 诊断状态说明文案换行 | 用户评审 2026-08-10 | 示例已实现 | 状态页说明分为两行：①每次模块 hook 生效时会更新最近一次事件。②颜色：ok / pending / attention（保留彩色 pill） | 仅排版，颜色图例保留 |
 | V3-17 | 概览/反馈卡片归属调整 | 用户评审 2026-08-10 | 示例已实现 | ①隐藏桌面图标移至模块激活状态下方；②记忆信息移至概览底部（关键状态之后）；③最近事件移至反馈工具之后 | 记录 tab 变空壳，去留待定 |
 | V3-18 | 记忆信息：移除 raw 明细行 + 真实记忆卡片化排版 | 用户评审 2026-08-10 | 示例已实现 | 记忆条目不再显示 `raw: codec=…` 行；每个耳机条目卡片化展示（MAC / 档位摘要 / 更新时间），来源行弱化为灰色小字；多设备逐条堆叠 | 接线时 Java 侧 `DiagnosticEvents.rememberedSummary` 同步移除 raw 输出（当前由 JS 剥离兜底） |
@@ -56,6 +56,7 @@
 | V3-26 | 最近事件提示措辞修正 | 用户评审 2026-08-10 | 示例已实现 | 提示改为「原始事件按容量滚动保留」 | 事件环跨会话保留（256KB 上限），原「仅本次会话可见」不准确 |
 | V3-27 | 概览开关顺序对调 + 开关语义归位 | 用户评审 2026-08-10 | 示例已实现 | 顺序：模块激活状态 → 模块总开关 → 隐藏桌面图标；模块总开关副行固定为「控制模块整体启停；关闭后所有作用域 Hook 停用（注入、桥接、治理均不生效）」（原动态状态文本移除，由激活状态卡承担）；激活状态卡不带额外说明 | 语义依据 `MelodyCodecLspEntry.moduleEnabled()`：四个作用域 Hook 安装全部受其门控；原 V3-17 中「隐藏图标在激活状态下方」的顺序被本条取代；JS 中 `module-status-text` 动态赋值已移除 |
 | V3-28 | 诊断状态行数修正：23 → 22（三方核对差异） | 三方核对 2026-08-10 | 示例已实现 | 示例注释与计划中的状态行数统一为 22 项，键列表移除不存在的 `game.mode` | 代码事实：`MasterSwitchActivity.STATUS_ROWS` 实为 22 行（无 `game.mode` / `dexkit` 行）；`game.mode` 与 `dexkit` 键仅被 `classify` 写入、未展示为行 |
+| V3-29 | v3 接线：URL 切换 + 手势沉浸 + 状态脱钩（含 V3-18 Java 侧） | 计划 Phase B 2026-08-10 | 已接线待验证 | `DIAGNOSTICS_URL` 指向 `diagnostics-v3.html`；Activity edge-to-edge（`setDecorFitsSystemWindows(false)` + 透明系统栏 + 亮色图标）；V3-15 状态豁免名单；`rememberedSummary` 不再输出 raw 行 | 单测扩展通过；真机验证见 Phase C |
 
 ## 4.5 三方核对（计划 / v3 示例 / 实际代码）
 
@@ -85,7 +86,7 @@
 
 > 后续评审提出的新项目（如新增卡片、布局调整、导航项增减）按上表格式追加编号登记。
 
-**技术备注（V3-01）**：接线前必须对照 `E:\我开发的模块\无线耳机-音频质量开关\api`（`io.github.libxposed.api.*`）确认激活状态判定的可行方式——重点核对 `XposedModuleInterface` / `XposedInterface` 是否暴露模块激活查询能力（如 `onModuleLoaded` 参数、进程内可见状态等）；若 API 无直接查询入口，再退回快照 `scope.host` 派生方案并在本行备注注明依据。
+**技术备注（V3-01）**：已核对 `api/`（`io.github.libxposed.api.*`，2026-08-10）——`XposedModuleInterface` / `XposedInterface` **未暴露模块激活查询接口**（仅有 `getModuleApplicationInfo`、`ModuleLoadedParam.isFirstPackage/isSystemServer`、`onModuleLoaded` 回调等），无直接查询入口；**确定采用快照 `scope.host` 状态派生方案**（配合 V3-15 状态脱钩，非录制期亦可反映挂载结果）。
 
 ## 4. 实施路线
 
@@ -121,15 +122,16 @@
 - [x] V3-26 最近事件提示措辞修正
 - [x] V3-27 概览开关顺序对调 + 激活状态卡语义说明
 - [x] V3-28 状态行数修正 23→22（三方核对差异）
+- [x] V3-29 v3 接线（URL / edge-to-edge / 状态脱钩 / raw 移除）
 - [ ] 其余评审意见（按登记表追加）
-- [ ] 示例定稿（用户确认）
+- [x] 示例定稿（用户确认）
 
 ### Phase B：接线（示例定稿后）
 
-- [ ] `MasterSwitchActivity.DIAGNOSTICS_URL` 指向 `diagnostics-v3.html`
-- [ ] 宿主 Activity 走 edge-to-edge（`setDecorFitsSystemWindows(false)`）+ 系统栏透明，让底部导航背景延伸进手势区
-- [ ] 保留现有行为：4 秒前台刷新、BQR 实时订阅、录制/反馈/记忆按钮、历史窗口切换
-- [ ] 构建 debug APK 供真机预览
+- [x] `MasterSwitchActivity.DIAGNOSTICS_URL` 指向 `diagnostics-v3.html`
+- [x] 宿主 Activity 走 edge-to-edge（`setDecorFitsSystemWindows(false)`）+ 系统栏透明，让底部导航背景延伸进手势区
+- [x] 保留现有行为：4 秒前台刷新、BQR 实时订阅、录制/反馈/记忆按钮、历史窗口切换（JS 未改动行为逻辑）
+- [x] 构建 debug APK 供真机预览（ASCII 副本构建通过）
 
 ### Phase C：真机验证
 

@@ -256,16 +256,59 @@ public final class MLog {
 
     /**
      * Status-essential events are low-frequency state snapshots that must stay visible on the
-     * diagnostic page even outside a recording session. Besides the remember-card mirror, the
-     * native patch results (bitrate branch + fast-switch equivalence) are captured at hook
-     * time so the page shows whether the patch took effect without starting a recording.
+     * diagnostic page even outside a recording session (V3-15: status rows are decoupled from
+     * feedback recording). Besides the remember-card mirror and native patch results, the
+     * scope / hook / injection / bridge / write / replay families are captured at hook time so
+     * the page shows the last known state without starting a recording. High-frequency
+     * activity events (codec.bt.reply, le.bt.*, lhdc.link.bqr_summary, remote_choppy, …) stay
+     * recording-gated to avoid non-session pref churn.
      */
-    static boolean isStatusEssentialEventName(String eventName) {
+    public static boolean isStatusEssentialEventName(String eventName) {
         if (eventName == null) return false;
         if (eventName.startsWith("remember.snapshot.")) return true;
+        if (eventName.startsWith("replay.")) return true;
+        if (eventName.startsWith("write.")) return true;
+        if (eventName.startsWith("dexkit.")) return true;
         if ("lhdc.memory_patch".equals(eventName)) return true;
         if ("lhdc.memory_patch.fast_switch".equals(eventName)) return true;
-        return "native.patch.state.recv".equals(eventName);
+        if ("native.patch.state.recv".equals(eventName)) return true;
+        switch (eventName) {
+            case "scope.host.start":
+            case "scope.host.context.ready":
+            case "scope.system.start":
+            case "scope.system.context.ready":
+            case "scope.wirelesssettings.start":
+            case "scope.wirelesssettings.context.ready":
+            case "diag.scope.snapshot":
+            case "controller.ready":
+            case "preference.fragment.hooked":
+            case "detailmain.activity.hooked":
+            case "onespace.activity.hooked":
+            case "onespace.fragment.hooked":
+            case "activity.scan.registered":
+            case "hires_anchored.injected":
+            case "detailmain_fallback.injected":
+            case "onespace.injected":
+            case "system.bridge.registered":
+            case "codec.bt.receiver.registered":
+            case "le.bt.receiver.registered":
+            case "le.ws.receiver.registered":
+            case "bt.a2dp.resolved":
+            case "codec.updated.hooks":
+            case "cdm.hooks":
+            case "cdm.bypass":
+            case "a2dp.setCodecConfigPreference":
+            case "bt.native.setCodecConfigPreference":
+            case "lhdc.link.stage_d":
+            case "lhdc.governor.choppy_hooks":
+            case "lhdc.governor.queue_hooks":
+            case "lhdc.link.bqr_hooks":
+            case "remember.write":
+            case "remember.set":
+                return true;
+            default:
+                return false;
+        }
     }
 
     private static String prefix() {

@@ -15,6 +15,7 @@ import java.util.Locale;
 import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.label.CodecLabelTable;
+import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 public final class DiagnosticEvents {
@@ -221,16 +222,15 @@ public final class DiagnosticEvents {
     }
 
     /**
-     * True when the message carries a remember-card mirror snapshot or a native patch status
-     * event. These are recorded outside a diagnostic session (status-only) so the page's
-     * remember card and native patch rows always reflect the last known state, independent of
-     * the recording session.
+     * True when the message carries a status-classifying event that must stay visible outside
+     * a diagnostic session (V3-15: status rows are decoupled from feedback recording). These
+     * are recorded status-only (no event ring) so the page always reflects the last known
+     * state; high-frequency activity events stay recording-gated.
      */
     static boolean isStatusEssentialEvent(String message) {
         if (message == null) return false;
-        return message.contains("evt=remember.snapshot.")
-                || message.contains("evt=lhdc.memory_patch")
-                || message.contains("evt=native.patch.state.recv");
+        String event = eventName(message);
+        return MLog.isStatusEssentialEventName(event);
     }
 
     /**
@@ -427,9 +427,6 @@ public final class DiagnosticEvents {
             int rate = sp.getInt(prefix + "rate", -1);
             sb.append(memoryValueLabel(codec, specific1, rate));
             if (updated > 0L) sb.append("\n  更新时间：").append(formatTime(updated));
-            sb.append("\n  raw: codec=").append(codec)
-                    .append(" specific1=").append(specific1)
-                    .append(" rate=0x").append(Integer.toHexString(rate));
         }
         return sb.length() > 0 ? sb.toString() : "暂无记忆镜像。";
     }

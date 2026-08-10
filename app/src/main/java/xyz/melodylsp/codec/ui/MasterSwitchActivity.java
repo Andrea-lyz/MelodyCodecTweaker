@@ -39,7 +39,7 @@ import xyz.melodylsp.codec.diag.FeedbackCollector;
 import xyz.melodylsp.codec.diag.RootBluetoothLogCapture;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
-/** Hosts the diagnostics-v2 HTML design and supplies its read-only foreground snapshot bridge. */
+/** Hosts the diagnostics-v3 HTML design and supplies its read-only foreground snapshot bridge. */
 public final class MasterSwitchActivity extends Activity {
 
     private static final String PREFS_NAME = "module_prefs";
@@ -48,9 +48,8 @@ public final class MasterSwitchActivity extends Activity {
     private static final String LAUNCHER_ALIAS =
             "xyz.melodylsp.codec.ui.LauncherActivity";
     private static final String DIAGNOSTICS_URL =
-            "file:///android_asset/diagnostics-v2.html";
+            "file:///android_asset/diagnostics-v3.html";
     private static final int LIGHT_BG = 0xFFF6F7FB;
-    private static final int DARK_BG = 0xFF0F1218;
     private static final long[] RECORDING_CONTROL_RETRY_DELAYS_MS = {
             500L, 2_000L, 5_000L
     };
@@ -125,6 +124,7 @@ public final class MasterSwitchActivity extends Activity {
         DiagnosticEvents.reconcileReceiverState(this);
         applyLauncherIconState(modulePrefs.getBoolean(KEY_HIDE_LAUNCHER_ICON, false), false);
         cachedEnvironment = buildEnvironmentSnapshot();
+        getWindow().setDecorFitsSystemWindows(false);
         configureSystemBars();
         setContentView(createWebView());
     }
@@ -170,12 +170,17 @@ public final class MasterSwitchActivity extends Activity {
         boolean dark = (getResources().getConfiguration().uiMode
                 & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
                 == android.content.res.Configuration.UI_MODE_NIGHT_YES;
-        int color = dark ? DARK_BG : LIGHT_BG;
-        getWindow().setStatusBarColor(color);
-        getWindow().setNavigationBarColor(color);
-        if (!dark) {
-            getWindow().getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        // Edge-to-edge: the WebView extends under the status bar and gesture navigation bar;
+        // the v3 HTML applies env(safe-area-inset-*) paddings for the tab bar and header.
+        getWindow().setStatusBarColor(android.graphics.Color.TRANSPARENT);
+        getWindow().setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+        android.view.WindowInsetsController controller =
+                getWindow().getDecorView().getWindowInsetsController();
+        if (controller != null) {
+            int mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+            controller.setSystemBarsAppearance(
+                    dark ? 0 : mask, mask);
         }
     }
 
