@@ -953,7 +953,9 @@ public final class ConnectionStateReplayer {
             String advisory = NativePatchAdvisory.replayToast(
                     transportRequest.codecSpecific1 & 0xFFL);
             if (advisory != null) {
-                Toast.makeText(context, advisory, Toast.LENGTH_SHORT).show();
+                // dispatchReplay runs on the replay worker thread; toasts require a looper.
+                mainHandler.post(() ->
+                        Toast.makeText(context, advisory, Toast.LENGTH_SHORT).show());
                 MLog.event("replay.advisory",
                         "mac", A2dpRouteReadiness.redactMac(mac),
                         "attempt", attempt,

@@ -2534,6 +2534,14 @@ public final class CodecController {
             applyOptionalCodecWrite(sub, true);
             return;
         }
+        // 高音质入口（LHDC 固定 1000/900）与质量选择器同判定：仅 LHDC → LHDC 纯质量
+        // 切换时预提醒（编解码类型切换的重建输出属正常行为，不打扰）。
+        if (CodecLabelTable.isLhdc(snapshot.activeCodecType)
+                && CodecLabelTable.isLhdc(request.codecType)) {
+            String advisory = NativePatchAdvisory.selectionToast(
+                    request.codecSpecific1 & 0xFFL);
+            if (advisory != null) showPatchAdvisory(advisory, "mode_picker_high");
+        }
         setCodecModeStatus(sub, Strings.STATE_SWITCHING_CODEC);
         MLog.event("write.high_quality.fastpath",
                 "from", snapshot.activeCodecType,

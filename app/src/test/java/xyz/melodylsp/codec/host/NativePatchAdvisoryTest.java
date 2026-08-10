@@ -52,6 +52,7 @@ public final class NativePatchAdvisoryTest {
         NativePatchAdvisory.update(true, true);
         // B 缺失时预提醒保持静默（拒绝语义由写失败路径承担）
         assertNull(NativePatchAdvisory.selectionToast(TIER_1000));
+        assertNull(NativePatchAdvisory.selectionToast(0L));
     }
 
     @Test
@@ -69,9 +70,12 @@ public final class NativePatchAdvisoryTest {
         NativePatchAdvisory.update(false, true);
         assertEquals(Strings.TOAST_NATIVE_PATCH_PARTIAL,
                 NativePatchAdvisory.replayToast(TIER_1000));
+        assertEquals(Strings.TOAST_NATIVE_PATCH_PARTIAL,
+                NativePatchAdvisory.replayToast(TIER_900));
 
         NativePatchAdvisory.update(false, false);
         assertNull(NativePatchAdvisory.replayToast(TIER_1000));
+        assertNull(NativePatchAdvisory.replayToast(TIER_900));
         assertNull(NativePatchAdvisory.replayToast(TIER_500));
         assertNull(NativePatchAdvisory.replayToast(TIER_ABR));
     }
