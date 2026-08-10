@@ -1,5 +1,7 @@
 # 欧加耳机音质助手
 
+[简体中文](README.md) · [English](README.en-US.md)
+
 <p align="center">
   <img src="docs/banner.png" alt="欧加耳机音质助手：让官方耳机面板更完整" width="100%">
 </p>
@@ -14,14 +16,34 @@
 
 模块主要服务于 ColorOS / OPlus 系设备上的 `com.oplus.melody`，同时配合 `com.android.bluetooth` 和 `com.oplus.wirelesssettings` 作用域完成更稳定的状态读取和写入。
 
-## 2.1.0 更新重点
+## 2.3.0 更新重点
 
-- LHDC 播放质量固定为三个面向用户的策略：**自适应、连接优先、音质优先**，不再把底层质量码直接暴露给用户。
-- 「自适应」继续使用 OPlus / LHDC 原有 ABR；「连接优先」请求约 500 / 560 kbps；「音质优先」以 1000 kbps 为目标，并由模块内置治理器在 1000 / 900 / 500 / 400 kbps 之间动态保护链路。
-- 「自适应」和「音质优先」会在播放质量摘要中显示编码器当前码率，便于直接观察实际运行状态；「连接优先」保持简洁显示。
-- 音质优先治理器同时接入编码队列、耳机卡顿回报与 Android 已解析的 Bluetooth Quality Report。它会根据 AFH 可用信道、重传和无接收统计判断何时值得重新尝试高码率，并按耳机、按 500→900 / 900→1000 边界分别学习，减少 900↔500 往返震荡。
-- 降档只修改 LHDC 编码器目标码率，不触发整条 A2DP 重连或改写采样率；队列达到 90% 持续 300 ms 时保护降档，队列打满时立即处理，链路稳定后再逐级回升。
-- 重新连接后的记忆回放、192 kHz 恢复和诊断状态进一步收敛；结构化诊断默认不在后台持续记录，只有用户主动开始记录问题时才限时开启。
+**LHDC V5 快切等价补丁（native 内存补丁）**
+
+- 修复 ColorOS 16 蓝牙栈 `A2DP_CodecEquals` 漏接 LHDC V5 的问题：纯码率档位切换不再被判定为必须重建输出（此前「环境支持最高码率却切档卡顿」，本质是重建链路后的启动拥塞）。
+- 覆盖全部已知版本线：PJZ110 16.0.9.401/.402（真机验证）、OP15/Ace6T 16.0.7.201、PJZ110 16.0.8.301/PLK110、PLC110 16.0.8.300、RMX6688（MTK）；码率 branch 补丁同步新增 RMX6688（MTK）适配与语义扫描兜底。
+- 诊断页将补丁状态拆为「码率 branch 补丁 / 快切等价补丁」两行独立展示，并在模块 hook 时即时记录，不依赖录制会话。
+
+**宿主适配提醒**
+
+- 切换到「音质优先」时按补丁适配状态提示：「未适配，请联系开发者反馈」（写失败后）或「未完整适配，强行使用可能出现异常卡顿」（选中即弹）。
+- 记忆回放路径同步提醒（覆盖系统更新后补丁失效场景，避免无声降级），同一回放片段 60 秒内只提示一次。
+
+**诊断页 v3**
+
+- 四分类底部导航（概览 / 状态 / 链路 / 反馈），适配 Android 手势沉浸（edge-to-edge）。
+- 概览新增：模块激活状态卡、环境信息作用域勾叉标记、关键状态速览、记忆信息卡片化；状态页支持手动刷新（可即时重查补丁状态）。
+
+**码率拥塞治理器（实验性）**
+
+- 新增实验性开关（默认关闭，诊断页可开关，跨蓝牙进程重启保留）。
+- Phase N 重构：统一 Target_Cap 事务与 Java 单脑决策；分层触发（choppy 漏桶、8 秒跳变窗口、灾难影子哨兵、BQR valid gate、启动/切档双守卫）；阶梯降档、降档死区与分层不对称恢复；恢复倒计时与边界条进度可视化。
+- 恢复判定细化：500→900 中档恢复放宽 No-Rx 门槛（非坏证据门），900→1000 严格档容忍单侧热窗，驻留时间按失败历史递增。
+
+**其他修复**
+
+- LE Audio / LC3 激活时，OneSpace 与 DetailMain 不再弹出音质选择面板。
+- 诊断页底部导航随滚动形变、滚动条、回放链展示、root 日志状态文案等细节修复。
 
 ## 支持作者
 
@@ -35,7 +57,8 @@
 - 在 OneSpace 快捷面板 `OneSpaceDetailActivity` 注入同一套控制项。
 - 显示当前协议：SBC、AAC、LDAC、LHDC、LC3 等。
 - 支持播放质量切换，例如 LHDC 的自适应、连接优先、音质优先，以及 LDAC 的 330 / 660 / 990 kbps。
-- 自适应与音质优先可显示 LHDC 编码器实时码率；音质优先附带 1000 kbps 锚定的链路拥塞治理。
+- 自适应与音质优先可显示 LHDC 编码器实时码率；音质优先可选开启实验性码率拥塞治理器（默认关闭）。
+- LHDC V5 native 双补丁（码率 branch / 快切等价）覆盖全部已知版本线，并按适配状态在宿主给出「未适配 / 未完整适配」提醒。
 - 支持采样率切换，根据当前耳机和协议动态显示 44.1 / 48 / 96 / 192 kHz 等可选项。
 - 播放质量和采样率会做联动修正，尽量避免写入蓝牙栈不接受的组合。
 - 支持按耳机记忆选择，重新连接后自动应用上次设置。
@@ -71,18 +94,16 @@
 
 ## 内置诊断页
 
-模块桌面入口是内置诊断页，主要包含：
+模块桌面入口是内置诊断页，v3 版本采用四分类底部导航（概览 / 状态 / 链路 / 反馈），并适配 Android 手势沉浸：
 
-- 模块总开关。
-- 隐藏桌面图标开关。
-- 模块版本、手机型号、Android 版本和相关包版本。
-- 「无线耳机」作用域、页面 Hook、主面板 / OneSpace 注入状态。
-- 蓝牙作用域、A2DP Bridge、无线设置作用域和 LE Audio bridge 状态。
-- LHDC V5 native 内存补丁、最近写入、记忆写入和重连重放状态。
-- 「开始记录问题」和「生成反馈包」两个反馈操作。
-- 最近结构化事件时间线。
+- **概览**：模块激活状态、模块总开关、隐藏桌面图标、环境信息（含三个宿主作用域的 hook 勾叉标记）、关键状态速览、记忆信息（当前 Melody 真实记忆 + 最近一次恢复链路）。
+- **状态**：22 项诊断状态（作用域 / 页面 Hook / 注入 / A2DP 与 LE Audio 桥 / native 补丁 / 写入 / 记忆 / 重放等），支持手动刷新（可即时重查补丁状态）。
+- **链路**：码率拥塞治理器（实验性）开关、LHDC BQR 实时环境（KPI + 边界状态 + 事件理由）、BQR 历史窗口。
+- **反馈**：记录会话、生成反馈包、最近结构化事件时间线。
 
 结构化诊断默认不会在后台持续采集，也不会为了记录日志反复启动模块进程。点击「开始记录问题」后会开启最长 30 分钟的限时记录；生成反馈包后立即结束，超时后也会自动停止。诊断状态显示「尚未采集」只代表当前记录中还没有对应事件，不代表模块或 LSPosed 作用域没有生效。记忆卡片和 native 补丁两行状态（码率 branch / 快切等价）是例外：它们在模块 hook 时就会记录最近一次生效结果，不依赖录制会话。
+
+诊断状态行与反馈录制已全面脱钩：正常使用（连接耳机、打开面板、切换音质、写记忆等）触发相关状态事件时，状态行即时更新；高频活性事件（如 BQR 实时样本、remote choppy 回报）仍只在录制会话期间写入事件环，避免非录制期高频落盘。
 
 如果出现「页面没有注入」「切换失败」「LE Audio 状态不刷新」「重连后记忆没有恢复」这类问题，建议先点「开始记录问题」，复现一次问题，再点「生成反馈包」。诊断页截图也仍然有用，可以快速判断是作用域没生效、页面 Hook 丢了、蓝牙桥没收到、native 补丁没命中，还是无线设置桥没工作。
 
@@ -111,24 +132,9 @@ OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip
 1. 确认 LSPosed 里已经启用模块，并勾选 `com.oplus.melody`、`com.android.bluetooth`、`com.oplus.wirelesssettings`、`com.android.settings` 四个作用域。
 2. 在 KernelSU / Magisk / APatch 等 root 管理器里给「欧加耳机音质助手」授权 root；没有 root 授权时也能生成反馈包，但会缺少最关键的蓝牙栈日志。
 3. 打开「欧加耳机音质助手」诊断页，点击「开始记录问题」。如果弹出 root 授权请求，请选择允许。
-4. 回到「无线耳机」页面复现一次问题，例如切换 LHDC 质量 / 采样率、切换 AAC / SBC / LHDC、断开重连耳机、开关 LE Audio，或等待出现「未适配，请联系开发者反馈」。
+4. 回到「无线耳机」页面复现一次问题，例如切换 LHDC 质量 / 采样率、切换 AAC / SBC / LHDC、断开重连耳机、开关 LE Audio，或等待出现「未适配，请联系开发者反馈」/「未完整适配，强行使用可能出现异常卡顿」提示。
 5. 再回到诊断页，点击「生成反馈包」。
 6. 把生成的 `OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip` 发给开发者即可。
-
-### Buds Ace 3 BQR Stage D 取证版
-
-2026-08-05 的 Stage D 测试构建只增加远程取证，不启用新的保护降档：连续两个有效 BQR `overflow/underflow` 窗口只记录 `would_protect`，不会因此修改 Java ceiling、native probe ceiling 或实际码率。RF 重传、No-Rx、AFH 压力也仍然只参与现有恢复判断，不能单独强制降档。
-
-反馈用户请按以下流程复现：
-
-1. 安装 Stage D 测试 APK，并确认 LSPosed 四个作用域均已勾选。
-2. 重启手机，确保新的 `com.android.bluetooth` 进程已加载取证 Hook；仅开关蓝牙不能作为进程已重启的证据。
-3. 给模块 root 权限，打开诊断页并点击「开始记录问题」。
-4. 连接 Buds Ace 3，选择「音质优先」，连续播放固定长曲目 1～2 分钟，期间不要反复暂停或切换设备。
-5. 卡顿时记住大致时间，卡顿后尽快生成反馈包。
-6. 发回 ZIP、卡顿大致时间、手机系统版本和耳机固件版本。
-
-反馈包会记录 Stage D 启用状态、BQR/choppy/queue Hook 数量、原始 overflow/underflow、影子连续窗口、`bqr_shadow_candidate`、remote choppy 的 MAC 归因、actual/requested bitrate，以及 root Bluetooth 日志。点击「开始记录问题」后，root 可用时会同步启动最长约 31 分钟、总量约 3 MB 的过滤式蓝牙日志轮转采集，避免生成反馈包时系统环形缓冲已经覆盖早期 TX `45/45`；停止记录或打包时只终止当前 session 的采集进程，不清空或扩容系统 logcat。持续采集失败时仍会回退到原有末尾快照。没有 `would_protect` 只表示当前信号体系没有捕获到强证据，不能据此宣称卡顿已经修复。
 
 如果是为了适配 LHDC V5 native 内存补丁，请同时提供手机型号、系统版本，以及当前系统的 `/system/lib64/libbluetooth_jni.so`。这个文件可以通过 root 文件管理器复制，也可以在电脑上用 adb 尝试导出：
 
@@ -179,18 +185,7 @@ LHDC 对用户固定显示三种策略，底层映射如下：
 | --- | --- | --- |
 | 自适应 | OPlus / LHDC ABR（质量码 9） | 由厂商算法预测链路并优先保证连续播放；显示编码器当前码率。 |
 | 连接优先 | 固定中档（质量码 6） | 请求约 500 / 560 kbps，适合干扰较强或距离较远的环境。 |
-| 音质优先 | 1000 kbps 目标（质量码 8） | 以 1000 kbps 为锚点，模块在 1000 / 900 / 500 / 400 kbps 梯度内保护和恢复；显示当前码率。 |
-
-「音质优先」不是把 1000 kbps 永久焊死。它表达的是用户的质量上限和回升意愿：链路能承受时主动靠近 1000 kbps，出现拥塞时先保证播放连续性。与厂商「自适应」相比，它更积极追求高码率，也更依赖事后反馈；因此治理器尽量把码率切换留在编码器内部，避免重新协商 A2DP、改变 192 kHz / 24 bit 设置或产生明显断音。
-
-治理器的主要信号与状态机：
-
-- `getAudioQueueLengthNative()` 的编码队列由蓝牙主线程采样。队列达到容量的 90% 并持续 300 ms 时保护降档，打满时立即降档；队列低于 25% 且持续稳定 15 秒后才允许逐级升档。
-- `onRemoteChoppyReport()` 提供耳机侧卡顿反馈。5 秒内连续回报会把 1000→900→500→400 的保护力度逐步加深。
-- `AdapterService.bluetoothQualityReportReadyCallback(BluetoothDevice, BluetoothQualityReport)` 提供系统已经解析完成的 BQR。模块读取 `BqrCommon` 中的 AFH、retransmission、noRx、RSSI、SNR、overflow / underflow 等字段。有效采样间隔限定为 3～15 秒；升档健康窗口要求 unused AFH ≤ 39（即至少约 40 个可用信道）、重传 ≤ 25 次 / 秒且 noRx ≤ 25 次 / 秒。
-- 500→900 与 900→1000 分别保存失败记录。某个边界在 5 分钟内快速失败两次后会被暂时锁住；只有连续健康 BQR 窗口、低队列和无拥塞时间同时达标，才开放一次恢复探测。
-- 恢复探测失败后，证据门槛从 3 个健康窗口 / 30 秒依次提高到 5 个 / 60 秒和 10 个 / 120 秒；探测稳定 60 秒后清除该边界的失败历史。
-- 所有学习状态按耳机 MAC 隔离，并在当前 `com.android.bluetooth` 进程生命周期内保留。切换耳机不会继承上一只耳机的坏链路判断。
+| 音质优先 | 1000 kbps 目标（质量码 8） | 按照设备能力固定最高码率（1000 / 900 kbps）。 |
 
 写入路径会按能力降级：
 
@@ -234,6 +229,8 @@ LHDC 的策略切换仍然依赖厂商蓝牙栈。模块会直接写入目标播
 - 不支持 Hi-Res 或没有对应页面项的耳机会走备用注入点；如果页面结构完全不同，仍可能无法显示。
 - 系统冻结 `com.oplus.wirelesssettings`、蓝牙栈重启或耳机重连期间，状态回读可能延迟几秒。
 - 部分厂商蓝牙栈会拒绝特定播放质量 / 采样率组合，模块会尝试联动修正，但不能保证所有组合都能实时生效。
+- 快切等价补丁是精确整块签名：系统更新（OTA 重编译）后可能报 `unsupported`，需等待对应版本线适配；期间切换到「音质优先」会收到「未适配 / 未完整适配」提醒，属于设计行为而非故障。
+- 安装或更新模块后，需要重启蓝牙进程（或重启手机）让新补丁与治理器生效；仅开关蓝牙不能作为进程已重启的证据。
 
 ## 记忆回放可靠性
 
@@ -251,13 +248,30 @@ LHDC 的策略切换仍然依赖厂商蓝牙栈。模块会直接写入目标播
 
 ## LHDC V5 运行时治理与内存补丁
 
-当前版本在 `com.android.bluetooth` 进程中提供两层独立能力：面向「音质优先」的编码器治理器，以及兼容旧 OPlus 固定码率保护逻辑的 ARM64 指令补丁。三种用户策略不依赖旧补丁才能成立；旧补丁仍作为已验证 ROM 的兼容层保留。
+当前版本在 `com.android.bluetooth` 进程中提供两类运行时能力：**两个 ARM64 内存补丁**（修复 ColorOS 16 蓝牙栈的两个独立问题）与**编码器治理器**（码率拥塞治理器，实验性）。
+
+### 双补丁：码率 branch 与快切等价
+
+- **码率 branch 补丁**：修复 ColorOS 16 蓝牙栈忽略 LHDC V5 固定 900 / 1000 kbps 目标码率的问题——「音质优先」写档后实际码率不跟随，停留在厂商 ABR 决定的值。
+- **快切等价补丁**：修复 `A2DP_CodecEquals` 重构时漏接 LHDC V5 分发的问题——纯码率档位切换被判定为必须重建输出（`restart_output=true`），切换后重建 AVDTP 链路并出现启动拥塞卡顿；补丁复刻旧版 LHDC V5 vendor equality 掩码，让纯质量位变化走「相等」路径（`restart_output=false`）。
+
+适配矩阵（两个补丁均已覆盖全部已知版本线）：
+
+| 版本线 | 机型 / SoC | 码率 branch | 快切等价 |
+| --- | --- | --- | --- |
+| 16.0.9.401 / .402 | PJZ110（一加 13 / 一加 11） | ✅ | ✅ 真机验证 |
+| 16.0.7.201 | OP15 / Ace6T（骁龙 8 Gen 5） | ✅ | ✅ |
+| 16.0.8.301 | PJZ110 / PLK110 | ✅ | ✅ |
+| 16.0.8.300 | PLC110（天玑 9400+） | ✅ | ✅ |
+| RMX 线 | RMX6688（天玑 9400+） | ✅ | ✅ |
+
+诊断页将补丁状态拆为「码率 branch 补丁 / 快切等价补丁」两行独立展示；宿主切换到「音质优先」时会按适配状态提示——补丁未适配时提示「未适配，请联系开发者反馈」，仅快切等价缺失时提示「未完整适配，强行使用可能出现异常卡顿」，记忆回放路径同样提醒（见下节）。
+
+### 编码器治理器（码率拥塞治理器）
 
 治理器会解析当前已加载的 `liblhdcv5BT_enc.so` 导出符号，并在 `libbluetooth_jni.so` 的可写数据段或紧邻匿名 `.bss` 中查找 `lhdcv5BT_encode` 与 `lhdcv5BT_free_handle` 的唯一回调 owner。只有两个 owner 都唯一命中时才用原子指针替换包裹 encode / free 调用，从真实 encode 路径捕获活动 handle，再调用 `lhdcv5BT_set_target_bitrate_inx` 调整码率、通过 `lhdcv5BT_get_bitrate` 回读。它不会修改 loader entry、relocation、GOT 或可执行页；候选为零或多于一个时直接停止安装。
 
 Java 侧将队列、remote choppy 与 BQR 归一到逐耳机链路状态，native 侧只在音质优先模式执行 1000 / 900 / 500 / 400 kbps 梯度切换。策略切换、encoder handle 更换或耳机释放都会重置对应运行时状态，避免把失效 handle 带到下一条音频流。
-
-旧指令补丁用于处理部分 OPlus / ColorOS 蓝牙栈忽略 LHDC V5 固定 900 / 1000 kbps 目标码率的问题。启用 `com.android.bluetooth` 作用域后，模块会在蓝牙进程启动时自动尝试，仍然坚持唯一命中与失败关闭。
 
 适配口径：
 
@@ -339,6 +353,45 @@ adb logcat -c
 adb logcat -v time -b all | grep -E 'quality_mode=HIGH1_1000|target bit rate: 8|max bit rate: 8|codec_specific_1: 32776|ignore target bitrate|write.timeout'
 ```
 
+## 码率拥塞治理器（实验性）
+
+治理器解决的核心问题是：**「音质优先」不是把 1000 kbps 焊死，而是表达用户的质量上限与回升意愿**。链路能承受时主动靠近 1000 kbps，出现拥塞时先保证播放连续，环境恢复后再逐级升回——不因一次抖动就长期停在低档，也不在明显拥堵时盲目冲高档。
+
+它把三类证据归一成逐耳机的链路状态，按 1000 / 900 / 500 / 400 kbps 梯度做保护与恢复：
+
+- **编码队列**：`getAudioQueueLengthNative()` 由蓝牙主线程采样；队列达到容量 90% 并持续 300 ms 保护降档，打满立即处理。
+- **耳机卡顿回报**：`onRemoteChoppyReport()` 的 5 秒连续回报加深保护力度，并进入漏桶计数，防止单次抖动误伤。
+- **系统 BQR**：AFH 可用信道、重传、No-Rx、overflow / underflow 等字段；有效采样窗口 3～15 秒，升档需要连续健康窗口。
+
+决策流程（简化）：
+
+```mermaid
+flowchart TD
+    A[逐耳机链路状态采样] --> B{证据分层}
+    B -->|队列 90% 持续 300ms| D[保护降档]
+    B -->|choppy 漏桶连续| D
+    B -->|BQR 严重重传 / No-Rx / AFH 不足| D
+    B -->|8 秒跳变窗口 / 灾难影子哨兵| D
+    D --> E[阶梯降档 1000→900→500→400]
+    E --> F[降档死区 + 按边界失败历史学习]
+    F --> G{恢复探测}
+    G -->|健康窗口与低队列达标| H[试探升档]
+    H -->|getter 确认实际到达| I[稳定运行]
+    H -->|失败| F
+    I --> A
+```
+
+关键设计：
+
+- **分层触发**：轻微压力走影子保护 / 温和降档，严重信号（队列打满、choppy 连续、BQR 恶化）立即保护；8 秒跳变窗口和灾难影子哨兵避免短时拥塞被漏判。
+- **阶梯降档与不对称恢复**：一次只降一档，避免过度反应；恢复路径按档位设置不同门槛（500→900 放宽 No-Rx 门槛，900→1000 严格档容忍单侧热窗），并按失败历史递增驻留时间（120 / 240 / 300 秒）。
+- **按耳机学习**：500→900 与 900→1000 边界分别保存失败记录，切换耳机不继承上一只耳机的坏链路判断。
+- **失败关闭**：native owner 不唯一、编码器接口不可用或写入无法确认时只降档或保持现状，绝不强行写未知地址。
+
+该功能是**实验性**的：诊断页「链路」tab 提供开关（默认关闭，跨蓝牙进程重启保留）。开启后移动 / 干扰环境下可能出现短暂降码率，这是保护机制本身，不是故障。
+
+完整算法、状态机与决策细节见：[governor-algorithm.md](docs/governor-algorithm.md)（[English](docs/governor-algorithm.en.md)）。
+
 ### 已过时的 KernelSU / Magisk Native 补丁
 
 `ksu/oplus_lhdcv5_native_patch/` 保留了一份旧的 KernelSU / Magisk 兼容模块源码，只作为历史参考和极端兜底。它通过系统级 overlay 替换当前设备上的 `libbluetooth_jni.so` 副本，虽然安装时会动态匹配字节特征，但仍会创建可被检测到的 systemless mount。
@@ -378,8 +431,11 @@ adb logcat -s MelodyCodecLsp:V
 - `le.melody.state.recv`：LE Audio 状态是否回传到 Melody。
 - `evt=lhdc.memory_patch`：码率 branch 补丁加载、命中和验证状态。
 - `evt=lhdc.memory_patch.fast_switch`：LHDC V5 快切等价补丁加载、命中和验证状态。
+- `evt=native.patch.state.recv`：宿主收到的补丁状态广播（含 `fast_switch=` 字段）。
+- `evt=native.patch.advisory` / `evt=replay.advisory`：切换「音质优先」或记忆回放时的适配提醒 toast。
 - `evt=lhdc.governor.install` / `LhdcGovernorNative`：编码器回调 owner 扫描、策略切换和码率升降档。
-- `evt=lhdc.bqr`：BQR 链路样本、健康窗口、当前探测上限和两个升档边界的锁定状态。
+- `evt=lhdc.link.bqr_summary`：BQR 链路样本、健康窗口、当前探测上限和两个升档边界的锁定状态。
+- `evt=lhdc.governor.choppy_hooks` / `evt=lhdc.governor.queue_hooks`：耳机卡顿与编码队列 Hook 是否安装。
 - `evt=remember.write`：按耳机记忆是否写入。
 - `evt=replay.dispatch` / `evt=replay.outcome`：重连后记忆重放和确认结果。
 - `evt=diag.session.start`：诊断页开始一次问题记录。
@@ -405,7 +461,7 @@ app/build/outputs/apk/release/
 
 GitHub Actions 分为两个入口：
 
-- `Build APK`：推送 `main` / `master`、PR 或手动触发时执行，用于日常开发构建，产物名带 `dev` 和提交号。
+- `Build APK`：推送 `main` / `master`、PR 或手动触发时执行，用于日常开发构建，产物名为 `OPlusHeadsetAudioHelper-<短提交号>-<日期>.apk`。
 - `Release APK`：仅手动触发。它会按 patch / minor / major 或指定版本号自动抬升 `versionName` 和 `versionCode`，构建签名 APK，提交版本号变更，创建符合 Xposed Modules Repo 规则的 `versionCode-versionName` tag（例如 `4-1.2.0`），并在 GitHub Release 中写入手填说明和自动生成的提交记录。发布工作流只会把面向用户的 README、作用域元数据和必要图片同步到 `Xposed-Modules-Repo/xyz.melodylsp.codec`，源码始终以本仓库为准；工作流需要配置 `LSP_REPO_TOKEN` secret。
 - KSU / Magisk native patch 已过时，不再作为常规 Release 附件发布；如需极端兜底，可从 `ksu/oplus_lhdcv5_native_patch/` 手动生成 zip。
 

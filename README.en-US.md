@@ -2,6 +2,8 @@
 
 # OPlus Headset Audio Helper
 
+[简体中文](README.md) · [English](README.en-US.md)
+
 <p align="center">
   <img src="docs/banner.png" alt="OPlus Headset Audio Helper: Make the official headset panel more complete" width="100%">
 </p>
@@ -16,14 +18,34 @@
 
 The module primarily targets `com.oplus.melody` on ColorOS / OPlus devices, working alongside the `com.android.bluetooth` and `com.oplus.wirelesssettings` scopes for more stable state reading and writing.
 
-## 2.1.0 Update Highlights
+## 2.3.0 Update Highlights
 
-- LHDC playback quality is fixed to three user-facing strategies: **Adaptive, Connection Priority, and Sound Quality Priority**, no longer exposing raw quality codes directly to users.
-- "Adaptive" continues to use the native OPlus / LHDC ABR; "Connection Priority" requests ~500 / 560 kbps; "Sound Quality Priority" targets 1000 kbps, with the module's built-in governor dynamically protecting the link within 1000 / 900 / 500 / 400 kbps.
-- "Adaptive" and "Sound Quality Priority" will display the encoder's current bitrate in the playback quality summary for easy monitoring; "Connection Priority" keeps the display concise.
-- The Sound Quality Priority governor also interfaces with the encoding queue, headset choppy reports, and Android-parsed Bluetooth Quality Reports (BQR). It evaluates AFH available channels, retransmissions, and no-receive statistics to determine when to retry higher bitrates, learning separately per headset and per 500→900 / 900→1000 boundary to reduce 900↔500 oscillation.
-- Downgrades only modify the LHDC encoder's target bitrate, without triggering a full A2DP reconnection or altering the sample rate; protection downgrades trigger when the queue hits 90% for 300ms, immediate action when full, and gradual recovery once the link stabilizes.
-- Post-reconnection memory replay, 192 kHz recovery, and diagnostic states are further refined; structured diagnostics no longer run continuously in the background by default, only activating with a time limit when the user explicitly starts recording an issue.
+**LHDC V5 fast-switch equivalence patch (native memory patch)**
+
+- Fixes ColorOS 16's `A2DP_CodecEquals` missing the LHDC V5 dispatch: pure quality-tier switches are no longer forced to rebuild the output (previously "environment supports the highest bitrate but switching stutters" — startup congestion after rebuilding the AVDTP link).
+- Covers every known version line: PJZ110 16.0.9.401/.402 (device-verified), OP15/Ace6T 16.0.7.201, PJZ110 16.0.8.301/PLK110, PLC110 16.0.8.300, RMX6688 (MTK); the bitrate-branch patch also gains RMX6688 (MTK) support and a semantic-scan fallback.
+- The diagnostics page now shows the patch state as two separate rows — **Bitrate Branch Patch** and **Fast-Switch Equivalence Patch** — captured at hook time without needing a recording session.
+
+**Host-side adaptation advisories**
+
+- Switching to "Sound Quality Priority" now reports the patch adaptation state: "Not Adapted, Please Contact Developer" (after a failed write) or "Not Fully Adapted — Severe Stutter May Occur" (shown when selected).
+- Memory replay of Sound Quality Priority gets the same advisory (covers patch invalidation after system updates, avoiding silent degradation); the same replay episode only notifies once within a 60-second window.
+
+**Diagnostics page v3**
+
+- Four-tab bottom navigation (Overview / Status / Link / Feedback) with Android gesture-immersion (edge-to-edge) support.
+- Overview adds: module activation status, environment scope hook marks (✓/✗/—), a key-status snapshot, and memory cards; the Status tab supports manual refresh (re-queries patch state on demand).
+
+**Bitrate congestion governor (experimental)**
+
+- New experimental switch (off by default, toggled from the diagnostics page, persisted across Bluetooth process restarts).
+- Phase N rebuild: unified Target_Cap transactions with a single Java decision brain; layered triggers (choppy leaky bucket, 8-second leap window, disaster shadow sentinels, BQR valid gate, start/switch guards); stepped downgrades, downgrade dead zones and tiered asymmetric recovery; recovery countdown UI with progress-filled boundary bars.
+- Refined recovery thresholds: mid-tier 500→900 recovery relaxes the No-Rx gate (non-bad evidence), the strict 900→1000 tier tolerates one-sided hot windows, and hold times escalate with failure history.
+
+**Other fixes**
+
+- With LE Audio / LC3 active, the OneSpace and DetailMain panels no longer open the quality picker.
+- Diagnostics details: bottom-nav deformation on scroll, scrollbar, replay-chain display, root-log status copy.
 
 ## Support the Author
 
@@ -37,7 +59,8 @@ If this module has been helpful to you, feel free to scan the QR code to buy me 
 - Injects the same control set into the OneSpace quick panel `OneSpaceDetailActivity`.
 - Displays the current protocol: SBC, AAC, LDAC, LHDC, LC3, etc.
 - Supports playback quality switching, such as LHDC's Adaptive, Connection Priority, and Sound Quality Priority, as well as LDAC's 330 / 660 / 990 kbps.
-- Adaptive and Sound Quality Priority modes can display the LHDC encoder's real-time bitrate; Sound Quality Priority includes link congestion governance anchored at 1000 kbps.
+- Adaptive and Sound Quality Priority modes can display the LHDC encoder's real-time bitrate; Sound Quality Priority can optionally enable the experimental bitrate congestion governor (off by default).
+- The LHDC V5 native dual patches (bitrate branch + fast-switch equivalence) cover all known version lines, with "Not Adapted / Not Fully Adapted" host advisories based on the patch adaptation state.
 - Supports sample rate switching, dynamically displaying available options like 44.1 / 48 / 96 / 192 kHz based on the current headset and protocol.
 - Playback quality and sample rate settings are cross-validated to avoid writing combinations rejected by the Bluetooth stack.
 - Supports per-headset memory of selections, automatically applying the last settings upon reconnection.
@@ -73,18 +96,17 @@ The desktop icon is visible by default. To hide it from the launcher, enable "Hi
 
 ## Built-in Diagnostics Page
 
-The desktop entry opens the built-in diagnostics page, which primarily includes:
+The desktop entry opens the built-in diagnostics page. The v3 layout uses a four-tab bottom
+navigation (Overview / Status / Link / Feedback) with Android gesture-immersion support:
 
-- Module main switch.
-- Hide desktop icon toggle.
-- Module version, device model, Android version, and related app versions.
-- "Wireless Headphones" scope status, page hook, and main panel / OneSpace injection status.
-- Bluetooth scope, A2DP Bridge, wireless settings scope, and LE Audio bridge status.
-- LHDC V5 native memory patch, recent writes, memory writes, and reconnection replay status.
-- "Start Recording Issue" and "Generate Feedback Package" feedback actions.
-- Recent structured event timeline.
+- **Overview**: module activation status, module master switch, hide-desktop-icon toggle, environment info (with hook ✓/✗ marks for the three host scopes), key-status snapshot, and memory info (current Melody memory + the most recent replay chain).
+- **Status**: 22 diagnostic states (scopes / page hooks / injection / A2DP and LE Audio bridges / native patches / writes / memory / replay, etc.) with a manual refresh button that re-queries patch state on demand.
+- **Link**: the experimental bitrate congestion governor switch, live LHDC BQR environment (KPIs + boundary states + event reasons), and the BQR history window.
+- **Feedback**: recording session, feedback package generation, and the recent structured event timeline.
 
 Structured diagnostics do not continuously collect data in the background by default, nor do they repeatedly launch the module process for logging. Clicking "Start Recording Issue" initiates a time-limited recording of up to 30 minutes; it stops immediately after generating a feedback package or automatically upon timeout. A diagnostic status showing "Not Yet Collected" simply means no corresponding events have occurred during the current recording session, not that the module or LSPosed scopes are inactive.
+
+Diagnostic status rows are fully decoupled from feedback recording: normal usage (connecting a headset, opening panels, switching quality, writing memory, etc.) updates the relevant status rows immediately; high-frequency activity events (live BQR samples, remote choppy reports, etc.) still only enter the event ring during a recording session to avoid frequent disk writes.
 
 If you encounter issues like "Page not injected", "Switch failed", "LE Audio status not refreshing", or "Memory not restored after reconnection", it is recommended to click "Start Recording Issue", reproduce the problem once, and then click "Generate Feedback Package". Screenshots of the diagnostics page are also useful for quickly determining whether the issue stems from inactive scopes, lost page hooks, missing Bluetooth bridge signals, missed native patches, or non-functional wireless settings bridges.
 
@@ -113,7 +135,7 @@ Follow this workflow before submitting feedback; regular users can proceed in or
 1. Confirm the module is enabled in LSPosed with `com.oplus.melody`, `com.android.bluetooth`, `com.oplus.wirelesssettings`, and `com.android.settings` scopes checked.
 2. Grant root access to "OPlus Headset Audio Helper" in your root manager (KernelSU / Magisk / APatch); feedback packages can still be generated without root, but will lack the critical Bluetooth stack logs.
 3. Open the "OPlus Headset Audio Helper" diagnostics page and click "Start Recording Issue". If a root permission prompt appears, allow it.
-4. Return to the "Wireless Headphones" page and reproduce the issue once (e.g., switching LHDC quality / sample rate, switching AAC / SBC / LHDC, disconnecting/reconnecting the headset, toggling LE Audio, or waiting for "Not Adapted, Please Contact Developer").
+4. Return to the "Wireless Headphones" page and reproduce the issue once (e.g., switching LHDC quality / sample rate, switching AAC / SBC / LHDC, disconnecting/reconnecting the headset, toggling LE Audio, or waiting for "Not Adapted, Please Contact Developer" / "Not Fully Adapted — Severe Stutter May Occur").
 5. Return to the diagnostics page and click "Generate Feedback Package".
 6. Send the generated `OPlusHeadsetAudioHelper-feedback-YYYYMMDD-HHMMSS.zip` to the developer.
 
@@ -166,18 +188,7 @@ LHDC displays three fixed strategies to the user, mapped internally as follows:
 | --- | --- | --- |
 | Adaptive | OPlus / LHDC ABR (Quality Code 9) | Vendor algorithm predicts the link and prioritizes continuous playback; displays encoder current bitrate. |
 | Connection Priority | Fixed Mid-Tier (Quality Code 6) | Requests ~500 / 560 kbps, suitable for high-interference or long-distance environments. |
-| Sound Quality Priority | 1000 kbps Target (Quality Code 8) | Anchors at 1000 kbps, with the module protecting and recovering within 1000 / 900 / 500 / 400 kbps gradients; displays current bitrate. |
-
-Sound Quality Priority does not permanently lock 1000 kbps. It represents the user's quality ceiling and recovery preference: it actively approaches 1000 kbps when the link can handle it, but prioritizes playback continuity during congestion. Compared to the vendor's "Adaptive" mode, it more aggressively pursues higher bitrates and relies more on post-facto feedback; thus, the governor keeps bitrate switches internal to the encoder to avoid A2DP renegotiation, altering 192 kHz / 24 bit settings, or causing audible dropouts.
-
-The governor's main signals and state machine:
-
-- The encoding queue from `getAudioQueueLengthNative()` is sampled by the Bluetooth main thread. Protection downgrades trigger when the queue hits 90% capacity for 300ms, immediate downgrades when full; upgrades are only allowed after the queue stays below 25% and stable for 15 seconds.
-- `onRemoteChoppyReport()` provides headset-side choppy feedback. Continuous reports within 5 seconds gradually deepen the 1000→900→500→400 protection intensity.
-- `AdapterService.bluetoothQualityReportReadyCallback(BluetoothDevice, BluetoothQualityReport)` provides system-parsed BQR. The module reads AFH, retransmission, noRx, RSSI, SNR, overflow / underflow, etc., from `BqrCommon`. Valid sampling intervals are limited to 3~15 seconds; upgrade health windows require unused AFH ≤ 39 (i.e., at least ~40 available channels), retransmissions ≤ 25/sec, and noRx ≤ 25/sec.
-- 500→900 and 900→1000 boundaries save failure records separately. A boundary that fails twice rapidly within 5 minutes is temporarily locked; recovery probes are only opened when continuous healthy BQR windows, low queues, and no-congestion times simultaneously meet criteria.
-- After a recovery probe fails, the evidence threshold increases from 3 healthy windows / 30s to 5 / 60s and 10 / 120s; failure history for that boundary is cleared after 60 seconds of stable probing.
-- All learning states are isolated by headset MAC and retained within the current `com.android.bluetooth` process lifecycle. Switching headsets does not inherit bad link judgments from the previous device.
+| Sound Quality Priority | 1000 kbps Target (Quality Code 8) | Fixes the highest bitrate per device capability (1000 / 900 kbps). |
 
 Write paths degrade by capability:
 
@@ -221,6 +232,8 @@ Advice for regular users:
 - Headsets lacking Hi-Res or corresponding page items will use fallback injection points; if the page structure is completely different, they may still fail to display.
 - State feedback may be delayed by a few seconds during system freezing of `com.oplus.wirelesssettings`, Bluetooth stack restarts, or headset reconnection periods.
 - Some vendor Bluetooth stacks reject specific playback quality / sample rate combinations; the module attempts cross-correction but cannot guarantee real-time activation for all combinations.
+- The fast-switch equivalence patch uses exact whole-block signatures: after a system update (OTA recompile) it may report `unsupported` until the corresponding version line is adapted. During that window, switching to "Sound Quality Priority" shows the "Not Adapted / Not Fully Adapted" advisory — this is designed behavior, not a fault.
+- After installing or updating the module, restart the Bluetooth process (or reboot the phone) for the new patches and governor to take effect; toggling Bluetooth alone does not count as a process restart.
 
 ## Memory Replay Reliability
 
@@ -238,13 +251,30 @@ Advice for regular users:
 
 ## LHDC V5 Runtime Governance & Memory Patch
 
-The current version provides two independent capabilities within the `com.android.bluetooth` process: an encoder governor for "Sound Quality Priority", and an ARM64 instruction patch compatible with legacy OPlus fixed bitrate protection logic. The three user strategies do not depend on the legacy patch to function; it remains solely as a compatibility layer for verified ROMs.
+The current version provides two kinds of runtime capabilities within the `com.android.bluetooth` process: **two ARM64 memory patches** (fixing two independent ColorOS 16 Bluetooth stack issues) and the **encoder governor** (experimental bitrate congestion governor).
+
+### Dual patches: bitrate branch & fast-switch equivalence
+
+- **Bitrate branch patch**: fixes ColorOS 16 Bluetooth stacks ignoring LHDC V5 fixed 900 / 1000 kbps target bitrates — "Sound Quality Priority" writes are not followed, leaving playback at the vendor ABR value.
+- **Fast-switch equivalence patch**: fixes `A2DP_CodecEquals` missing the LHDC V5 dispatch after the refactor — pure quality-tier switches are judged as requiring output rebuild (`restart_output=true`), rebuilding the AVDTP link and causing startup congestion stutter; the patch reproduces the legacy LHDC V5 vendor equality mask so pure quality-bit changes take the "equal" path (`restart_output=false`).
+
+Adaptation matrix (both patches cover all known version lines):
+
+| Version line | Device / SoC | Bitrate branch | Fast-switch equivalence |
+| --- | --- | --- | --- |
+| 16.0.9.401 / .402 | PJZ110 (OnePlus 13 / OnePlus 11) | ✅ | ✅ device-verified |
+| 16.0.7.201 | OP15 / Ace6T (Snapdragon 8 Gen 5) | ✅ | ✅ |
+| 16.0.8.301 | PJZ110 / PLK110 | ✅ | ✅ |
+| 16.0.8.300 | PLC110 (Dimensity 9400+) | ✅ | ✅ |
+| RMX line | RMX6688 (Dimensity 9400+) | ✅ | ✅ |
+
+The diagnostics page shows the patch state as two separate rows — "Bitrate Branch Patch" and "Fast-Switch Equivalence Patch". When switching to "Sound Quality Priority", the host reports the adaptation state: "Not Adapted, Please Contact Developer" when the patch is missing, or "Not Fully Adapted — Severe Stutter May Occur" when only the fast-switch patch is missing; memory replay is reminded the same way (see the governor section below).
+
+### Encoder governor (bitrate congestion governor)
 
 The governor parses exported symbols from the currently loaded `liblhdcv5BT_enc.so`, and searches for the unique callback owners of `lhdcv5BT_encode` and `lhdcv5BT_free_handle` in the writable data segment or adjacent anonymous `.bss` of `libbluetooth_jni.so`. Only when both owners are uniquely matched does it wrap the encode/free calls via atomic pointer replacement, capture the active handle from the real encode path, and call `lhdcv5BT_set_target_bitrate_inx` to adjust the bitrate, reading back via `lhdcv5BT_get_bitrate`. It does not modify loader entries, relocations, GOT, or executable pages; installation stops immediately if candidates are zero or multiple.
 
 The Java side consolidates queue, remote choppy, and BQR data into per-headset link states; the native side only executes 1000 / 900 / 500 / 400 kbps gradient switching in Sound Quality Priority mode. Strategy switches, encoder handle changes, or headset releases reset corresponding runtime states to prevent invalid handles from carrying over to the next audio stream.
-
-The legacy instruction patch addresses issues where some OPlus / ColorOS Bluetooth stacks ignore LHDC V5 fixed 900 / 1000 kbps target bitrates. Once the `com.android.bluetooth` scope is enabled, the module automatically attempts it at Bluetooth process startup, still adhering to unique hit and fail-safe closure.
 
 Compatibility criteria:
 
@@ -326,6 +356,45 @@ adb logcat -c
 adb logcat -v time -b all | grep -E 'quality_mode=HIGH1_1000|target bit rate: 8|max bit rate: 8|codec_specific_1: 32776|ignore target bitrate|write.timeout'
 ```
 
+## Bitrate Congestion Governor (Experimental)
+
+The governor solves a core problem: **"Sound Quality Priority" is not about welding 1000 kbps permanently, but about expressing the user's quality ceiling and recovery preference**. It actively approaches 1000 kbps when the link can handle it, prioritizes playback continuity during congestion, and steps back up tier by tier after the environment recovers — neither staying low for long after a single glitch, nor blindly pushing high tiers during obvious congestion.
+
+It normalizes three kinds of evidence into per-headset link states and protects/recovers across the 1000 / 900 / 500 / 400 kbps gradient:
+
+- **Encoding queue**: `getAudioQueueLengthNative()` sampled by the Bluetooth main thread; protection downgrade at 90% capacity for 300ms, immediate handling when full.
+- **Headset choppy reports**: `onRemoteChoppyReport()` continuous reports within 5 seconds deepen the protection and feed a leaky bucket, preventing a single glitch from overreacting.
+- **System BQR**: AFH available channels, retransmissions, No-Rx, overflow / underflow, etc.; valid sampling windows 3–15s, upgrades require consecutive healthy windows.
+
+Decision flow (simplified):
+
+```mermaid
+flowchart TD
+    A[Per-headset link state sampling] --> B{Evidence tiering}
+    B -->|queue 90% for 300ms| D[Protective downgrade]
+    B -->|choppy leaky bucket| D
+    B -->|BQR severe retx / No-Rx / AFH shortage| D
+    B -->|8s leap window / disaster shadow sentinel| D
+    D --> E[Stepped downgrade 1000→900→500→400]
+    E --> F[Downgrade dead zone + per-boundary failure learning]
+    F --> G{Recovery probe}
+    G -->|healthy windows + low queue| H[Probe upgrade]
+    H -->|getter confirms actual bitrate| I[Stable operation]
+    H -->|failed| F
+    I --> A
+```
+
+Key design:
+
+- **Layered triggers**: mild pressure takes shadow protection / gentle downgrades; severe signals (full queue, consecutive choppy, BQR deterioration) trigger immediate protection; the 8-second leap window and disaster shadow sentinels prevent short bursts from being missed.
+- **Stepped downgrades & asymmetric recovery**: one tier at a time to avoid overreaction; recovery thresholds differ per tier (500→900 relaxes the No-Rx gate, the strict 900→1000 tier tolerates one-sided hot windows), with hold times escalating by failure history (120 / 240 / 300s).
+- **Per-headset learning**: 500→900 and 900→1000 boundaries keep separate failure records; switching headsets does not inherit another device's bad-link judgments.
+- **Fail-safe closure**: if native owners are ambiguous, encoder interfaces are unavailable, or writes cannot be confirmed, the governor only downgrades or holds — it never forces writes to unknown addresses.
+
+This feature is **experimental**: the "Link" tab of the diagnostics page provides the switch (off by default, persisted across Bluetooth process restarts). When enabled, brief bitrate drops may occur in mobile / interference-heavy environments — that is the protection mechanism itself, not a fault.
+
+Full algorithm, state machine and decision details: [governor-algorithm.en.md](docs/governor-algorithm.en.md)（[简体中文](docs/governor-algorithm.md)）。
+
 ### Deprecated KernelSU / Magisk Native Patch
 
 `ksu/oplus_lhdcv5_native_patch/` retains legacy KernelSU / Magisk compatibility module source code, kept only for historical reference and extreme fallback. It replaces the current device's `libbluetooth_jni.so` copy via a system-level overlay; although it dynamically matches byte signatures during installation, it still creates a detectable systemless mount.
@@ -364,8 +433,12 @@ Common keywords:
 - `evt=scope.wirelesssettings.context.ready`: Whether wireless settings scope loaded.
 - `le.melody.state.recv`: Whether LE Audio state callback to Melody succeeded.
 - `evt=lhdc.memory_patch`: LHDC V5 runtime memory patch load, hit, and verification status.
+- `evt=lhdc.memory_patch.fast_switch`: LHDC V5 fast-switch equivalence patch load, hit, and verification status.
+- `evt=native.patch.state.recv`: Host-received patch state broadcast (including the `fast_switch=` field).
+- `evt=native.patch.advisory` / `evt=replay.advisory`: Adaptation advisories when switching to "Sound Quality Priority" or replaying memory.
 - `evt=lhdc.governor.install` / `LhdcGovernorNative`: Encoder callback owner scan, strategy switch, and bitrate upgrade/downgrade.
-- `evt=lhdc.bqr`: BQR link samples, health windows, current probe caps, and lock status for both upgrade boundaries.
+- `evt=lhdc.link.bqr_summary`: BQR link samples, health windows, current probe caps, and lock status for both upgrade boundaries.
+- `evt=lhdc.governor.choppy_hooks` / `evt=lhdc.governor.queue_hooks`: Whether the headset choppy and encoding queue hooks installed.
 - `evt=remember.write`: Whether per-headset memory written.
 - `evt=replay.dispatch` / `evt=replay.outcome`: Post-reconnection memory replay and confirmation results.
 - `evt=diag.session.start`: Diagnostics page started an issue recording session.
@@ -391,7 +464,7 @@ app/build/outputs/apk/release/
 
 GitHub Actions are split into two entry points:
 
-- `Build APK`: Executes on pushes to `main` / `master`, PRs, or manual triggers; used for daily development builds, artifact names include `dev` and commit hash.
+- `Build APK`: Executes on pushes to `main` / `master`, PRs, or manual triggers; used for daily development builds, artifact name is `OPlusHeadsetAudioHelper-<short-sha>-<date>.apk`.
 - `Release APK`: Manual trigger only. It automatically bumps `versionName` and `versionCode` by patch / minor / major or specified version, builds a signed APK, commits version changes, creates an Xposed Modules Repo-compliant `versionCode-versionName` tag (e.g., `4-1.2.0`), and writes manual notes + auto-generated commit records in the GitHub Release. The release workflow only syncs the user-facing README, scope metadata, and necessary images to `Xposed-Modules-Repo/xyz.melodylsp.codec`; source code always remains the source of truth for this repository; the workflow requires configuring the `LSP_REPO_TOKEN` secret.
 - The KSU / Magisk native patch is deprecated and no longer distributed as a standard Release attachment; if an extreme fallback is needed, the zip can be manually generated from `ksu/oplus_lhdcv5_native_patch/`.
 
