@@ -37,6 +37,7 @@ import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.diag.FeedbackCollector;
 import xyz.melodylsp.codec.diag.RootBluetoothLogCapture;
+import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 /** Hosts the diagnostics-v3 HTML design and supplies its read-only foreground snapshot bridge. */
@@ -450,6 +451,12 @@ public final class MasterSwitchActivity extends Activity {
         public void requestMemorySnapshot() {
             runOnUiThread(MasterSwitchActivity.this::requestRememberedSnapshot);
         }
+
+        /** 触发蓝牙侧重查 native 补丁状态；宿主收到回复后打点，状态行随之更新。 */
+        @JavascriptInterface
+        public void requestNativePatchState() {
+            runOnUiThread(MasterSwitchActivity.this::queryNativePatchState);
+        }
     }
 
     private void startRecordSession() {
@@ -544,6 +551,17 @@ public final class MasterSwitchActivity extends Activity {
     private void requestRememberedSnapshot() {
         DiagnosticEvents.requestRememberedSnapshot(this);
         mainHandler.postDelayed(this::pushSnapshotToPage, 900L);
+    }
+
+    private void queryNativePatchState() {
+        try {
+            Intent intent = new Intent(CodecIpc.ACTION_QUERY_NATIVE_PATCH);
+            intent.setPackage(CodecIpc.BLUETOOTH_PKG);
+            intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+            TrustedBroadcasts.send(this, intent);
+        } catch (Throwable t) {
+            MLog.w("native patch state query failed", t);
+        }
     }
 
     private boolean applyLauncherIconState(boolean hidden, boolean notifyLauncher) {

@@ -11,7 +11,7 @@
        导航栏适配 Android 手势沉浸（safe-area-inset-bottom）。
        分类：
          - 概览：模块激活状态 / 模块开关 / 隐藏图标 / 环境信息 / 关键状态 / 记忆信息
-         - 状态：诊断状态 22 项
+         - 状态：诊断状态 22 项（含手动刷新：重读快照 + 重查补丁状态）
          - 链路：实验性开关 / BQR 实时环境（KPI + 边界 + 理由）/ BQR 历史窗口
          - 反馈：反馈工具（记录 / 反馈包 / 记忆快照）/ 最近事件 12 行
        1. HTML 通过 JavaScriptInterface 读取诊断快照；只有用户操作开关或按钮时
@@ -448,12 +448,17 @@
     }
     .key-status-item .name { font-size: 13px; font-weight: 600; }
 
-    /* ── v3: 记忆卡头部操作区 ── */
+    /* ── v3: 卡片头部操作区 ── */
+    .card-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 10px;
+    }
     .memory-head-actions { display: flex; align-items: center; gap: 8px; }
-    .btn.memory-refresh {
+    .btn.mini {
       flex: none; min-width: 0;
       padding: 6px 12px; font-size: 12px; border-radius: 999px;
     }
+    .btn.mini:disabled { opacity: .55; cursor: default; box-shadow: none; }
 
     /* ── v3: 记忆信息卡片化排版 ── */
     .memory-list { display: grid; gap: 8px; margin-top: 4px; }
@@ -578,7 +583,7 @@
       <h3>当前 Melody 真实记忆</h3>
       <div class="memory-head-actions">
         <span class="pill idle" id="memory-state"><span class="dot"></span>等待快照</span>
-        <button class="btn ghost memory-refresh" id="memory-button">重抓</button>
+        <button class="btn ghost mini" id="memory-button">重抓</button>
       </div>
     </div>
     <div class="memory-list" id="memory-remembered">
@@ -740,7 +745,10 @@
 
   <!-- ═══════════════ 诊断状态 ═══════════════ -->
   <section class="card">
-    <h2>诊断状态</h2>
+    <div class="card-head">
+      <h2>诊断状态</h2>
+      <button class="btn ghost mini" id="status-refresh-button">刷新</button>
+    </div>
     <p class="hint">每次模块 hook 生效时会更新最近一次事件。</p>
     <p class="hint">颜色：<span class="pill ok">ok</span> <span class="pill warn">pending</span> <span class="pill err">attention</span></p>
 
@@ -1736,6 +1744,22 @@
   });
   byId('memory-button').addEventListener('click', () => {
     if (bridge && bridge.requestMemorySnapshot) bridge.requestMemorySnapshot();
+  });
+  /* ── v3: 诊断状态手动刷新：立即重读 + 触发蓝牙侧重查补丁状态 ── */
+  byId('status-refresh-button').addEventListener('click', () => {
+    const button = byId('status-refresh-button');
+    button.disabled = true;
+    button.textContent = '刷新中…';
+    if (bridge && bridge.requestNativePatchState) bridge.requestNativePatchState();
+    refresh();
+    setTimeout(() => {
+      refresh();
+      setTimeout(() => {
+        refresh();
+        button.disabled = false;
+        button.textContent = '刷新';
+      }, 1200);
+    }, 800);
   });
   document.querySelectorAll('[data-history-window]').forEach(button => {
     button.addEventListener('click', () => {
