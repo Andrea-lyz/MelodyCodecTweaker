@@ -24,11 +24,12 @@ public final class DiagnosticEventReceiver extends BroadcastReceiver {
         if (intent == null || !DiagnosticEvents.ACTION.equals(intent.getAction())) return;
         String message = intent.getStringExtra(DiagnosticEvents.EXTRA_MESSAGE);
         boolean memoryMirror = DiagnosticEvents.isMemoryMirrorEvent(message);
-        // Memory-mirror events are exempt from the recording gate: the diagnostic page must be
-        // able to refresh the remember card anytime. Other events are only recorded while a
-        // session is active, so the receiver stays resident and ignores telemetry outside
-        // recording instead of disabling itself.
-        if (!DiagnosticEvents.isRecording(context) && !memoryMirror) return;
+        boolean statusEssential = DiagnosticEvents.isStatusEssentialEvent(message);
+        // Memory-mirror and native patch status events are exempt from the recording gate: the
+        // diagnostic page must be able to show the remember card and native patch rows anytime.
+        // Other events are only recorded while a session is active, so the receiver stays
+        // resident and ignores telemetry outside recording instead of disabling itself.
+        if (!DiagnosticEvents.isRecording(context) && !memoryMirror && !statusEssential) return;
         TrustedBroadcasts.SenderIdentity sender = TrustedBroadcasts.captureSender(this);
         String scope;
         int rateLimitUid;
@@ -52,12 +53,15 @@ public final class DiagnosticEventReceiver extends BroadcastReceiver {
             rateLimitUid = -1;
         }
         if (!DiagnosticEvents.isRecording(context)) {
-            // Outside a session, mirror only the remember card state; do not touch telemetry.
-            DiagnosticEvents.recordMemoryMirror(
-                    context,
-                    message,
-                    intent.getLongExtra(
-                            DiagnosticEvents.EXTRA_TIME, System.currentTimeMillis()));
+            // Outside a session, mirror only remember-card and native patch status state; do
+            // not touch telemetry.
+            long time = intent.getLongExtra(
+                    DiagnosticEvents.EXTRA_TIME, System.currentTimeMillis());
+            if (memoryMirror) {
+                DiagnosticEvents.recordMemoryMirror(context, message, time);
+            } else if (statusEssential) {
+                DiagnosticEvents.recordStatusEssential(context, scope, message, time);
+            }
             return;
         }
         if (!allowEvent(rateLimitUid, SystemClock.elapsedRealtime())) return;

@@ -82,7 +82,7 @@
 - 「开始记录问题」和「生成反馈包」两个反馈操作。
 - 最近结构化事件时间线。
 
-结构化诊断默认不会在后台持续采集，也不会为了记录日志反复启动模块进程。点击「开始记录问题」后会开启最长 30 分钟的限时记录；生成反馈包后立即结束，超时后也会自动停止。诊断状态显示「尚未采集」只代表当前记录中还没有对应事件，不代表模块或 LSPosed 作用域没有生效。
+结构化诊断默认不会在后台持续采集，也不会为了记录日志反复启动模块进程。点击「开始记录问题」后会开启最长 30 分钟的限时记录；生成反馈包后立即结束，超时后也会自动停止。诊断状态显示「尚未采集」只代表当前记录中还没有对应事件，不代表模块或 LSPosed 作用域没有生效。记忆卡片和 native 补丁两行状态（码率 branch / 快切等价）是例外：它们在模块 hook 时就会记录最近一次生效结果，不依赖录制会话。
 
 如果出现「页面没有注入」「切换失败」「LE Audio 状态不刷新」「重连后记忆没有恢复」这类问题，建议先点「开始记录问题」，复现一次问题，再点「生成反馈包」。诊断页截图也仍然有用，可以快速判断是作用域没生效、页面 Hook 丢了、蓝牙桥没收到、native 补丁没命中，还是无线设置桥没工作。
 
@@ -376,7 +376,8 @@ adb logcat -s MelodyCodecLsp:V
 - `evt=codec.updated.hooks`：蓝牙侧编解码器更新 Hook 是否安装。
 - `evt=scope.wirelesssettings.context.ready`：无线设置作用域是否加载。
 - `le.melody.state.recv`：LE Audio 状态是否回传到 Melody。
-- `evt=lhdc.memory_patch`：LHDC V5 运行时内存补丁加载、命中和验证状态。
+- `evt=lhdc.memory_patch`：码率 branch 补丁加载、命中和验证状态。
+- `evt=lhdc.memory_patch.fast_switch`：LHDC V5 快切等价补丁加载、命中和验证状态。
 - `evt=lhdc.governor.install` / `LhdcGovernorNative`：编码器回调 owner 扫描、策略切换和码率升降档。
 - `evt=lhdc.bqr`：BQR 链路样本、健康窗口、当前探测上限和两个升档边界的锁定状态。
 - `evt=remember.write`：按耳机记忆是否写入。

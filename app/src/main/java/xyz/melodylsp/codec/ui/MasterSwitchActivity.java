@@ -37,9 +37,10 @@ import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.diag.FeedbackCollector;
 import xyz.melodylsp.codec.diag.RootBluetoothLogCapture;
+import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
-/** Hosts the diagnostics-v2 HTML design and supplies its read-only foreground snapshot bridge. */
+/** Hosts the diagnostics-v3 HTML design and supplies its read-only foreground snapshot bridge. */
 public final class MasterSwitchActivity extends Activity {
 
     private static final String PREFS_NAME = "module_prefs";
@@ -48,9 +49,8 @@ public final class MasterSwitchActivity extends Activity {
     private static final String LAUNCHER_ALIAS =
             "xyz.melodylsp.codec.ui.LauncherActivity";
     private static final String DIAGNOSTICS_URL =
-            "file:///android_asset/diagnostics-v2.html";
+            "file:///android_asset/diagnostics-v3.html";
     private static final int LIGHT_BG = 0xFFF6F7FB;
-    private static final int DARK_BG = 0xFF0F1218;
     private static final long[] RECORDING_CONTROL_RETRY_DELAYS_MS = {
             500L, 2_000L, 5_000L
     };
@@ -66,7 +66,8 @@ public final class MasterSwitchActivity extends Activity {
             {"LE Audio 蓝牙桥", "bridge.le.bt"},
             {"无线设置作用域", "scope.wirelesssettings"},
             {"LE Audio 无线设置桥", "bridge.le.ws"},
-            {"Native 内存补丁", "native.patch"},
+            {"码率 branch 补丁", "native.patch.bitrate"},
+            {"快切等价补丁", "native.patch.fast_switch"},
             {"root 蓝牙持续日志", "diag.root.capture"},
             {"LHDC BQR Hook", "lhdc.link.bqr"},
             {"LHDC choppy Hook", "lhdc.link.choppy"},
@@ -124,6 +125,7 @@ public final class MasterSwitchActivity extends Activity {
         DiagnosticEvents.reconcileReceiverState(this);
         applyLauncherIconState(modulePrefs.getBoolean(KEY_HIDE_LAUNCHER_ICON, false), false);
         cachedEnvironment = buildEnvironmentSnapshot();
+        getWindow().setDecorFitsSystemWindows(false);
         configureSystemBars();
         setContentView(createWebView());
     }
@@ -169,12 +171,17 @@ public final class MasterSwitchActivity extends Activity {
         boolean dark = (getResources().getConfiguration().uiMode
                 & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
                 == android.content.res.Configuration.UI_MODE_NIGHT_YES;
-        int color = dark ? DARK_BG : LIGHT_BG;
-        getWindow().setStatusBarColor(color);
-        getWindow().setNavigationBarColor(color);
-        if (!dark) {
-            getWindow().getDecorView().setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        // Edge-to-edge: the WebView extends under the status bar and gesture navigation bar;
+        // the v3 HTML applies env(safe-area-inset-*) paddings for the tab bar and header.
+        getWindow().setStatusBarColor(android.graphics.Color.TRANSPARENT);
+        getWindow().setNavigationBarColor(android.graphics.Color.TRANSPARENT);
+        android.view.WindowInsetsController controller =
+                getWindow().getDecorView().getWindowInsetsController();
+        if (controller != null) {
+            int mask = android.view.WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                    | android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
+            controller.setSystemBarsAppearance(
+                    dark ? 0 : mask, mask);
         }
     }
 
@@ -182,6 +189,12 @@ public final class MasterSwitchActivity extends Activity {
     private WebView createWebView() {
         WebView view = new WebView(this);
         view.setBackgroundColor(LIGHT_BG);
+        // 关闭框架层 overscroll 拉伸/辉光：edge-to-edge 下滚动到顶/底时
+        // 整个 WebView（含 position:fixed 的底部导航）会被 ROM 拉伸变形。
+        view.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        // 隐藏滚动条：页面滚动照常，仅不显示滚动指示条。
+        view.setVerticalScrollBarEnabled(false);
+        view.setHorizontalScrollBarEnabled(false);
         WebSettings settings = view.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(false);
@@ -441,6 +454,12 @@ public final class MasterSwitchActivity extends Activity {
         public void requestMemorySnapshot() {
             runOnUiThread(MasterSwitchActivity.this::requestRememberedSnapshot);
         }
+
+        /** 触发蓝牙侧重查 native 补丁状态；宿主收到回复后打点，状态行随之更新。 */
+        @JavascriptInterface
+        public void requestNativePatchState() {
+            runOnUiThread(MasterSwitchActivity.this::queryNativePatchState);
+        }
     }
 
     private void startRecordSession() {
@@ -535,6 +554,17 @@ public final class MasterSwitchActivity extends Activity {
     private void requestRememberedSnapshot() {
         DiagnosticEvents.requestRememberedSnapshot(this);
         mainHandler.postDelayed(this::pushSnapshotToPage, 900L);
+    }
+
+    private void queryNativePatchState() {
+        try {
+            Intent intent = new Intent(CodecIpc.ACTION_QUERY_NATIVE_PATCH);
+            intent.setPackage(CodecIpc.BLUETOOTH_PKG);
+            intent.putExtra(CodecIpc.EXTRA_TOKEN, CodecIpc.TOKEN);
+            TrustedBroadcasts.send(this, intent);
+        } catch (Throwable t) {
+            MLog.w("native patch state query failed", t);
+        }
     }
 
     private boolean applyLauncherIconState(boolean hidden, boolean notifyLauncher) {

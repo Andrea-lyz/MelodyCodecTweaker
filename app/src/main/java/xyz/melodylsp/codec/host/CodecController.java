@@ -112,6 +112,7 @@ public final class CodecController {
     private final Map<String, Integer> lhdcPoliciesByMac = new HashMap<>();
     private BroadcastReceiver memorySnapshotReceiver;
     private volatile boolean nativePatchUnsupported;
+    private String lastNativePatchFastSwitchStatus = "";
     private int lhdcGovernorBitrateKbps;
     private boolean governorBitratePollScheduled;
     private final Runnable governorBitratePoll = this::runGovernorBitratePoll;
@@ -393,19 +394,33 @@ public final class CodecController {
         String status = intent.getStringExtra(CodecIpc.EXTRA_NATIVE_PATCH_STATUS);
         int patched = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_PATCHED, -1);
         int original = intent.getIntExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, -1);
+        String fastSwitchStatus = intent.getStringExtra(
+                CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_STATUS);
+        int fastSwitchPatched = intent.getIntExtra(
+                CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_PATCHED, -1);
+        int fastSwitchOriginal = intent.getIntExtra(
+                CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_ORIGINAL, -1);
+        if (fastSwitchStatus == null) fastSwitchStatus = "";
         int bitrateKbps = intent.getIntExtra(
                 CodecIpc.EXTRA_LHDC_GOVERNOR_BITRATE_KBPS, 0);
         boolean bitrateChanged = lhdcGovernorBitrateKbps != bitrateKbps;
         boolean nextUnsupported = "unsupported".equals(status)
                 && patched == 0
                 && original == 0;
-        boolean stateChanged = bitrateChanged || nativePatchUnsupported != nextUnsupported;
+        boolean fastSwitchChanged = !fastSwitchStatus.equals(lastNativePatchFastSwitchStatus);
+        boolean stateChanged = bitrateChanged
+                || nativePatchUnsupported != nextUnsupported
+                || fastSwitchChanged;
         lhdcGovernorBitrateKbps = Math.max(0, bitrateKbps);
         nativePatchUnsupported = nextUnsupported;
+        lastNativePatchFastSwitchStatus = fastSwitchStatus;
         Object[] telemetry = {
                 "status", status,
                 "patched", patched,
                 "original", original,
+                "fast_switch", fastSwitchStatus,
+                "fast_switch_patched", fastSwitchPatched,
+                "fast_switch_original", fastSwitchOriginal,
                 "bitrateKbps", lhdcGovernorBitrateKbps,
                 "unsupported", nativePatchUnsupported
         };
@@ -1194,12 +1209,17 @@ public final class CodecController {
      * background so OPPO's slow optional confirmation path never blocks the visible switch.
      */
     private void showCodecModePicker(Subscription sub, Object sourcePref) {
+        // LC3 runs over the LE transport: the codec mode picker only lists classic A2DP tiers
+        // (LHDC/AAC/SBC) and must not open while LC3 is the active codec. This applies to every
+        // injected surface (OneSpace + DetailMain) because they share this controller.
+        if (shouldRenderLeAudioActive(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
             Toast.makeText(context, Strings.STATE_CODEC_UNKNOWN, Toast.LENGTH_SHORT).show();
             return;
         }
+        if (snapshot.activeCodecType == CodecLabelTable.CODEC_LC3) return;
         if (!isCodecModeSwitchAvailable(snapshot)) {
             Toast.makeText(context,
                     Strings.TOAST_CODEC_MODE_UNSUPPORTED, Toast.LENGTH_SHORT).show();
@@ -1272,6 +1292,7 @@ public final class CodecController {
      * (vendor codec quirk on every OPPO LHDC variant).
      */
     private void showQualityPicker(Subscription sub, Object sourcePref) {
+        if (shouldRenderLeAudioActive(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
@@ -1509,6 +1530,7 @@ public final class CodecController {
     }
 
     private void showSampleRatePicker(Subscription sub, Object sourcePref) {
+        if (shouldRenderLeAudioActive(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {

@@ -48,4 +48,57 @@ public final class DiagnosticEventReceiverTest {
         assertEquals("未发现", DiagnosticEvents.defaultStatus("last.warning"));
         assertEquals("未发现", DiagnosticEvents.defaultStatus("last.error"));
     }
+
+    @Test
+    public void statusEssentialEventsAreIdentified() {
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.memory_patch status=patched success=true"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.memory_patch.fast_switch status=unsupported"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=native.patch.state.recv status=patched fast_switch=patched"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=remember.snapshot.begin reason=request count=1"));
+        assertFalse(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=codec.bt.set codec=ldac result=0"));
+    }
+
+    @Test
+    public void statusDecouplingCoversScopeHookAndResultEvents() {
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent("evt=scope.host.start"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=scope.system.context.ready"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=scope.wirelesssettings.start"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent("evt=controller.ready"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=preference.fragment.hooked class=androidx.preference.g"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=detailmain.activity.hooked"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent("evt=onespace.injected"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=codec.bt.receiver.registered"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent("evt=codec.updated.hooks"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.governor.queue_hooks count=2"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=remember.write mac=AA:BB:CC:DD:EE:01"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=replay.dispatch attempt=0"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=write.done success=true"));
+        assertTrue(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=dexkit.native.loaded"));
+        // 高频活性事件仍受录制门控
+        assertFalse(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=codec.bt.reply ok=true"));
+        assertFalse(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=le.bt.a2dp.reconnect attempt=3"));
+        assertFalse(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.link.bqr_summary retx=8"));
+        assertFalse(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.link.remote_choppy level=1"));
+        assertFalse(DiagnosticEvents.isStatusEssentialEvent(
+                "evt=lhdc.link.probe_ceiling ceiling=900"));
+    }
 }

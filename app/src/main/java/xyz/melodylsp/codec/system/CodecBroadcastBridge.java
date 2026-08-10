@@ -278,6 +278,17 @@ public final class CodecBroadcastBridge {
             intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_ORIGINAL, result.originalCount);
             intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_SUCCESS, result.success);
         }
+        NativeLhdcMemoryPatch.PatchResult fastSwitch =
+                NativeLhdcMemoryPatch.lastQualitySwitchResult();
+        if (fastSwitch != null) {
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_STATUS, fastSwitch.status);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_DETAIL, fastSwitch.reason);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_PATCHED,
+                    fastSwitch.patchedCount);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_ORIGINAL,
+                    fastSwitch.originalCount);
+            intent.putExtra(CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_SUCCESS, fastSwitch.success);
+        }
         intent.putExtra(CodecIpc.EXTRA_LHDC_GOVERNOR_BITRATE_KBPS,
                 NativeLhdcMemoryPatch.currentGovernorBitrateKbps());
     }

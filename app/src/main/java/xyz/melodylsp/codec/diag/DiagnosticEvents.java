@@ -15,6 +15,7 @@ import java.util.Locale;
 import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.label.CodecLabelTable;
+import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
 public final class DiagnosticEvents {
@@ -221,6 +222,18 @@ public final class DiagnosticEvents {
     }
 
     /**
+     * True when the message carries a status-classifying event that must stay visible outside
+     * a diagnostic session (V3-15: status rows are decoupled from feedback recording). These
+     * are recorded status-only (no event ring) so the page always reflects the last known
+     * state; high-frequency activity events stay recording-gated.
+     */
+    static boolean isStatusEssentialEvent(String message) {
+        if (message == null) return false;
+        String event = eventName(message);
+        return MLog.isStatusEssentialEventName(event);
+    }
+
+    /**
      * Applies a remember-card mirror snapshot without touching the recording event ring. Used
      * by the receiver when no diagnostic session is active.
      */
@@ -229,6 +242,25 @@ public final class DiagnosticEvents {
         message = limit(message, MAX_MESSAGE_CHARS);
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         SharedPreferences.Editor editor = sp.edit();
+        mirrorMemory(sp, editor, message, time);
+        editor.apply();
+    }
+
+    /**
+     * Applies status-row classification without touching the recording event ring. Used by the
+     * receiver when no diagnostic session is active so hook-time native patch state stays
+     * visible on the page.
+     */
+    static void recordStatusEssential(
+            Context context, String scope, String message, long time) {
+        if (context == null || message == null || message.isEmpty()) return;
+        message = limit(message, MAX_MESSAGE_CHARS);
+        SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        SharedPreferences.Editor editor = sp.edit();
+        classify(editor, safe(scope), message, Log.INFO, time);
+        // Replay-family events also mirror the reconnect chain into the memory card (and any
+        // remember.snapshot.* that reaches this path is mirrored too), so the overview memory
+        // card stays fresh outside a recording session.
         mirrorMemory(sp, editor, message, time);
         editor.apply();
     }
@@ -334,6 +366,9 @@ public final class DiagnosticEvents {
         if ("last.warning".equals(key) || "last.error".equals(key)) {
             return "未发现";
         }
+        if ("diag.root.capture".equals(key)) {
+            return "未记录";
+        }
         if ("inject.detail".equals(key)
                 || "inject.onespace".equals(key)
                 || "scope.wirelesssettings".equals(key)
@@ -399,9 +434,6 @@ public final class DiagnosticEvents {
             int rate = sp.getInt(prefix + "rate", -1);
             sb.append(memoryValueLabel(codec, specific1, rate));
             if (updated > 0L) sb.append("\n  更新时间：").append(formatTime(updated));
-            sb.append("\n  raw: codec=").append(codec)
-                    .append(" specific1=").append(specific1)
-                    .append(" rate=0x").append(Integer.toHexString(rate));
         }
         return sb.length() > 0 ? sb.toString() : "暂无记忆镜像。";
     }
@@ -487,9 +519,18 @@ public final class DiagnosticEvents {
                 || message.contains("evt=le.ws.")) {
             mark(editor, "bridge.le.ws", "registered", message, time);
         }
-        if (message.contains("evt=lhdc.memory_patch")
-                || message.contains("evt=native.patch.state.recv")) {
-            mark(editor, "native.patch", stateFromMessage(message), message, time);
+        String event = eventName(message);
+        if ("lhdc.memory_patch".equals(event)) {
+            mark(editor, "native.patch.bitrate", stateFromMessage(message), message, time);
+        } else if ("lhdc.memory_patch.fast_switch".equals(event)) {
+            mark(editor, "native.patch.fast_switch", stateFromMessage(message), message, time);
+        } else if ("native.patch.state.recv".equals(event)) {
+            mark(editor, "native.patch.bitrate", stateFromMessage(message), message, time);
+            String fastSwitchStatus = valueOf(message, "fast_switch");
+            if (fastSwitchStatus != null && !fastSwitchStatus.isEmpty()) {
+                mark(editor, "native.patch.fast_switch",
+                        stateFromPatchStatus(fastSwitchStatus), message, time);
+            }
         }
         if (message.contains("evt=diag.root_capture")) {
             String captureStatus = message.contains("status=started")
@@ -851,6 +892,15 @@ public final class DiagnosticEvents {
                 || message.contains("success=false")) {
             return "attention";
         }
+        return "seen";
+    }
+
+    /** Maps a raw patch status value (patched/already_patched/pending/failed/unsupported). */
+    private static String stateFromPatchStatus(String status) {
+        if ("patched".equals(status) || "already_patched".equals(status)) return "ok";
+        if ("pending".equals(status)) return "pending";
+        if ("failed".equals(status)) return "failed";
+        if ("unsupported".equals(status)) return "attention";
         return "seen";
     }
 
