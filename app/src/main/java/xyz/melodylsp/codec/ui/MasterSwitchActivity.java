@@ -192,6 +192,9 @@ public final class MasterSwitchActivity extends Activity {
         // 关闭框架层 overscroll 拉伸/辉光：edge-to-edge 下滚动到顶/底时
         // 整个 WebView（含 position:fixed 的底部导航）会被 ROM 拉伸变形。
         view.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        // 隐藏滚动条：页面滚动照常，仅不显示滚动指示条。
+        view.setVerticalScrollBarEnabled(false);
+        view.setHorizontalScrollBarEnabled(false);
         WebSettings settings = view.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(false);

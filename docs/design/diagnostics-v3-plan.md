@@ -61,6 +61,7 @@
 | V3-31 | 「上次记忆恢复链路」只显示最近一次回放片段 | 真机反馈 2026-08-10 | 已接线待验证 | 恢复链路卡不再显示全部历史日志；仅展示最近一次回放（相邻间隔 ≥ 60s 切分片段，上限 12 行） | 底层 `KEY_MEMORY_REPLAY_CHAIN` 保留完整（反馈包仍含全量），仅展示层截取 |
 | V3-32 | root 蓝牙持续日志行默认文案改为「未记录」 | 真机反馈 2026-08-10 | 已接线待验证 | 非录制会话下该行显示「未记录」（副文案：随录制会话启动），不再显示「等待状态」 | 该行状态由 `diag.root_capture` 驱动，天然会话绑定；仅文案语义修正 |
 | V3-33 | 诊断状态卡新增「刷新」按钮 | 用户评审 2026-08-10 | 已接线待验证 | 状态页标题行右侧显示「刷新」按钮：点击后立即重读快照，并触发蓝牙侧重查 native 补丁状态（`ACTION_QUERY_NATIVE_PATCH` → 宿主打点 → 状态行更新），随后两次延迟重读（800ms/2s） | 新增 bridge 方法 `requestNativePatchState`；仅触发查询回复，不重新打补丁，无副作用 |
+| V3-34 | 隐藏页面滚动条 | 用户评审 2026-08-10 | 已接线待验证 | 页面滑动时不再显示滚动条（滚动行为不变） | `WebView.setVerticalScrollBarEnabled(false)` / `setHorizontalScrollBarEnabled(false)` + CSS `::-webkit-scrollbar { display: none }` 双保险 |
 
 > 真机反馈（2026-08-10）：LHDC BQR/choppy/queue Hook 与 BQR 影子保护行在非录制期显示「等待状态」——机制已确认：四类 hook 事件（`lhdc.link.bqr_hooks` / `lhdc.governor.choppy_hooks` / `lhdc.governor.queue_hooks` / `lhdc.link.stage_d`）均已在 V3-15 豁免名单内，事件在**蓝牙进程启动**时打点；安装 APK 后需重启蓝牙进程（或重启手机）使新代码生效，重启后这些行应在无录制会话时即显示 hooked/armed。若重启后仍为等待状态，再抓反馈包排查。
 
