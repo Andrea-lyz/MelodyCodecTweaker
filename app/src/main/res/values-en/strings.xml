@@ -1,7 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_label">OPlus Headset Audio Helper</string>
-    <string name="app_description">Adds codec, quality, sample-rate and LE Audio controls to the OPPO / OnePlus / ColorOS Wireless Headset app, with a built-in diagnostics panel for feedback.</string>
 
     <string name="codec_block_title">Bluetooth audio</string>
     <string name="codec_display_title">Active codec</string>
