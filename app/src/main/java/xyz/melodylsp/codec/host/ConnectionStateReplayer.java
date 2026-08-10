@@ -11,6 +11,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.Handler;
 import android.os.Looper;
+import android.widget.Toast;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -948,6 +949,17 @@ public final class ConnectionStateReplayer {
                 "attempt", attempt,
                 "policy", policy,
                 "request", transportRequest);
+        if (CodecLabelTable.isLhdc(transportRequest.codecType)) {
+            String advisory = NativePatchAdvisory.replayToast(
+                    transportRequest.codecSpecific1 & 0xFFL);
+            if (advisory != null) {
+                Toast.makeText(context, advisory, Toast.LENGTH_SHORT).show();
+                MLog.event("replay.advisory",
+                        "mac", A2dpRouteReadiness.redactMac(mac),
+                        "attempt", attempt,
+                        "toast", advisory);
+            }
+        }
         bridge.setCodec(transportRequest, () -> isReplayStillCurrent(mac, stored, generation))
                 .whenComplete((result, throwable) -> {
             if (throwable != null) {

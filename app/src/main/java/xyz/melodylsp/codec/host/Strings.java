@@ -27,6 +27,8 @@ public final class Strings {
     public static final String BANNER_VIA_ROOT = "已通过 root 写入开发者选项并确认生效";
     public static final String TOAST_APPLY_FAILED = "切换未生效，请重试";
     public static final String TOAST_NATIVE_PATCH_UNSUPPORTED = "未适配，请联系开发者反馈";
+    public static final String TOAST_NATIVE_PATCH_PARTIAL =
+            "未完整适配，强行使用可能出现异常卡顿";
     public static final String TOAST_A2DP_WAITING = "等待耳机就绪";
     public static final String TOAST_CODEC_MODE_UNSUPPORTED = "当前耳机不支持高品质编解码器切换";
     public static final String TOAST_LHDC_CEILING_900 = "1Mbps码率应用失败，耳机侧报告限制最大码率为900kbps";

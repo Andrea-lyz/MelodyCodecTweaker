@@ -407,12 +407,16 @@ public final class CodecController {
         boolean nextUnsupported = "unsupported".equals(status)
                 && patched == 0
                 && original == 0;
+        boolean nextFastSwitchUnsupported = "unsupported".equals(fastSwitchStatus)
+                && fastSwitchPatched == 0
+                && fastSwitchOriginal == 0;
         boolean fastSwitchChanged = !fastSwitchStatus.equals(lastNativePatchFastSwitchStatus);
         boolean stateChanged = bitrateChanged
                 || nativePatchUnsupported != nextUnsupported
                 || fastSwitchChanged;
         lhdcGovernorBitrateKbps = Math.max(0, bitrateKbps);
         nativePatchUnsupported = nextUnsupported;
+        NativePatchAdvisory.update(nextUnsupported, nextFastSwitchUnsupported);
         lastNativePatchFastSwitchStatus = fastSwitchStatus;
         Object[] telemetry = {
                 "status", status,
@@ -1362,6 +1366,10 @@ public final class CodecController {
                         refreshSnapshot(sub);
                         return;
                     }
+                }
+                if (finalPreserveLhdcHighBits) {
+                    String advisory = NativePatchAdvisory.selectionToast(picked & 0xFFL);
+                    if (advisory != null) showPatchAdvisory(advisory, "picker");
                 }
                 CodecRequest.Builder builder = CodecRequest.fromActive(snapshot)
                         .withSpecific1(picked);
@@ -2405,9 +2413,17 @@ public final class CodecController {
                 || request == null
                 || !CodecLabelTable.isLhdc(request.codecType)) return false;
         long quality = request.codecSpecific1 & 0xFFL;
-        // The three user policies use AUTO/500 or the native governor and no longer depend on
-        // the legacy fixed-900/1000 instruction patch.
-        return quality == CodecLabelTable.LHDC_QUALITY_FIXED_900;
+        // 固定 900 与 1000（音质优先）统一纳入拒绝判定。
+        return NativePatchAdvisory.isFixedLhdcTier(quality);
+    }
+
+    private void showPatchAdvisory(String toast, String source) {
+        Toast.makeText(context, toast, Toast.LENGTH_SHORT).show();
+        MLog.event("native.patch.advisory",
+                "source", source,
+                "bitrate", NativePatchAdvisory.isBitrateUnsupported() ? "unsupported" : "ok",
+                "fast_switch",
+                NativePatchAdvisory.isFastSwitchUnsupported() ? "unsupported" : "ok");
     }
 
     private void showWriteFailedToastForSnapshot(CodecSnapshot snapshot) {

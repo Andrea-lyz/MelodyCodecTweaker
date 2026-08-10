@@ -14,6 +14,9 @@ android {
         versionName = "2.2.0"
         buildConfigField("String", "LHDC_GOVERNOR_MODE", "\"adaptive_governor\"")
         buildConfigField("boolean", "LHDC_DYN_OBSERVE", "false")
+        // Toast-matrix 设备验证开关（release 恒为 false；debug 可由 -P 覆盖，运行时还有 DEBUG 二次门控）
+        buildConfigField("boolean", "TOAST_TEST_BLOCK_BITRATE", "false")
+        buildConfigField("boolean", "TOAST_TEST_BLOCK_FAST_SWITCH", "false")
 
         externalNativeBuild {
             cmake {
@@ -47,6 +50,10 @@ android {
             isMinifyEnabled = false
             buildConfigField("String", "LHDC_GOVERNOR_MODE", "\"bqr_fallback_ab\"")
             buildConfigField("boolean", "LHDC_DYN_OBSERVE", "true")
+            buildConfigField("boolean", "TOAST_TEST_BLOCK_BITRATE",
+                    (project.findProperty("toastBlockBitrate") as String? ?: "false").toBoolean().toString())
+            buildConfigField("boolean", "TOAST_TEST_BLOCK_FAST_SWITCH",
+                    (project.findProperty("toastBlockFastSwitch") as String? ?: "false").toBoolean().toString())
             externalNativeBuild {
                 cmake {
                     arguments += "-DMELODY_FIXED_1000_AB=ON"
