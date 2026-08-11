@@ -77,10 +77,14 @@ final class NativeLhdcMemoryPatch {
      * PJZ110 16.0.8.301 (+ PLK110), PJZ110 16.0.9.401 (+ .402), PJZ110 16.0.10.501.
      * Group B (x28, x29-#0x60): PLC110 16.0.8.300, RMX6688. The reject/accept tails
      * (+0x90/+0x98) are structurally identical across all six builds, so only the
-     * register/stack-offset encodings differ.
+     * register/stack-offset encodings differ. Builds without an entry are handled by the
+     * semantic fallback in {@link #applySemanticQualitySwitchUnchecked}.
      *
-     * <p>These are intentionally exact whole-block signatures for the evidence builds. An OTA
-     * that recompiles the function is unsupported instead of receiving a guessed patch.</p>
+     * <p>These are intentionally exact whole-block signatures for the evidence builds and serve
+     * as the fast path. An OTA that recompiles the function keeps the block structure intact, so
+     * {@link #applySemanticQualitySwitchUnchecked} finds the same block semantically and applies
+     * the group's shared replacement; only a structural change to the block layout needs a new
+     * spec or a scanner variant.</p>
      */
     private static final CodeBlockSpec[] LHDC_V5_QUALITY_SWITCH_SPECS = {
             new CodeBlockSpec(
@@ -715,12 +719,14 @@ final class NativeLhdcMemoryPatch {
             PatchResult result = applyQualitySwitchSpecUnchecked(ranges, spec);
             if (result != null) return result;
         }
-        return PatchResult.unsupported(0, 0);
+        PatchResult semantic = applySemanticQualitySwitchUnchecked(ranges);
+        return semantic != null ? semantic : PatchResult.unsupported(0, 0);
     }
 
     /**
      * Applies one version-line spec when its whole-block signature uniquely matches the mapped
-     * library; returns null when this build is not the target (another spec may match).
+     * library; returns null when this build is not the target (another spec may match, or the
+     * caller falls back to the semantic scan).
      */
     private static PatchResult applyQualitySwitchSpecUnchecked(
             List<MapRange> ranges, CodeBlockSpec spec) throws Exception {
@@ -797,6 +803,162 @@ final class NativeLhdcMemoryPatch {
         appliedQualitySwitchSpecName = spec.name;
         return PatchResult.patched(originalAddress, patchedCount, originalCount, spec.name);
     }
+
+    /**
+     * Semantic fallback for the LHDC V5 fast-switch equivalence default block, mirroring the
+     * guard's {@link #scanSemanticGuard}. The block layout is structurally identical across all
+     * known version lines: entry {@code mov wN,#0x563}, {@code bl} at +0x64, {@code b +0x90}
+     * (accept: {@code mov wM,#1}; {@code strb}) at +0x68, two vendor-equals call slots
+     * (+0x6c..+0x8c) whose {@code tbz}/{@code tbnz} targets must agree with the accept/reject
+     * branches, and reject at +0x98. Only absolute-address instructions (adrp/add/adr/bl)
+     * change between builds. The CIE pointer register distinguishes group A (x21) from group B
+     * (x28), which selects the shared replacement block. A candidate is applied only when it is
+     * unique across all executable mappings. Trust boundary: the replacement compares x8 at
+     * block entry as the LHDC V5 codec id (as every known build passes it in x8), which cannot
+     * be validated from inside the block.
+     */
+    private static PatchResult applySemanticQualitySwitchUnchecked(List<MapRange> ranges)
+            throws Exception {
+        long address = 0L;
+        boolean groupB = false;
+        int count = 0;
+        for (MapRange range : ranges) {
+            if (!range.executable) continue;
+            byte[] bytes = readRange(range);
+            if (bytes == null) continue;
+            for (QualitySwitchMatch match : scanQualitySwitchImage(bytes)) {
+                count++;
+                if (count == 1) {
+                    address = range.start + match.offset;
+                    groupB = match.groupB;
+                }
+            }
+        }
+        if (count != 1) return null;
+
+        CodeBlockSpec template = qualitySwitchSpecForTestName(groupB
+                ? "lhdcv5_quality_equals_plc110_1608300"
+                : "lhdcv5_quality_equals_pjz110_1609401_1609402");
+        MapRange patchRange = findRange(ranges, address);
+        if (patchRange == null || address + template.patched.length > patchRange.end) {
+            return PatchResult.failed("patch_block_outside_mapping");
+        }
+        if (!patchRange.executable) {
+            return PatchResult.failed("patch_mapping_not_executable");
+        }
+        if ((address & 3L) != 0L || template.patched.length == 0
+                || (template.patched.length & 3) != 0) {
+            return PatchResult.failed("patch_block_not_aligned_arm64");
+        }
+        if (!ensureNativeLoaded()) {
+            return PatchResult.failed("native_helper_unavailable:" + nativeLoadError);
+        }
+
+        // The scan already validated the shape; pass the live bytes as the expected block so the
+        // native helper re-verifies the exact instruction stream before writing.
+        byte[] expected = readMemory(address, template.patched.length);
+        int nativeResult;
+        try {
+            nativeResult = nativePatchCodeBlock(
+                    address,
+                    expected,
+                    template.patched,
+                    template.safeGateInstruction,
+                    patchRange.protectionFlags());
+        } catch (Throwable t) {
+            return PatchResult.failed("native_patch_call_failed:" + describeThrowable(t));
+        }
+        if (nativeResult != NATIVE_PATCH_OK
+                && nativeResult != NATIVE_PATCH_ALREADY_APPLIED) {
+            return PatchResult.failed(describeNativePatchResult(nativeResult));
+        }
+
+        byte[] verify = readMemory(address, template.patched.length);
+        if (!equalsBytes(verify, template.patched)) {
+            return PatchResult.failed("verify_failed");
+        }
+        if (nativeResult == NATIVE_PATCH_ALREADY_APPLIED) {
+            appliedQualitySwitchSpecName = "semantic_quality_switch_v1";
+            return PatchResult.alreadyPatched(1, 0, "semantic_quality_switch_v1");
+        }
+        appliedQualitySwitchSpecName = "semantic_quality_switch_v1";
+        return PatchResult.patched(address, 0, 1, "semantic_quality_switch_v1");
+    }
+
+    /**
+     * Finds the LHDC V5 fast-switch equivalence default block by ARM64 instruction semantics
+     * instead of compiler-generated bytes. Every known OTA recompiles the block with different
+     * adrp/add/adr/bl immediates, but the 38-instruction window keeps the same layout, accept and
+     * reject targets, and group register. Visible for tests so each provided library must yield
+     * exactly one candidate.
+     */
+    static List<QualitySwitchMatch> scanQualitySwitchImage(byte[] bytes) {
+        List<QualitySwitchMatch> out = new ArrayList<>();
+        for (int offset = 0; offset + QUALITY_SWITCH_WINDOW_BYTES <= bytes.length; offset += 4) {
+            if (!isMovWImmediate(readIntLe(bytes, offset), 0x563)) continue;
+            QualitySwitchMatch match = matchQualitySwitchShape(bytes, offset);
+            if (match != null) out.add(match);
+        }
+        return out;
+    }
+
+    private static QualitySwitchMatch matchQualitySwitchShape(byte[] bytes, int rel) {
+        if (!isBl(readIntLe(bytes, rel + 0x64))) return null;
+        int tail = readIntLe(bytes, rel + 0x68);
+        if (!isUnconditionalBranch(tail)) return null;
+        if (branchTarget(rel + 0x68, tail, false) != rel + 0x90L) return null;
+        if (!isMovWImmediate(readIntLe(bytes, rel + 0x90), 1)) return null;
+        if (!isStrb(readIntLe(bytes, rel + 0x94))) return null;
+        // CIE pointer construction: sub x0, x29, #imm; the immediate is the group's stack
+        // offset (Group A #0x70, Group B #0x60) and must agree at both call slots.
+        int stackOffsetA = readIntLe(bytes, rel + 0x6c);
+        int stackOffsetB = readIntLe(bytes, rel + 0x80);
+        if (!isSubX29ToX0(stackOffsetA) || !isSubX29ToX0(stackOffsetB)) return null;
+        int stackImm = (stackOffsetA >>> 10) & 0xfff;
+        if (stackImm != 0x70 && stackImm != 0x60) return null;
+        if (((stackOffsetB >>> 10) & 0xfff) != stackImm) return null;
+        if (!isBl(readIntLe(bytes, rel + 0x74))) return null;
+        int tbz = readIntLe(bytes, rel + 0x78);
+        if (!isTbzW0Bit0(tbz)) return null;
+        if (tbzTarget(rel + 0x78, tbz) != rel + 0x90L) return null;
+        int rejectBranch = readIntLe(bytes, rel + 0x7c);
+        if (!isUnconditionalBranch(rejectBranch)) return null;
+        long reject = branchTarget(rel + 0x7c, rejectBranch, false);
+        if (reject != rel + 0x98L) return null;
+        if (!isBl(readIntLe(bytes, rel + 0x88))) return null;
+        int tbnz = readIntLe(bytes, rel + 0x8c);
+        if (!isTbnzW0Bit0(tbnz)) return null;
+        if (tbzTarget(rel + 0x8c, tbnz) != reject) return null;
+        // The reject path continues with an unsigned-offset byte load; pin it so the block
+        // really lands on the original function continuation instead of an arbitrary target.
+        if (!isLdrb(readIntLe(bytes, rel + 0x98))) return null;
+        boolean groupB;
+        if (isMovXRegister(readIntLe(bytes, rel + 0x70), 1, 21)
+                && isMovXRegister(readIntLe(bytes, rel + 0x84), 1, 21)) {
+            groupB = false;
+        } else if (isMovXRegister(readIntLe(bytes, rel + 0x70), 1, 28)
+                && isMovXRegister(readIntLe(bytes, rel + 0x84), 1, 28)) {
+            groupB = true;
+        } else {
+            return null;
+        }
+        // CIE pointer register and stack offset must agree on the same group.
+        if (groupB != (stackImm == 0x60)) return null;
+        return new QualitySwitchMatch(rel, groupB);
+    }
+
+    /** A semantic match inside one library image: relative offset and CIE register group. */
+    static final class QualitySwitchMatch {
+        final int offset;
+        final boolean groupB;
+
+        QualitySwitchMatch(int offset, boolean groupB) {
+            this.offset = offset;
+            this.groupB = groupB;
+        }
+    }
+
+    private static final int QUALITY_SWITCH_WINDOW_BYTES = 0x98;
 
     /**
      * Finds the LHDC fixed-bitrate guard by ARM64 instruction semantics instead of compiler-
@@ -892,13 +1054,52 @@ final class NativeLhdcMemoryPatch {
             int immediate) {
         int end = Math.min(bytes.length - 4, start + instructionCount * 4);
         for (int offset = start; offset <= end; offset += 4) {
-            int instruction = readIntLe(bytes, offset);
-            if ((instruction & 0xffe00000) == 0x52800000
-                    && ((instruction >>> 5) & 0xffff) == immediate) {
-                return true;
-            }
+            if (isMovWImmediate(readIntLe(bytes, offset), immediate)) return true;
         }
         return false;
+    }
+
+    private static boolean isMovWImmediate(int instruction, int immediate) {
+        return (instruction & 0xffe00000) == 0x52800000
+                && ((instruction >>> 5) & 0xffff) == immediate;
+    }
+
+    private static boolean isBl(int instruction) {
+        return (instruction & 0xfc000000) == 0x94000000;
+    }
+
+    private static boolean isStrb(int instruction) {
+        return (instruction & 0xffc00000) == 0x39000000;
+    }
+
+    private static boolean isLdrb(int instruction) {
+        return (instruction & 0xffc00000) == 0x39400000;
+    }
+
+    private static boolean isSubX29ToX0(int instruction) {
+        return (instruction & 0xffc00000) == 0xd1000000
+                && (instruction & 0x1f) == 0
+                && ((instruction >>> 5) & 0x1f) == 29;
+    }
+
+    private static boolean isMovXRegister(int instruction, int rd, int rn) {
+        // MOV alias as emitted by the OPlus compiler: ORR xd, xzr, xm.
+        return (instruction & 0xffe0ffe0) == 0xaa0003e0
+                && (instruction & 0x1f) == rd
+                && ((instruction >>> 5) & 0x1f) == 31
+                && ((instruction >>> 16) & 0x1f) == rn;
+    }
+
+    private static boolean isTbzW0Bit0(int instruction) {
+        return (instruction & 0xff000010) == 0x36000000
+                && (instruction & 0x1f) == 0
+                && ((instruction >>> 19) & 0x1f) == 0;
+    }
+
+    private static boolean isTbnzW0Bit0(int instruction) {
+        return (instruction & 0xff000010) == 0x37000000
+                && (instruction & 0x1f) == 0
+                && ((instruction >>> 19) & 0x1f) == 0;
     }
 
     private static boolean isCmpXImmediate(int instruction, int immediate) {
@@ -947,6 +1148,17 @@ final class NativeLhdcMemoryPatch {
     private static long branchTarget19(long address, int instruction) {
         int immediate = (instruction >>> 5) & 0x7ffff;
         if ((immediate & 0x40000) != 0) immediate |= 0xfff80000;
+        return address + ((long) immediate * 4L);
+    }
+
+    /**
+     * TBZ/TBNZ use a 14-bit signed branch offset (bits 18:5). The {@code isTbzW0Bit0}
+     * family pins bits 23:19 to zero, so the same bits hold imm14; kept separate from
+     * {@link #branchTarget19} to avoid inheriting imm19 sign semantics.
+     */
+    private static long tbzTarget(long address, int instruction) {
+        int immediate = (instruction >>> 5) & 0x3fff;
+        if ((immediate & 0x2000) != 0) immediate |= 0xffffc000;
         return address + ((long) immediate * 4L);
     }
 

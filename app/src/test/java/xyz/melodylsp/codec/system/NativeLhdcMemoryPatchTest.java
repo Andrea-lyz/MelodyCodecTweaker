@@ -212,6 +212,77 @@ public final class NativeLhdcMemoryPatchTest {
         }
     }
 
+    @Test
+    public void semanticQualitySwitchScanFindsKnownBlocksUniquely() throws Exception {
+        File root = findWorkspaceRoot();
+        if (root == null) return;
+        String[][] samples = {
+                {"lhdcv5_quality_equals_op15",
+                        "OnePlus 15/libbluetooth_jni_op15.so", "A"},
+                {"lhdcv5_quality_equals_op15",
+                        "OnePlus Ace 6T C16.0.7.201/libbluetooth_jni.so", "A"},
+                {"lhdcv5_quality_equals_pjz110_1608301",
+                        "PJZ110_16.0.8.301/libbluetooth_jni.so", "A"},
+                {"lhdcv5_quality_equals_pjz110_1608301",
+                        "PLK110_16.0.8.301(CN01)/libbluetooth_jni.so", "A"},
+                {"lhdcv5_quality_equals_pjz110_1609401_1609402",
+                        "PJZ110_16.0.9.401/libbluetooth_jni.so", "A"},
+                {"lhdcv5_quality_equals_pjz110_1610501",
+                        "PJZ110_16.0.10.501/libbluetooth_jni.so", "A"},
+                {"lhdcv5_quality_equals_plc110_1608300",
+                        "PLC110_16.0.8.300(CN01B90P01)/libbluetooth_jni.so", "B"},
+                {"lhdcv5_quality_equals_rmx6688",
+                        "realme RMX6688/libbluetooth_jni.so", "B"},
+        };
+        for (String[] sample : samples) {
+            File lib = new File(root, sample[1]);
+            if (!lib.isFile()) continue;
+            byte[] image = Files.readAllBytes(lib.toPath());
+            java.util.List<NativeLhdcMemoryPatch.QualitySwitchMatch> hits =
+                    NativeLhdcMemoryPatch.scanQualitySwitchImage(image);
+            assertEquals(sample[0] + " must match semantically exactly once in " + sample[1],
+                    1, hits.size());
+            assertEquals(sample[0] + " group in " + sample[1],
+                    "B".equals(sample[2]), hits.get(0).groupB);
+            NativeLhdcMemoryPatch.CodeBlockSpec spec =
+                    NativeLhdcMemoryPatch.qualitySwitchSpecForTestName(sample[0]);
+            // Byte equality holds for these evidence builds only; a future OTA would match
+            // semantically with different bytes and is covered by the uniqueness assertion.
+            byte[] found = java.util.Arrays.copyOfRange(
+                    image, hits.get(0).offset, hits.get(0).offset + spec.original.length);
+            assertTrue(sample[0] + " found bytes must equal spec original in " + sample[1],
+                    java.util.Arrays.equals(spec.original, found));
+        }
+    }
+
+    @Test
+    public void semanticQualitySwitchScanRejectsMutatedShapes() throws Exception {
+        File root = findWorkspaceRoot();
+        if (root == null) return;
+        File lib = new File(root, "PJZ110_16.0.10.501/libbluetooth_jni.so");
+        if (!lib.isFile()) return;
+        byte[] image = Files.readAllBytes(lib.toPath());
+        java.util.List<NativeLhdcMemoryPatch.QualitySwitchMatch> hits =
+                NativeLhdcMemoryPatch.scanQualitySwitchImage(image);
+        assertEquals(1, hits.size());
+        int offset = hits.get(0).offset;
+        // Patched-style tail delta (+0x28 -> +0x30) must no longer match the original shape.
+        byte[] tailMutated = image.clone();
+        writeIntLe(tailMutated, offset + 0x68, 0x0c000014);
+        assertEquals(0, NativeLhdcMemoryPatch.scanQualitySwitchImage(tailMutated).size());
+        // Wrong entry constant must be rejected.
+        byte[] entryMutated = image.clone();
+        writeIntLe(entryMutated, offset, 0x52800028); // mov w8, #1
+        assertEquals(0, NativeLhdcMemoryPatch.scanQualitySwitchImage(entryMutated).size());
+    }
+
+    private static void writeIntLe(byte[] bytes, int offset, int value) {
+        bytes[offset] = (byte) value;
+        bytes[offset + 1] = (byte) (value >>> 8);
+        bytes[offset + 2] = (byte) (value >>> 16);
+        bytes[offset + 3] = (byte) (value >>> 24);
+    }
+
     private static NativeLhdcMemoryPatch.PatternSpec findSpec(String name) {
         for (NativeLhdcMemoryPatch.PatternSpec spec : NativeLhdcMemoryPatch.patternsForTest()) {
             if (spec.name.equals(name)) return spec;
@@ -220,6 +291,13 @@ public final class NativeLhdcMemoryPatchTest {
     }
 
     private static File findWorkspaceRoot() {
+        // Local runs through the ASCII junction (E:\melody-lsp-link) cannot walk up to the
+        // real workspace root; point the tests at the research folder explicitly instead.
+        String override = System.getenv("MELODY_NATIVE_RESEARCH_DIR");
+        if (override != null && !override.isEmpty()) {
+            File candidate = new File(override);
+            if (candidate.isDirectory()) return candidate;
+        }
         File dir = new File(System.getProperty("user.dir", "."));
         for (int i = 0; i < 6 && dir != null; i++) {
             File candidate = new File(dir, "native_research");
