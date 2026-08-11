@@ -309,7 +309,10 @@ adb logcat -v time MelodyCodecLsp:V LSPosedFramework:I '*:S' | grep 'lhdc.memory
 ```text
 evt=lhdc.memory_patch.native_loaded path=.../libmelody_lhdc_patch.so
 evt=lhdc.memory_patch status=patched detail=pattern=branch_plus_69 ... success=true
+evt=lhdc.memory_patch.fast_switch status=patched detail=pattern=semantic_quality_switch_v1 ... success=true
 ```
+
+没有精确签名的新 OTA 重编译上，快切等价补丁会由语义扫描兜底命中，`detail=pattern=semantic_quality_switch_v1` 表示走的是语义路径；精确签名命中时则显示对应版本线 spec 名。
 
 如果蓝牙进程已经被补过，可能显示：
 
@@ -323,7 +326,7 @@ evt=lhdc.memory_patch status=already_patched ... success=true
 evt=lhdc.memory_patch status=unsupported ... patched=0 original=0 success=false
 ```
 
-这种情况不会替换系统文件，也不会强行写入未知地址。请提供反馈包或对应 `libbluetooth_jni.so`，后续可以按新库族补充 pattern。反馈包里的 `diagnostics.txt`、`timeline.txt`、`events.jsonl` 会记录 native patch 状态。
+这种情况不会替换系统文件，也不会强行写入未知地址。结构不变的重编译（只改 adrp/add/adr/bl 立即数）通常会被语义扫描自动覆盖，无需反馈；只有块的布局结构真正变化、语义扫描也无法唯一命中时，才需要提供反馈包或对应 `libbluetooth_jni.so`，用于扩展语义扫描器或补充结构变体。反馈包里的 `diagnostics.txt`、`timeline.txt`、`events.jsonl` 会记录 native patch 状态。
 
 在支持 1 Mbps 的耳机链路上，策略写入成功后会看到 `quality_mode=HIGH1_1000(8)`；开始播放后摘要显示的是治理器回读到的实时码率。环境不支持 1000 kbps 时，治理器可能稳定停留在 900、500 或 400 kbps，这仍属于「音质优先」策略，而不是回落成「自适应」。若当前耳机或系统组合只向蓝牙栈暴露到 900 kbps，模块也会把 900 kbps 作为音质优先的有效确认结果。
 
