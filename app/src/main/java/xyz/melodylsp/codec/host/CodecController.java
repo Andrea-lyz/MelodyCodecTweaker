@@ -401,6 +401,12 @@ public final class CodecController {
         int fastSwitchOriginal = intent.getIntExtra(
                 CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_ORIGINAL, -1);
         if (fastSwitchStatus == null) fastSwitchStatus = "";
+        String fastSwitchDetail = intent.getStringExtra(
+                CodecIpc.EXTRA_NATIVE_PATCH_FAST_SWITCH_DETAIL);
+        String fastSwitchSpec = fastSwitchDetail != null
+                && fastSwitchDetail.startsWith("pattern=")
+                ? fastSwitchDetail.substring("pattern=".length())
+                : "";
         int bitrateKbps = intent.getIntExtra(
                 CodecIpc.EXTRA_LHDC_GOVERNOR_BITRATE_KBPS, 0);
         boolean bitrateChanged = lhdcGovernorBitrateKbps != bitrateKbps;
@@ -425,6 +431,7 @@ public final class CodecController {
                 "fast_switch", fastSwitchStatus,
                 "fast_switch_patched", fastSwitchPatched,
                 "fast_switch_original", fastSwitchOriginal,
+                "fast_switch_spec", fastSwitchSpec,
                 "bitrateKbps", lhdcGovernorBitrateKbps,
                 "unsupported", nativePatchUnsupported
         };
