@@ -16,7 +16,7 @@
 
 模块主要服务于 ColorOS / OPlus 系设备上的 `com.oplus.melody`，同时配合 `com.android.bluetooth` 和 `com.oplus.wirelesssettings` 作用域完成更稳定的状态读取和写入。
 
-## 2.3.1 更新重点
+## 2.4.0 更新重点
 
 **LHDC V5 快切等价补丁新增语义扫描兜底（PJZ110 16.0.10.501 真机验证）**
 
@@ -27,7 +27,7 @@
 
 **文档**
 
-- 新增《LHDC V5 Native 补丁新版本线适配指南》（`docs/native-patch-adaptation-guide.md`）：适配决策树、脚本命令、唯一性验收与设备验证清单，后续 OTA 重编译可直接按流程适配。
+- 更新《LHDC V5 Native 补丁新版本线适配指南》（`docs/native-patch-adaptation-guide.md`）：适配决策表改为「精确签名优先 + 语义兜底」，结构不变的重编译无需人工适配。
 
 ## 支持作者
 
