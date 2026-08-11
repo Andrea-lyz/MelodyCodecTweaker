@@ -10,8 +10,8 @@ android {
         applicationId = "xyz.melodylsp.codec"
         minSdk = 31
         targetSdk = 36
-        versionCode = 24
-        versionName = "2.3.0"
+        versionCode = 25
+        versionName = "2.3.1"
         buildConfigField("String", "LHDC_GOVERNOR_MODE", "\"adaptive_governor\"")
         buildConfigField("boolean", "LHDC_DYN_OBSERVE", "false")
         // Toast-matrix 设备验证开关（release 恒为 false；debug 可由 -P 覆盖，运行时还有 DEBUG 二次门控）
