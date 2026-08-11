@@ -17,13 +17,15 @@
 | 场景 | guard 字节 | 快切块字节 | 动作 |
 | --- | --- | --- | --- |
 | A | 命中现有表 | 命中现有表 | 零代码改动（可选：仅补文档） |
-| B | 命中现有表 | 新字节 | 只加 `CodeBlockSpec`（16.0.10.501 即此场景） |
-| C | 新字节但语义扫描唯一 | 新字节 | 加 `PatternSpec` + `CodeBlockSpec` |
+| B | 命中现有表 | 新字节但结构不变 | 零代码改动（语义兜底自动覆盖；可选加 `CodeBlockSpec` 便于诊断标注版本线） |
+| C | 新字节但语义扫描唯一 | 新字节 | 加 `PatternSpec`（guard）；快切块结构不变则无需加 spec |
 | D | 语义扫描不唯一 | 任意 | 停止，不写未知地址（设计行为 `unsupported`） |
 
-注意：码率 branch guard 有语义扫描兜底（`semantic_guard_v1`），不加 `PatternSpec` 也能
-工作；加它的价值是诊断页能标注具体版本线。快切等价块**没有**语义兜底，OTA 重编译后
-报 `unsupported` 是设计行为，必须按本指南人工适配。
+注意：码率 branch guard 有语义扫描兜底（`semantic_guard_v1`）；快切等价块同样有
+语义兜底（`scanQualitySwitchImage` / `semantic_quality_switch_v1`）。两者都是
+「精确签名优先 + 语义兜底」，结构不变的重编译（只变 adrp/add/adr/bl 立即数）通常
+**无需人工适配**；只有块的布局结构真正变化、语义扫描不再唯一命中时才需要人工介入
+（此时通常要扩展语义扫描器或新增结构变体，而不是加字节 spec）。
 
 ## 1. 样本准备
 
@@ -33,7 +35,7 @@
 - 可选：写 `manifest.txt`（设备 / 构建 / 指纹），参照
   `native_research/PJZ110_16.0.10.501/manifest.txt`。
 
-## 2. 定位快切等价块（核心，无兜底）
+## 2. 定位快切等价块（核心；已有语义兜底，人工定位仅用于结构变化时）
 
 1. 搜索块入口签名 `68ac8052`（`mov w8, #0x563`，default unsupported 块第一条）。
    骁龙线入口约在 0xA0xxxx（16.0.8.301@0xa0a1e4、16.0.9.401@0xa0a4e4、
@@ -100,9 +102,15 @@
    （数量随表增长）。
 2. 附录命令跑唯一性检查。
 3. Gradle 单测（走 ASCII junction，避开中文路径 AIDL 的 GBK 问题）：
-   `cd E:\melody-lsp-link` 后
-   `.\gradlew.bat :app:testDebugUnitTest --tests xyz.melodylsp.codec.system.NativeLhdcMemoryPatchTest`
-   预期 BUILD SUCCESSFUL、全部通过（含新增测试）。
+   从 junction 运行时 `findWorkspaceRoot` 找不到真实工作区的 `native_research`，
+   必须先设置环境变量（测试 JVM 会继承）：
+   ```powershell
+   cd E:\melody-lsp-link
+   $env:MELODY_NATIVE_RESEARCH_DIR = "E:\我开发的模块\无线耳机-音频质量开关\native_research"
+   .\gradlew.bat :app:testDebugUnitTest --tests xyz.melodylsp.codec.system.NativeLhdcMemoryPatchTest
+   ```
+   预期 BUILD SUCCESSFUL、全部通过（含新增测试）；不要直接在中文路径下跑 Gradle
+   （测试 JVM 类路径会因编码问题报 ClassNotFoundException）。
 4. 不做完整 assembleRelease（过度验证）；需要测试 APK 时参照 RMX6688 流程
    （临时改 versionName、junction 构建、aapt2/apksigner 校验、用后还原）。
 
@@ -119,14 +127,16 @@
 - 骁龙线样本 vaddr == file offset，语义脚本直接可用；不要假设其他平台也这样。
 - 块字节必然不同：`adrp/add/adr/bl` 是绝对地址，OTA 重编译必变；结构等价才是
   判断依据，不要期待整块字节相同。
-- 快切块无语义兜底：新 OTA 报 unsupported 是设计行为（README 已说明），按本指南补
-  spec 即可。
+- 快切块有语义兜底：新 OTA 若只是重编译（结构不变）会自动适配，诊断报
+  `unsupported` 说明布局结构真的变了，需要按本指南分析结构差异并扩展语义扫描器，
+  而不是补字节 spec。
 - Group A/B 的 patched 块不同（`+0x14`/`+0x50` 编码差异），选错组会在设备上报
   `verify_failed`。
 - 同字节模式改名合并时，README「补丁流程」变体列表要同步。
 - 中文路径构建报 `MalformedInputException` 时一律走 `E:\melody-lsp-link` junction
   （junction 指向 module，改动自动共享）。
-- 新样本目录放好后再跑测试：`findWorkspaceRoot` 自动向上查找并覆盖新目录。
+- 新样本目录放好后再跑测试：`findWorkspaceRoot` 自动向上查找并覆盖新目录（junction
+  构建时用 `MELODY_NATIVE_RESEARCH_DIR` 环境变量显式指定）。
 
 ## 附录 A：常用命令（PowerShell）
 
