@@ -52,7 +52,7 @@ final class NativeLhdcMemoryPatch {
                     4,
                     hex("49000014")),
             new PatternSpec(
-                    "branch_plus_68_pjz110_1609401",
+                    "branch_plus_68_pjz110_1609401_1610501",
                     hex("1f0900f182080054a83e80529a008052"),
                     hex("1f0900f144000014a83e80529a008052"),
                     4,
@@ -74,9 +74,10 @@ final class NativeLhdcMemoryPatch {
      * original restart path.
      *
      * <p>Group A (CIE pointer x21, CIE on stack x29-#0x70): OP15/Ace6T 16.0.7.201,
-     * PJZ110 16.0.8.301 (+ PLK110), PJZ110 16.0.9.401 (+ .402). Group B (x28, x29-#0x60):
-     * PLC110 16.0.8.300, RMX6688. The reject/accept tails (+0x90/+0x98) are structurally
-     * identical across all five builds, so only the register/stack-offset encodings differ.
+     * PJZ110 16.0.8.301 (+ PLK110), PJZ110 16.0.9.401 (+ .402), PJZ110 16.0.10.501.
+     * Group B (x28, x29-#0x60): PLC110 16.0.8.300, RMX6688. The reject/accept tails
+     * (+0x90/+0x98) are structurally identical across all six builds, so only the
+     * register/stack-offset encodings differ.
      *
      * <p>These are intentionally exact whole-block signatures for the evidence builds. An OTA
      * that recompiles the function is unsupported instead of receiving a guessed patch.</p>
@@ -88,6 +89,17 @@ final class NativeLhdcMemoryPatch {
                             + "a90302d11f2003d50aa60210a93900f9aaa107a929008052aa0301d141b0ff90"
                             + "21b4139183b5ffd0638c2a91a26302d1a5c302d1c000805264038052a92900a9"
                             + "a80900f99d2b17940a000014"),
+                    hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa0359385f350071a1030054"
+                            + "aa2359385ffd037141030054aa3359b84ba780525f010b6bc1020054aa735978"
+                            + "ab8689525f010b6b41020054aa9359b8ab9240b84a010b4aabe680520b02b872"
+                            + "5f010b6a610100540c000014"),
+                    0x14000024),
+            new CodeBlockSpec(
+                    "lhdcv5_quality_equals_pjz110_1610501",
+                    hex("68ac805289b2ffb029450291a88316b8c8b1ffb008550891a92102a9e8018052"
+                            + "a90302d11f2003d50aa60210a93900f9aaa107a929008052aa0301d121b0ffd0"
+                            + "21c0169183b5ffb063580a91a26302d1a5c302d1c000805264038052a92900a9"
+                            + "a80900f9a13117940a000014"),
                     hex("e95f87d2a9a0a6f28909c0f21f0109eb01040054aa0359385f350071a1030054"
                             + "aa2359385ffd037141030054aa3359b84ba780525f010b6bc1020054aa735978"
                             + "ab8689525f010b6b41020054aa9359b8ab9240b84a010b4aabe680520b02b872"

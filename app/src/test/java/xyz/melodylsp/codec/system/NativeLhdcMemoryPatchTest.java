@@ -124,10 +124,25 @@ public final class NativeLhdcMemoryPatchTest {
     }
 
     @Test
+    public void qualitySwitchPatternMatchesPjz110501UniquelyWhenLibraryAvailable()
+            throws Exception {
+        File root = findWorkspaceRoot();
+        if (root == null) return;
+        File lib = new File(root, "PJZ110_16.0.10.501/libbluetooth_jni.so");
+        if (!lib.isFile()) return;
+        byte[] image = Files.readAllBytes(lib.toPath());
+        NativeLhdcMemoryPatch.CodeBlockSpec spec =
+                NativeLhdcMemoryPatch.qualitySwitchSpecForTestName(
+                        "lhdcv5_quality_equals_pjz110_1610501");
+        assertEquals(1, countMatches(image, spec.original));
+        assertEquals(0, countMatches(image, spec.patched));
+    }
+
+    @Test
     public void allQualitySwitchSpecsAreBoundedConsistentAndDistinct() {
         NativeLhdcMemoryPatch.CodeBlockSpec[] specs =
                 NativeLhdcMemoryPatch.qualitySwitchSpecsForTest();
-        assertEquals(5, specs.length);
+        assertEquals(6, specs.length);
         java.util.Set<String> names = new java.util.HashSet<>();
         for (int i = 0; i < specs.length; i++) {
             NativeLhdcMemoryPatch.CodeBlockSpec spec = specs[i];
@@ -177,6 +192,8 @@ public final class NativeLhdcMemoryPatchTest {
                 {"lhdcv5_quality_equals_op15", "OnePlus 15/libbluetooth_jni_op15.so"},
                 {"lhdcv5_quality_equals_pjz110_1608301",
                         "PJZ110_16.0.8.301/libbluetooth_jni.so"},
+                {"lhdcv5_quality_equals_pjz110_1610501",
+                        "PJZ110_16.0.10.501/libbluetooth_jni.so"},
                 {"lhdcv5_quality_equals_plc110_1608300",
                         "PLC110_16.0.8.300(CN01B90P01)/libbluetooth_jni.so"},
                 {"lhdcv5_quality_equals_rmx6688",
