@@ -427,4 +427,34 @@ public final class NativeLhdcMemoryPatchTest {
                 NativeLhdcMemoryPatch.verificationTextForNativeState(6));
         assertEquals("unknown", NativeLhdcMemoryPatch.verificationTextForNativeState(99));
     }
+
+    @Test
+    public void preNativePatchBuildLineIsDetectedFromDisplay() {
+        // 非金标（< 16.0.7.x）：LHDC V5 原生可用，短路补丁流程
+        assertTrue(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJD110_16.0.3.500(CN01)"));
+        assertTrue(NativeLhdcMemoryPatch.isPreNativePatchBuild("OP5929L1_16.0.3.500(CN01)"));
+        assertTrue(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJD110_16.0.6.999(CN01)"));
+        assertTrue(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJD110_15.0.1.100(CN01)"));
+        // 金标线起（>= 16.0.7.0）：继续 pattern 扫描（已适配与未适配的 OTA 都要真实上报）
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("OP15_16.0.7.201(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("RMX6688_16.0.7.500(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJZ110_16.0.8.301(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJZ110_16.0.9.401(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJZ110_16.0.10.501(CN01)"));
+        // 无法解析版本线时不拦截：交给 pattern 扫描决定（不猜测）
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("BP2A.250605.015"));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild(""));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild(null));
+    }
+
+    @Test
+    public void preNativePatchVersionLineParsesOnlyOplusShapedSegments() {
+        int[] v = NativeLhdcMemoryPatch.parseColorOsVersionLine("PJD110_16.0.3.500(CN01)");
+        assertEquals(16, v[0]);
+        assertEquals(0, v[1]);
+        assertEquals(3, v[2]);
+        assertEquals(500, v[3]);
+        assertEquals(null, NativeLhdcMemoryPatch.parseColorOsVersionLine("BP2A.250605.015"));
+        assertEquals(null, NativeLhdcMemoryPatch.parseColorOsVersionLine(null));
+    }
 }

@@ -4,6 +4,7 @@ import xyz.melodylsp.codec.BuildConfig;
 
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
+import android.os.Build;
 import android.system.OsConstants;
 
 import java.io.BufferedReader;
@@ -15,6 +16,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.util.MLog;
@@ -203,6 +206,54 @@ final class NativeLhdcMemoryPatch {
         }
     }
 
+    /**
+     * ColorOS 16 重构蓝牙栈的起始版本线：16.0.7.x 起固定码率写入被忽略、LHDC V5 equality
+     * 漏接（docs/native-patch-adoption-plan.md §1）。更早版本线的 LHDC V5 为系统原生行为，
+     * 无需内存补丁。
+     */
+    private static final int[] NATIVE_PATCH_MIN_BUILD_LINE = {16, 0, 7, 0};
+
+    /** 匹配 OPlus 构建显示名中的 ColorOS 版本线，如 PJD110_16.0.3.500(CN01) 的 16.0.3.500。 */
+    private static final Pattern COLOROS_VERSION_LINE =
+            Pattern.compile("([0-9]{1,4})[.]([0-9]{1,4})[.]([0-9]{1,4})[.]([0-9]{1,4})");
+
+    /**
+     * 解析构建显示名（{@code Build.DISPLAY}）中的 ColorOS 版本线并判定是否需要内存补丁：
+     * 版本线 < 16.0.7.0（含 ColorOS 15.x）返回 true（原生支持，短路补丁流程）；
+     * >= 16.0.7.0 返回 false（继续 pattern 扫描）；解析不出版本线时返回 false，
+     * 交给 pattern 扫描决定，保持「宁可报 unsupported 也不猜测」的漂移策略。
+     */
+    static boolean isPreNativePatchBuild(String display) {
+        int[] version = parseColorOsVersionLine(display);
+        return version != null && compareVersionLines(version, NATIVE_PATCH_MIN_BUILD_LINE) < 0;
+    }
+
+    static int[] parseColorOsVersionLine(String display) {
+        if (display == null) return null;
+        Matcher matcher = COLOROS_VERSION_LINE.matcher(display);
+        if (!matcher.find()) return null;
+        try {
+            return new int[] {
+                    Integer.parseInt(matcher.group(1)),
+                    Integer.parseInt(matcher.group(2)),
+                    Integer.parseInt(matcher.group(3)),
+                    Integer.parseInt(matcher.group(4))
+            };
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static int compareVersionLines(int[] left, int[] right) {
+        int len = Math.max(left.length, right.length);
+        for (int i = 0; i < len; i++) {
+            int l = i < left.length ? left[i] : 0;
+            int r = i < right.length ? right[i] : 0;
+            if (l != r) return l < r ? -1 : 1;
+        }
+        return 0;
+    }
+
     static synchronized PatchResult apply() {
         // Toast-matrix 设备验证门：debug 构建且显式开启时模拟补丁未适配（release 恒 false，
         // 且此处 DEBUG 二次门控保证 release 永不生效）。
@@ -210,6 +261,14 @@ final class NativeLhdcMemoryPatch {
             PatchResult blocked = PatchResult.unsupported(0, 0);
             lastResult = blocked;
             return blocked;
+        }
+        // 非金标版本线（< 16.0.7.x）：LHDC V5 固定码率与快切等价均为系统原生行为，不需要
+        // 内存补丁。扫描不到 pattern 是预期结果，不能按 unsupported 上报（宿主会把
+        // unsupported 当成「未适配」弹提醒并显示红叉）。
+        if (isPreNativePatchBuild(Build.DISPLAY)) {
+            PatchResult nativeSupported = PatchResult.notRequired("native_lhdc_v5_available");
+            lastResult = nativeSupported;
+            return nativeSupported;
         }
         PatchResult result;
         try {
@@ -231,6 +290,11 @@ final class NativeLhdcMemoryPatch {
             PatchResult blocked = PatchResult.unsupported(0, 0);
             lastQualitySwitchResult = blocked;
             return blocked;
+        }
+        if (isPreNativePatchBuild(Build.DISPLAY)) {
+            PatchResult nativeSupported = PatchResult.notRequired("native_lhdc_v5_available");
+            lastQualitySwitchResult = nativeSupported;
+            return nativeSupported;
         }
         PatchResult result;
         try {
@@ -1447,6 +1511,10 @@ final class NativeLhdcMemoryPatch {
         static PatchResult unsupported(int patchedCount, int originalCount) {
             return new PatchResult("unsupported", "", 0L, patchedCount, originalCount,
                     true, false);
+        }
+
+        static PatchResult notRequired(String reason) {
+            return new PatchResult("not_required", reason, 0L, 0, 0, true, true);
         }
 
         static PatchResult pending(String reason) {
