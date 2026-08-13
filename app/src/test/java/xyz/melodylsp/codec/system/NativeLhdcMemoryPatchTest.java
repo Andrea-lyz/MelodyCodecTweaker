@@ -441,8 +441,18 @@ public final class NativeLhdcMemoryPatchTest {
         assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJZ110_16.0.8.301(CN01)"));
         assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJZ110_16.0.9.401(CN01)"));
         assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJZ110_16.0.10.501(CN01)"));
+        // 阈值精确相等不短路：16.0.7.0 本身仍走 pattern 扫描
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJD110_16.0.7.0(CN01)"));
+        // 版本线前出现其它 4 段数字时仍锚定「型号_版本线(地区)」形状，取正确的版本线
+        assertTrue(NativeLhdcMemoryPatch.isPreNativePatchBuild(
+                "PJD110_2026.08.13.999_16.0.3.500(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild(
+                "PJD110_2026.08.13.999_16.0.9.401(CN01)"));
+        // 地区后缀非 CN 的全球版同样短路
+        assertTrue(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJD110_16.0.3.500(IN01)"));
         // 无法解析版本线时不拦截：交给 pattern 扫描决定（不猜测）
         assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("BP2A.250605.015"));
+        assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild("PJD110_16.0.3.500"));
         assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild(""));
         assertFalse(NativeLhdcMemoryPatch.isPreNativePatchBuild(null));
     }
@@ -455,6 +465,7 @@ public final class NativeLhdcMemoryPatchTest {
         assertEquals(3, v[2]);
         assertEquals(500, v[3]);
         assertEquals(null, NativeLhdcMemoryPatch.parseColorOsVersionLine("BP2A.250605.015"));
+        assertEquals(null, NativeLhdcMemoryPatch.parseColorOsVersionLine("PJD110_16.0.3.500"));
         assertEquals(null, NativeLhdcMemoryPatch.parseColorOsVersionLine(null));
     }
 }

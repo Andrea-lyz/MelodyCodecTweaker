@@ -326,6 +326,14 @@ evt=lhdc.memory_patch status=already_patched ... success=true
 evt=lhdc.memory_patch status=unsupported ... patched=0 original=0 success=false
 ```
 
+系统版本低于 16.0.7（LHDC V5 为系统原生行为，无需内存补丁）时不会扫描，直接短路上报：
+
+```text
+evt=lhdc.memory_patch status=not_required detail=native_lhdc_v5_available ... success=true
+```
+
+这种情况下诊断页「码率 branch 补丁」「快切等价补丁」两行显示绿勾（原生支持），切换音质优先不会再出现「未适配」提醒。
+
 这种情况不会替换系统文件，也不会强行写入未知地址。结构不变的重编译（只改 adrp/add/adr/bl 立即数）通常会被语义扫描自动覆盖，无需反馈；只有块的布局结构真正变化、语义扫描也无法唯一命中时，才需要提供反馈包或对应 `libbluetooth_jni.so`，用于扩展语义扫描器或补充结构变体。反馈包里的 `diagnostics.txt`、`timeline.txt`、`events.jsonl` 会记录 native patch 状态。
 
 在支持 1 Mbps 的耳机链路上，策略写入成功后会看到 `quality_mode=HIGH1_1000(8)`；开始播放后摘要显示的是治理器回读到的实时码率。环境不支持 1000 kbps 时，治理器可能稳定停留在 900、500 或 400 kbps，这仍属于「音质优先」策略，而不是回落成「自适应」。若当前耳机或系统组合只向蓝牙栈暴露到 900 kbps，模块也会把 900 kbps 作为音质优先的有效确认结果。

@@ -213,9 +213,13 @@ final class NativeLhdcMemoryPatch {
      */
     private static final int[] NATIVE_PATCH_MIN_BUILD_LINE = {16, 0, 7, 0};
 
-    /** 匹配 OPlus 构建显示名中的 ColorOS 版本线，如 PJD110_16.0.3.500(CN01) 的 16.0.3.500。 */
+    /**
+     * 匹配 OPlus 构建显示名「型号_版本线(地区)」形状中的 ColorOS 版本线，如
+     * PJD110_16.0.3.500(CN01) 的 16.0.3.500。两侧锚定避免误取显示名里其它 4 段数字；
+     * 形状不符（如缺少地区后缀）时不匹配，保持保守、不短路补丁流程。
+     */
     private static final Pattern COLOROS_VERSION_LINE =
-            Pattern.compile("([0-9]{1,4})[.]([0-9]{1,4})[.]([0-9]{1,4})[.]([0-9]{1,4})");
+            Pattern.compile("_([0-9]{1,4})[.]([0-9]{1,4})[.]([0-9]{1,4})[.]([0-9]{1,4})[(]");
 
     /**
      * 解析构建显示名（{@code Build.DISPLAY}）中的 ColorOS 版本线并判定是否需要内存补丁：

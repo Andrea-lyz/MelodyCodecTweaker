@@ -845,7 +845,7 @@ public final class DiagnosticEvents {
         return "V";
     }
 
-    private static String stateFromMessage(String message) {
+    static String stateFromMessage(String message) {
         if (message.contains("success=true")
                 || message.contains("outcome=CONFIRMED")
                 || message.contains("evt=replay.stable")
@@ -897,7 +897,7 @@ public final class DiagnosticEvents {
     }
 
     /** Maps a raw patch status value (patched/already_patched/pending/failed/unsupported). */
-    private static String stateFromPatchStatus(String status) {
+    static String stateFromPatchStatus(String status) {
         if ("patched".equals(status) || "already_patched".equals(status)) return "ok";
         if ("not_required".equals(status)) return "ok";
         if ("pending".equals(status)) return "pending";
