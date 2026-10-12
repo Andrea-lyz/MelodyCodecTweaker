@@ -738,6 +738,7 @@ public final class CodecController {
             return;
         }
 
+        MLog.event("le.melody.dialog", "builder", "framework");
         AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
                 .setTitle(title)
                 .setMessage(message)
@@ -796,6 +797,8 @@ public final class CodecController {
                 "E4.b",
                 "h1.e",
                 "com.oplus.melody.common.widget.MelodyAlertDialogBuilder",
+                "u7.b",
+                "W2.h",
                 "o6.C1381b",
                 "o6.b",
                 "B2.e"
@@ -1658,6 +1661,11 @@ public final class CodecController {
                 },
                 {
                         "Y1.C0480e", "Y1.o", "f", "f5923g", "f5924h", "f5840v"
+                },
+                {
+                        // ColorOS 17 / Melody 17.6.3 (names verified against the shipped dex):
+                        // COUIPopupListWindow + PopupListItem, fields resolved by reflection.
+                        "com.coui.appcompat.poplist.b", "d3.r", "h", "i", "j", "E"
                 }
         };
         for (String[] binding : bindings) {
@@ -1800,7 +1808,7 @@ public final class CodecController {
                 }
                 Class<?> parent = popupClass.getSuperclass();
                 if (parent == null
-                        || !"com.coui.appcompat.poplist.a".equals(parent.getName())
+                        || !isCouiPopupBaseClass(parent)
                         || !PopupWindow.class.isAssignableFrom(popupClass)
                         || findCouiSetItemsMethod(popupClass) == null
                         || findCouiPopupShowMethod(popupClass) == null) {
@@ -1840,6 +1848,13 @@ public final class CodecController {
                             "impl", binding[0], "item", binding[1]);
                     return binding;
                 }
+                String[] viaMethods = findItemBindingViaMethodReturns(
+                        popupClass, listener.getName());
+                if (viaMethods != null) {
+                    MLog.event("ui.choice.popup.discovered",
+                            "impl", viaMethods[0], "item", viaMethods[1]);
+                    return viaMethods;
+                }
             }
         } catch (Throwable t) {
             MLog.event("ui.choice.popup.discovery_failed",
@@ -1861,6 +1876,22 @@ public final class CodecController {
         if (dot <= 0 || dot != name.lastIndexOf('.')) return false;
         String packageName = name.substring(0, dot);
         return packageName.length() <= 3;
+    }
+
+    /**
+     * COUI popup base classes move between host releases: older builds anchor popups on
+     * {@code com.coui.appcompat.poplist.a}, while ColorOS 17 renamed that class to the
+     * popup animation controller and moved the window base to {@code poplist.b} /
+     * {@code poplist.d}. Accept any ancestor inside the bundled COUI poplist package so
+     * discovery does not depend on a single obfuscated class name.
+     */
+    private static boolean isCouiPopupBaseClass(Class<?> parent) {
+        Class<?> cls = parent;
+        while (cls != null && cls != Object.class) {
+            if (cls.getName().startsWith("com.coui.appcompat.poplist.")) return true;
+            cls = cls.getSuperclass();
+        }
+        return false;
     }
 
     private static Field firstFieldOfType(Class<?> cls, Class<?> fieldType) {
@@ -1901,6 +1932,42 @@ public final class CodecController {
                 || drawableCount != 1 || listCount != 1) return null;
         booleans.sort((left, right) -> left.getName().compareTo(right.getName()));
         return new Field[]{text, booleans.get(0), booleans.get(1)};
+    }
+
+    /**
+     * ColorOS 17 moved the item model (e.g. {@code d3.r}) out of the popup package and
+     * stripped generic signatures, so the same-package scan cannot find it. Fall back to
+     * the popup's own accessors: COUIPopupListWindow exposes {@code o(int)} / {@code p(int)}
+     * methods returning the bundled item type.
+     */
+    private static String[] findItemBindingViaMethodReturns(
+            Class<?> popupClass, String listenerField) {
+        LinkedHashSet<Class<?>> candidates = new LinkedHashSet<>();
+        for (Method method : popupClass.getMethods()) {
+            if (method.getParameterCount() != 1) continue;
+            if (method.getParameterTypes()[0] != int.class) continue;
+            Class<?> ret = method.getReturnType();
+            if (ret == null || ret.isPrimitive() || ret.isArray()) continue;
+            candidates.add(ret);
+        }
+        for (Class<?> itemClass : candidates) {
+            try {
+                itemClass.getDeclaredConstructor();
+            } catch (Throwable ignored) {
+                continue;
+            }
+            Field[] itemFields = popupItemFields(itemClass);
+            if (itemFields == null) continue;
+            return new String[]{
+                    popupClass.getName(),
+                    itemClass.getName(),
+                    itemFields[0].getName(),
+                    itemFields[1].getName(),
+                    itemFields[2].getName(),
+                    listenerField
+            };
+        }
+        return null;
     }
 
     private static void setField(Object target, String name, Object value) throws Exception {
