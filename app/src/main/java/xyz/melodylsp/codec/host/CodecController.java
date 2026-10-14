@@ -1208,11 +1208,14 @@ public final class CodecController {
 
     /**
      * 「游戏自动切换 LE Audio」只对确认支持 LE Audio 的耳机显示，判据与主 LE Audio 开关
-     * 相同（{@link LeAudioManager#isSupported(String)}）；能力状态变化时重新刷新。
+     * 相同（{@link LeAudioManager#isSupported(String)}）；X4 类支持「LE Audio + 经典共存」
+     * 的耳机由官方链路接管游戏内 LE Audio，同样隐藏该行以避免双重控制。
      */
     private void applyGameAutoLeaVisibility(Subscription sub) {
         if (sub.prefs.gameAutoLeaSwitch == null) return;
-        PrefRef.setVisible(sub.prefs.gameAutoLeaSwitch, leAudioManager.isSupported(sub.mac));
+        boolean show = leAudioManager.isSupported(sub.mac)
+                && !leAudioManager.isOfficialCoexist(sub.mac);
+        PrefRef.setVisible(sub.prefs.gameAutoLeaSwitch, show);
     }
 
     /** Called only after the host's own setter; module-originated setters are ignored. */

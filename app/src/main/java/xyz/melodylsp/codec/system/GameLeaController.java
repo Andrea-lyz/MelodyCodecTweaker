@@ -283,6 +283,15 @@ public final class GameLeaController implements BluetoothLeAudioBridge.GameLaten
             MLog.event("game.ll.auto.skip", "reason", "lea_not_supported");
             return; // Keep the existing classic codec for the rest of this game session.
         }
+        Boolean coexist = bridge.readLeaCoexistSupportedForGame(target.mac);
+        if (Boolean.TRUE.equals(coexist)) {
+            // X4-class device: the official dual-mode chain drives game LE Audio itself, so the
+            // module stays fully out of the way (no session, no classic-fallback suppression).
+            target.suppress = false;
+            session = null;
+            MLog.event("game.ll.auto.skip", "reason", "official_coexist");
+            return;
+        }
         Boolean enabledBefore = bridge.readLeAudioEnabledForGame(target.mac);
         if (enabledBefore == null) {
             MLog.event("game.ll.auto.skip", "reason", "enablement_unknown");

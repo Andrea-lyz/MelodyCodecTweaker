@@ -66,6 +66,8 @@ public final class LeAudioIpc {
     public static final String EXTRA_ENABLED = "enabled";
     /** boolean, whether the LE Audio profile is currently connected / active. */
     public static final String EXTRA_CONNECTED = "connected";
+    /** boolean, X4-class "LE Audio + classic coexistence" report used by the official chain. */
+    public static final String EXTRA_LEA_COEXIST = "lea_coexist";
     /** boolean, whether the toggle request succeeded (in {@link #ACTION_LE_AUDIO_STATE}). */
     public static final String EXTRA_OK = "ok";
     /** String, the coarse anti-spoof token shared by both module instances. */

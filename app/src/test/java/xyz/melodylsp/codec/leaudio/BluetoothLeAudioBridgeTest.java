@@ -7,6 +7,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Map;
 import java.util.UUID;
 
 import org.junit.Test;
@@ -114,5 +115,28 @@ public final class BluetoothLeAudioBridgeTest {
         assertFalse(BluetoothLeAudioBridge.hasLeAudioCapability(1, new UUID[]{ascs}));
         assertFalse(BluetoothLeAudioBridge.hasLeAudioCapability(3, new UUID[]{bass}));
         assertFalse(BluetoothLeAudioBridge.hasLeAudioCapability(3, null));
+    }
+
+    @Test
+    public void coexistSupportRequiresAnExplicitTrueForAnyIdentity() {
+        assertEquals(Boolean.TRUE, BluetoothLeAudioBridge.coexistFromPrefs(
+                Map.of("40:72:18:C6:E5:50", true, "40:72:18:C6:E0:3A", false),
+                Arrays.asList("40:72:18:C6:E0:3A", "40:72:18:C6:E5:50")));
+        assertEquals(Boolean.FALSE, BluetoothLeAudioBridge.coexistFromPrefs(
+                Map.of("40:72:18:C6:E5:50", false),
+                Arrays.asList("40:72:18:C6:E5:50")));
+        assertEquals(Boolean.FALSE, BluetoothLeAudioBridge.coexistFromPrefs(
+                Map.of(), Arrays.asList("40:72:18:C6:E5:50")));
+    }
+
+    @Test
+    public void coexistSupportStaysUnknownWhenItCannotBeResolved() {
+        assertNull(BluetoothLeAudioBridge.coexistFromPrefs(
+                null, Arrays.asList("40:72:18:C6:E5:50")));
+        assertNull(BluetoothLeAudioBridge.coexistFromPrefs(
+                Map.of(), Collections.<String>emptyList()));
+        assertEquals(Boolean.FALSE, BluetoothLeAudioBridge.coexistFromPrefs(
+                Map.of("40:72:18:C6:E5:50", "true"),
+                Arrays.asList("40:72:18:C6:E5:50")));
     }
 }
