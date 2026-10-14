@@ -7,6 +7,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.os.ParcelUuid;
 
 import java.lang.reflect.Method;
@@ -14,6 +15,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -310,6 +312,51 @@ public final class BluetoothLeAudioBridge {
             }
             return false;
         }
+    }
+
+    /**
+     * X4-class "LE Audio + classic coexistence" support for this device.
+     *
+     * <p>The SmartAudio callback reports feature bit 0x4000 and the vendor dual-mode manager
+     * mirrors it into the {@code dual_mode_support} preference (key = device address, absent =
+     * not supported, and the system removes the key when a headset reports no support). That
+     * same signal drives the official game LE Audio chain, so the module stays hands-off while
+     * it is set.</p>
+     *
+     * @return {@code TRUE} when confirmed, {@code FALSE} when readable but not reported,
+     *         {@code null} when the check itself failed.
+     */
+    public Boolean readLeaCoexistSupportedForGame(String mac) {
+        synchronized (writeLock) {
+            try {
+                BluetoothDevice device = resolveDevice(mac);
+                if (device == null) return null;
+                LinkedHashSet<String> candidates = new LinkedHashSet<>();
+                candidates.add(device.getAddress());
+                BluetoothDevice br = resolveBrDevice(device);
+                if (br != null) candidates.add(br.getAddress());
+                for (BluetoothDevice member : resolveLeAudioDevices(device)) {
+                    if (member != null) candidates.add(member.getAddress());
+                }
+                SharedPreferences prefs = context.getSharedPreferences(
+                        "dual_mode_support", Context.MODE_PRIVATE);
+                return coexistFromPrefs(prefs.getAll(), candidates);
+            } catch (Throwable t) {
+                MLog.w("le.bt.coexist read failed", t);
+                return null;
+            }
+        }
+    }
+
+    /** Pure helper: an explicit {@code true} entry for any candidate address wins. */
+    static Boolean coexistFromPrefs(Map<String, ?> values, Collection<String> addresses) {
+        if (values == null || addresses == null || addresses.isEmpty()) return null;
+        for (String address : addresses) {
+            if (address == null) continue;
+            Object value = values.get(address);
+            if (value instanceof Boolean && (Boolean) value) return Boolean.TRUE;
+        }
+        return Boolean.FALSE;
     }
 
     /** Authoritative profile connection read used by the game auto-LEA controller. */
@@ -755,10 +802,12 @@ public final class BluetoothLeAudioBridge {
         boolean supported;
         boolean enabled;
         boolean connected;
+        Boolean coexist;
         synchronized (writeLock) {
             supported = acquireProxyBlocking() != null;
             enabled = supported && Boolean.TRUE.equals(readLeAudioEnabledForGame(mac));
             connected = supported && isLeAudioConnectedNow(mac);
+            coexist = readLeaCoexistSupportedForGame(mac);
         }
         Intent reply = new Intent(LeAudioIpc.ACTION_LE_AUDIO_STATE);
         reply.setPackage(LeAudioIpc.MELODY_PKG);
@@ -767,6 +816,7 @@ public final class BluetoothLeAudioBridge {
         reply.putExtra(LeAudioIpc.EXTRA_SUPPORTED, supported);
         reply.putExtra(LeAudioIpc.EXTRA_ENABLED, enabled);
         reply.putExtra(LeAudioIpc.EXTRA_CONNECTED, connected);
+        reply.putExtra(LeAudioIpc.EXTRA_LEA_COEXIST, Boolean.TRUE.equals(coexist));
         reply.putExtra(LeAudioIpc.EXTRA_OK, ok);
         try {
             if (!TrustedBroadcasts.send(context, reply)) {
@@ -776,6 +826,7 @@ public final class BluetoothLeAudioBridge {
                     "supported", supported,
                     "enabled", enabled,
                     "connected", connected,
+                    "coexist", Boolean.TRUE.equals(coexist),
                     "ok", ok);
         } catch (Throwable t) {
             MLog.w("le.bt.reply send failed", t);

@@ -16,6 +16,13 @@
 
 模块主要服务于 ColorOS / OPlus 系设备上的 `com.oplus.melody`，同时配合 `com.android.bluetooth` 和 `com.oplus.wirelesssettings` 作用域完成更稳定的状态读取和写入。
 
+## 2.5.1 更新重点
+
+**X4 类耳机屏蔽模块的「游戏自动切换 LE Audio」（避免与官方链路冲突）**
+
+- X4 这类支持「LE Audio + 经典共存」的耳机上，官方链路本身会在游戏内接管 LE Audio；模块现在会隐藏「游戏自动切换 LE Audio」开关，并在运行时完全让位（不建会话、不压制经典回退），避免双重控制。
+- 判定直接复用系统信号（SmartAudio 特性位 0x4000 → 蓝牙 `dual_mode_support` 偏好），不猜型号；X3 等不支持共存的耳机行为不变。
+
 ## 2.5.0 更新重点
 
 **游戏功能新增两个开关：游戏低延迟总开关、游戏自动切换 LE Audio（一加 13 / ColorOS 17 + Enco X3 真机验证）**

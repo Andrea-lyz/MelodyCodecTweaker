@@ -71,6 +71,8 @@ public final class LeAudioManager {
     private final Map<String, Boolean> enabledByMac = new ConcurrentHashMap<>();
     /** Authoritative LE Audio profile state; never inferred from connection policy or A2DP. */
     private final Map<String, Boolean> connectedByMac = new ConcurrentHashMap<>();
+    /** X4-class official coexistence report ("LE Audio + classic" on the same device). */
+    private final Map<String, Boolean> coexistByMac = new ConcurrentHashMap<>();
     private final Map<String, Long> lastQueryElapsedByMac = new ConcurrentHashMap<>();
 
     private BroadcastReceiver receiver;
@@ -97,6 +99,15 @@ public final class LeAudioManager {
     /** True only when the LE Audio profile itself is connected. */
     public boolean isConnected(String mac) {
         Boolean v = mac != null ? connectedByMac.get(mac) : null;
+        return v != null && v;
+    }
+
+    /**
+     * True when the earphone reported official "LE Audio + classic coexistence" support, i.e.
+     * the dual-mode chain owns game LE Audio for it (X4-class devices).
+     */
+    public boolean isOfficialCoexist(String mac) {
+        Boolean v = mac != null ? coexistByMac.get(mac) : null;
         return v != null && v;
     }
 
@@ -251,6 +262,7 @@ public final class LeAudioManager {
         boolean en = intent.getBooleanExtra(LeAudioIpc.EXTRA_ENABLED, wasEnabled);
         boolean connected = intent.getBooleanExtra(
                 LeAudioIpc.EXTRA_CONNECTED, isConnected(mac));
+        boolean coexist = intent.getBooleanExtra(LeAudioIpc.EXTRA_LEA_COEXIST, false);
         boolean localSup = probeSupport(mac);
         // The bluetooth process can only tell us whether the system has a LE Audio profile
         // proxy. That is not the same thing as "this headset exposes LE Audio"; otherwise every
@@ -264,10 +276,12 @@ public final class LeAudioManager {
         supportedByMac.put(mac, sup);
         enabledByMac.put(mac, en);
         connectedByMac.put(mac, connected);
+        coexistByMac.put(mac, coexist);
         MLog.event("le.melody.state.recv",
                 "supported", sup,
                 "enabled", en,
-                "connected", connected);
+                "connected", connected,
+                "coexist", coexist);
         notifyChanged(mac);
     }
 

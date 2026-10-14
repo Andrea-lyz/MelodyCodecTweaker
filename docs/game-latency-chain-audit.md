@@ -116,3 +116,9 @@
 - 按用户要求绑定：新增 `CodecController.applyGameAutoLeaVisibility()`，以主 LE Audio 开关相同的判据（`LeAudioManager.isSupported`）在耳机不支持时隐藏该行；插入点在 `wireGameRows`、延迟重排、`refreshGameRows` 与 `onLeAudioStateChanged`，能力状态变化时自动刷新。总闸「游戏低延迟」不绑定能力（它只保留经典协议，对所有耳机有效）。
 - 构建与同一组测试通过，最新调试包 SHA-256：`6D6D7C1880EDFACE4C8EB039481AEC77A102D6CEA81E51F8FF03984F123CCC95`。构建日志 `.c17_audit/game_ll_capability_build.log`，`git diff --check` 通过，包已覆盖安装。
 - 待验证：重启「无线耳机」作用域后，Enco X3 页面应仍显示该行（回归检查）；如接入不支持 LE Audio 的耳机，该行应隐藏。
+
+## X4 类（官方共存）耳机屏蔽自动切换（2026-10-14 深夜）
+
+- 判据链（反编译确认）：SmartAudio 远程特性回调 `(16384 & remoteFeature) != 0`（bit 0x4000）→ `OplusDualModeManagerImpl.notifyDualModeSupport` 写蓝牙进程偏好 `dual_mode_support`（键 = 耳机地址；不支持时移除键）；`isSupportDualConnection` 读取同源偏好，为官方「游戏时自动开 LE Audio」链路的前置。设备上该文件当前为空表（X3 上报不含 0x4000）。
+- 实现：`BluetoothLeAudioBridge.readLeaCoexistSupportedForGame` 读取该偏好（请求地址、官方 BR 地址与 LEA 组成员任一为 true 即命中；读取失败返回 null）；`ACTION_LE_AUDIO_STATE` 回执新增 `lea_coexist` 字段；宿主 `LeAudioManager.isOfficialCoexist` 记录；`CodecController.applyGameAutoLeaVisibility` 仅在「支持 LE Audio 且非官方共存」时显示自动切换行；`GameLeaController.startAutoLea` 命中官方共存时直接让位（`game.ll.auto.skip reason=official_coexist`，不建会话、不压制经典回退）。
+- 待验证：X4 真机（宿主隐藏该行、官方链路自行接管）；X3 回归（该行仍显示，日志无 coexist 命中）。
