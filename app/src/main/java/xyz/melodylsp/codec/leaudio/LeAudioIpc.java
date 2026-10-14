@@ -29,10 +29,35 @@ public final class LeAudioIpc {
     /** privileged bridge → melody: authoritative support + enabled state for a device. */
     public static final String ACTION_LE_AUDIO_STATE = "xyz.melodylsp.codec.action.LE_AUDIO_STATE";
 
+    /**
+     * melody → privileged bridge: module game low-latency state. Sent when Melody's 游戏功能
+     * controller starts, rows are attached, and on every toggle. The host verifies the mirror
+     * through ACTION_QUERY_GAME_LATENCY_STATE and retries until the requested values arrive.
+     */
+    public static final String ACTION_SET_GAME_LATENCY_STATE =
+            "xyz.melodylsp.codec.action.SET_GAME_LATENCY_STATE";
+    /** melody -> bluetooth: read back the applied game configuration. */
+    public static final String ACTION_QUERY_GAME_LATENCY_STATE =
+            "xyz.melodylsp.codec.action.QUERY_GAME_LATENCY_STATE";
+    /** bluetooth -> melody: configuration readback, correlated with the host request. */
+    public static final String ACTION_GAME_LATENCY_STATE =
+            "xyz.melodylsp.codec.action.GAME_LATENCY_STATE";
+    /** bluetooth -> melody: the receiver is ready; resend the authoritative host preferences. */
+    public static final String ACTION_REQUEST_GAME_LATENCY_STATE =
+            "xyz.melodylsp.codec.action.REQUEST_GAME_LATENCY_STATE";
+    /** Bluetooth-side mirror also used by GameLeaController. */
+    public static final String GAME_LATENCY_PREFS = "melody_codec_game_latency";
+
     /** String, the device MAC the request / response concerns. */
     public static final String EXTRA_MAC = "mac";
     /** boolean, the requested enable state for {@link #ACTION_SET_LE_AUDIO}. */
     public static final String EXTRA_ENABLE = "enable";
+    /** boolean, 游戏低延迟 master switch (default true; off keeps LHDC during games). */
+    public static final String EXTRA_GAME_LOW_LATENCY_ENABLED = "game_low_latency_enabled";
+    /** boolean, 游戏自动切换 LE Audio switch (default false). */
+    public static final String EXTRA_GAME_AUTO_LEA_ENABLED = "game_auto_lea_enabled";
+    public static final String EXTRA_GAME_STATE_REQUEST_ID = "game_state_request_id";
+    public static final String EXTRA_GAME_STATE_READY = "game_state_ready";
     /** boolean, query-side hint that a fresh OEM/profile event warrants reconnect repair. */
     public static final String EXTRA_REPAIR_CONNECTION = "repair_connection";
     /** boolean, whether the device supports LE Audio (in {@link #ACTION_LE_AUDIO_STATE}). */

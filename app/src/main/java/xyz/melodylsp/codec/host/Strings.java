@@ -70,6 +70,16 @@ public final class Strings {
     public static final String LE_AUDIO_SUMMARY_UNKNOWN = "正在获取状态…";
     public static final String STATE_LE_AUDIO_CONNECTING = "LE Audio 正在连接…";
 
+    // 游戏功能 rows (injected around Melody's official 游戏模式 entry).
+    public static final String GAME_LOW_LATENCY_TITLE = "游戏低延迟";
+    public static final String GAME_LOW_LATENCY_SUMMARY_ON =
+            "已开启：进游戏按系统逻辑切换低延迟编解码";
+    public static final String GAME_LOW_LATENCY_SUMMARY_OFF =
+            "已关闭：进游戏保持 LHDC，不切换到 SBC";
+    public static final String GAME_AUTO_LEA_TITLE = "游戏自动切换 LE Audio";
+    public static final String GAME_AUTO_LEA_SUMMARY =
+            "进游戏自动切到 LE Audio（LC3），离开游戏后延迟恢复；需耳机支持 LE Audio。切换时可能短暂断音或外放";
+
     private Strings() {
     }
 }

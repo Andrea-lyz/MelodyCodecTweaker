@@ -7,14 +7,22 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.os.ParcelUuid;
 
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
@@ -29,6 +37,13 @@ import xyz.melodylsp.codec.util.TrustedBroadcasts;
  */
 public final class BluetoothLeAudioBridge {
 
+    /** Sink for the module's game-latency switch state; set by the bluetooth-side controller. */
+    public interface GameLatencyListener {
+        void onGameLatencyStateChanged(boolean lowLatencyEnabled, boolean autoLeaEnabled);
+
+        default void onManualLeAudioChanged(String mac, boolean enable) { }
+    }
+
     private static final int PROFILE_LE_AUDIO = 22;
     private static final int PROFILE_A2DP = 2;
     private static final int CONNECTION_POLICY_FORBIDDEN = 0;
@@ -39,12 +54,19 @@ public final class BluetoothLeAudioBridge {
     private static final String OPLUS_COMPONENT_SAFE = "oplus.permission.OPLUS_COMPONENT_SAFE";
     private static final long[] LE_RECONNECT_DELAYS_MS = {600L, 2_500L, 6_000L};
     private static final long LE_RECONNECT_COOLDOWN_MS = 12_000L;
+    private static final UUID UUID_LE_AUDIO =
+            UUID.fromString("0000184e-0000-1000-8000-00805f9b34fb");
+    private static final UUID UUID_HAS =
+            UUID.fromString("00001854-0000-1000-8000-00805f9b34fb");
 
     private final Context context;
     private volatile boolean registered;
     private volatile Object leAudioProxy;
     private volatile Object a2dpProxy;
+    private volatile GameLatencyListener gameLatencyListener;
+    private final Object writeLock = new Object();
     private final ReconnectGate reconnectGate = new ReconnectGate();
+    private final A2dpRestoreGate a2dpRestoreGate = new A2dpRestoreGate();
     private final ExecutorService requestExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread worker = new Thread(r, "MelodyCodecLsp-leaudio");
         worker.setDaemon(true);
@@ -53,6 +75,10 @@ public final class BluetoothLeAudioBridge {
 
     public BluetoothLeAudioBridge(Context context) {
         this.context = context.getApplicationContext();
+    }
+
+    public void setGameLatencyListener(GameLatencyListener listener) {
+        this.gameLatencyListener = listener;
     }
 
     public synchronized void register() {
@@ -68,6 +94,7 @@ public final class BluetoothLeAudioBridge {
         IntentFilter filter = new IntentFilter();
         filter.addAction(LeAudioIpc.ACTION_SET_LE_AUDIO);
         filter.addAction(LeAudioIpc.ACTION_QUERY_LE_AUDIO);
+        filter.addAction(LeAudioIpc.ACTION_SET_GAME_LATENCY_STATE);
         if (!TrustedBroadcasts.registerExportedReceiver(
                 context,
                 receiver,
@@ -95,10 +122,30 @@ public final class BluetoothLeAudioBridge {
             }
             String action = intent.getAction();
             if (!isAuthorizedRequest(action, sender)) return;
+            if (LeAudioIpc.ACTION_SET_GAME_LATENCY_STATE.equals(action)) {
+                boolean lowLatency = intent.getBooleanExtra(
+                        LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, true);
+                boolean autoLea = intent.getBooleanExtra(
+                        LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED, false);
+                GameLatencyListener listener = gameLatencyListener;
+                if (listener != null) {
+                    listener.onGameLatencyStateChanged(lowLatency, autoLea);
+                }
+                MLog.event("le.bt.game_state", "lowLatency", lowLatency,
+                        "autoLea", autoLea, "listener", listener != null);
+                return;
+            }
             String mac = intent.getStringExtra(LeAudioIpc.EXTRA_MAC);
             if (mac == null || mac.isEmpty()) return;
             if (LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)) {
                 boolean enable = intent.getBooleanExtra(LeAudioIpc.EXTRA_ENABLE, false);
+                GameLatencyListener listener = gameLatencyListener;
+                if (listener != null) {
+                    BluetoothDevice requested = resolveDevice(mac);
+                    String manualMac = requested == null
+                            ? mac : resolveBrDevice(requested).getAddress();
+                    listener.onManualLeAudioChanged(manualMac, enable);
+                }
                 boolean ok = applyLeAudio(mac, enable);
                 MLog.event("le.bt.apply", "enable", enable, "ok", ok);
                 scheduleReply(mac, ok, 400L);
@@ -121,13 +168,15 @@ public final class BluetoothLeAudioBridge {
         if (!TrustedBroadcasts.supportsSenderIdentity()) {
             // Android 12/13 rely on the OPlus signature permission required at registration time.
             return LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)
-                    || LeAudioIpc.ACTION_QUERY_LE_AUDIO.equals(action);
+                    || LeAudioIpc.ACTION_QUERY_LE_AUDIO.equals(action)
+                    || LeAudioIpc.ACTION_SET_GAME_LATENCY_STATE.equals(action);
         }
         boolean trusted = TrustedBroadcasts.isTrustedSender(
                 context, sender, LeAudioIpc.MELODY_PKG);
         if (trusted) return true;
 
-        if (LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)) {
+        if (LeAudioIpc.ACTION_SET_LE_AUDIO.equals(action)
+                || LeAudioIpc.ACTION_SET_GAME_LATENCY_STATE.equals(action)) {
             MLog.w("LE Audio bluetooth write rejected: sender identity unavailable or untrusted");
             return false;
         }
@@ -136,19 +185,33 @@ public final class BluetoothLeAudioBridge {
     }
 
     private boolean applyLeAudio(String mac, boolean enable) {
+        synchronized (writeLock) {
+            return applyLeAudioLocked(mac, enable, () -> true);
+        }
+    }
+
+    private boolean applyLeAudioLocked(
+            String mac, boolean enable, BooleanSupplier stillCurrent) {
+        BluetoothDevice requested = resolveDevice(mac);
+        if (requested == null) return false;
+        BluetoothDevice brDevice = resolveBrDevice(requested);
+        long restoreGeneration = a2dpRestoreGate.advance(brDevice.getAddress());
         Object proxy = acquireProxyBlocking();
-        BluetoothDevice device = resolveDevice(mac);
-        if (proxy == null || device == null) return false;
-        if (!enable) {
-            reconnectGate.cancel(mac);
-        }
-        boolean ok = setConnectionPolicy(proxy, device,
-                enable ? CONNECTION_POLICY_ALLOWED : CONNECTION_POLICY_FORBIDDEN);
-        if (!ok) {
-            ok = setEnabled(proxy, device, enable);
-        }
-        if (ok) {
-            if (enable) {
+        if (proxy == null) return false;
+        // Settings checks any enabled LE member. Resolve before disconnecting the first one,
+        // using the vendor BR/LE mapping and the stack's group rather than guessing MACs.
+        List<BluetoothDevice> devices = resolveLeAudioDevices(requested);
+        // Proxy acquisition and member resolution can block. Recheck immediately before writing.
+        if (!stillCurrent.getAsBoolean()) return false;
+        boolean ok = true;
+        for (BluetoothDevice device : devices) {
+            String targetMac = device.getAddress();
+            if (!enable) reconnectGate.cancel(targetMac);
+            boolean applied = setConnectionPolicy(proxy, device,
+                    enable ? CONNECTION_POLICY_ALLOWED : CONNECTION_POLICY_FORBIDDEN);
+            if (!applied) applied = setEnabled(proxy, device, enable);
+            ok &= applied;
+            if (applied && enable) {
                 int stateBefore = getProfileConnectionState(proxy, device);
                 Boolean connectOk = null;
                 boolean transportSent = false;
@@ -167,17 +230,101 @@ public final class BluetoothLeAudioBridge {
                         "stateBefore", stateBefore,
                         "connectOk", connectOk,
                         "transportSent", transportSent);
-                scheduleLeReconnect(mac, "explicit_enable", true);
-            } else {
-                MLog.event("le.bt.transport.skipped",
-                        "connect", false,
-                        "reason", "policy_disconnect");
-                reconnectA2dpLater(device, 2400L, 1);
-                reconnectA2dpLater(device, 4600L, 2);
-                reconnectA2dpLater(device, 8000L, 3);
+                scheduleLeReconnect(targetMac, "explicit_enable", true);
             }
         }
+        if (ok && !enable) {
+            MLog.event("le.bt.transport.skipped",
+                    "connect", false,
+                    "reason", "policy_disconnect");
+            reconnectA2dpLater(brDevice, restoreGeneration, 2400L, 1);
+            reconnectA2dpLater(brDevice, restoreGeneration, 4600L, 2);
+            reconnectA2dpLater(brDevice, restoreGeneration, 8000L, 3);
+        }
         return ok;
+    }
+
+    /** In-process entry point for the game auto-LEA controller (no broadcast hop). */
+    public boolean setLeAudioEnabledForGame(String mac, boolean enable) {
+        return setLeAudioEnabledForGame(mac, enable, () -> true);
+    }
+
+    /** Recheck the controller's session/ticket only after acquiring the common writer lock. */
+    public boolean setLeAudioEnabledForGame(
+            String mac, boolean enable, BooleanSupplier stillCurrent) {
+        boolean ok;
+        synchronized (writeLock) {
+            if (stillCurrent == null || !stillCurrent.getAsBoolean()) return false;
+            ok = applyLeAudioLocked(mac, enable, stillCurrent);
+        }
+        MLog.event("le.bt.game.apply", "enable", enable, "ok", ok);
+        scheduleReply(mac, ok, 400L);
+        scheduleReply(mac, ok, 1800L);
+        scheduleReply(mac, ok, 4000L);
+        return ok;
+    }
+
+    /** Authoritative profile enablement read used by the game auto-LEA controller. */
+    public boolean isLeAudioEnabledNow(String mac) {
+        return Boolean.TRUE.equals(readLeAudioEnabledForGame(mac));
+    }
+
+    /** Null means unavailable/unknown; connection state must not stand in for user policy. */
+    public Boolean readLeAudioEnabledForGame(String mac) {
+        synchronized (writeLock) {
+            try {
+                Object proxy = acquireProxyBlocking();
+                BluetoothDevice device = resolveDevice(mac);
+                if (proxy == null || device == null) return null;
+                List<Boolean> states = new ArrayList<>();
+                for (BluetoothDevice member : resolveLeAudioDevices(device)) {
+                    states.add(readLeAudioEnabled(proxy, member));
+                }
+                return anyLeAudioEnabled(states);
+            } catch (Throwable t) {
+                MLog.w("le.bt.game.read failed", t);
+                return null;
+            }
+        }
+    }
+
+    /** Conservative positive check matching OPlus isLeaDevice: LE/dual type plus ASCS or HAS. */
+    public boolean isLeAudioSupportedForGame(String mac) {
+        synchronized (writeLock) {
+            try {
+                BluetoothDevice device = resolveDevice(mac);
+                if (device == null || acquireProxyBlocking() == null) return false;
+                for (BluetoothDevice member : resolveLeAudioDevices(device)) {
+                    try {
+                        ParcelUuid[] parcelUuids = member.getUuids();
+                        if (parcelUuids == null) continue;
+                        UUID[] uuids = new UUID[parcelUuids.length];
+                        for (int i = 0; i < parcelUuids.length; i++) {
+                            uuids[i] = parcelUuids[i] == null ? null : parcelUuids[i].getUuid();
+                        }
+                        if (hasLeAudioCapability(member.getType(), uuids)) return true;
+                    } catch (Throwable ignored) { }
+                }
+            } catch (Throwable ignored) {
+                // Missing proxy, mapping or capability read must never unlock an unknown device.
+            }
+            return false;
+        }
+    }
+
+    /** Authoritative profile connection read used by the game auto-LEA controller. */
+    public boolean isLeAudioConnectedNow(String mac) {
+        synchronized (writeLock) {
+            Object proxy = acquireProxyBlocking();
+            BluetoothDevice device = resolveDevice(mac);
+            if (proxy == null || device == null) return false;
+            for (BluetoothDevice member : resolveLeAudioDevices(device)) {
+                if (getProfileConnectionState(proxy, member) == BluetoothProfile.STATE_CONNECTED) {
+                    return true;
+                }
+            }
+            return false;
+        }
     }
 
     private synchronized Object acquireProxyBlocking() {
@@ -238,6 +385,93 @@ public final class BluetoothLeAudioBridge {
         }
     }
 
+    private Object resolveOplusLeAdapterService() {
+        try {
+            Class<?> cls = Class.forName("com.android.bluetooth.btservice.AdapterService",
+                    false, context.getClassLoader());
+            return cls.getField("mOplusLeAdapterService").get(null);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private BluetoothDevice resolveBrDevice(BluetoothDevice device) {
+        Object br = invokeObject(resolveOplusLeAdapterService(), "findBrDevice",
+                new Class[]{String.class}, new Object[]{device.getAddress()});
+        return br instanceof BluetoothDevice ? (BluetoothDevice) br : device;
+    }
+
+    private Object resolveLeAudioService() {
+        try {
+            ClassLoader loader = context.getClassLoader();
+            Class<?> cls = Class.forName("com.android.bluetooth.le_audio.LeAudioService",
+                    false, loader);
+            Method getter = findMethod(cls, "getLeAudioService");
+            if (getter != null) {
+                getter.setAccessible(true);
+                return getter.invoke(null);
+            }
+            // Android 17 obtains profiles from AdapterService as Optional<Profile>.
+            Class<?> adapterCls = Class.forName("com.android.bluetooth.btservice.AdapterService",
+                    false, loader);
+            getter = findMethod(adapterCls, "deprecatedGetAdapterService");
+            if (getter == null) getter = findMethod(adapterCls, "getAdapterService");
+            if (getter == null) return null;
+            getter.setAccessible(true);
+            Object service = invokeObject(getter.invoke(null), "getLeAudioService",
+                    new Class[0], new Object[0]);
+            return service instanceof Optional ? ((Optional<?>) service).orElse(null) : service;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private List<BluetoothDevice> resolveLeAudioDevices(BluetoothDevice device) {
+        Map<String, BluetoothDevice> devices = new LinkedHashMap<>();
+        devices.put(device.getAddress(), device);
+        BluetoothDevice br = resolveBrDevice(device);
+        addLeAudioDevices(devices, invokeObject(resolveOplusLeAdapterService(),
+                "findLeAudioDevices", new Class[]{String.class},
+                new Object[]{br.getAddress()}));
+        Object service = resolveLeAudioService();
+        // Take a copy because adding peers can grow the map while iterating.
+        for (BluetoothDevice member : new ArrayList<>(devices.values())) {
+            Object group = invokeObject(service, "getGroupId",
+                    new Class[]{BluetoothDevice.class}, new Object[]{member});
+            if (group instanceof Integer && (Integer) group >= 0) {
+                addLeAudioDevices(devices, invokeObject(service, "getGroupDevices",
+                        new Class[]{int.class}, new Object[]{group}));
+            }
+        }
+        return new ArrayList<>(devices.values());
+    }
+
+    private static void addLeAudioDevices(Map<String, BluetoothDevice> devices, Object members) {
+        if (!(members instanceof Collection)) return;
+        for (Object member : (Collection<?>) members) {
+            if (!(member instanceof BluetoothDevice)) continue;
+            BluetoothDevice device = (BluetoothDevice) member;
+            String address = device.getAddress();
+            if (BluetoothAdapter.checkBluetoothAddress(address)
+                    && !"00:00:00:00:00:00".equals(address)) {
+                devices.put(address, device);
+            }
+        }
+    }
+
+    private static Object invokeObject(
+            Object target, String name, Class<?>[] params, Object[] args) {
+        if (target == null) return null;
+        try {
+            Method method = findMethod(target.getClass(), name, params);
+            if (method == null) return null;
+            method.setAccessible(true);
+            return method.invoke(target, args);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
     private static boolean setConnectionPolicy(Object proxy, BluetoothDevice device, int policy) {
         try {
             Method m = findMethod(proxy.getClass(), "setConnectionPolicy",
@@ -292,6 +526,12 @@ public final class BluetoothLeAudioBridge {
     }
 
     private void scheduleLeReconnect(String mac, String reason, boolean force) {
+        synchronized (writeLock) {
+            scheduleLeReconnectLocked(mac, reason, force);
+        }
+    }
+
+    private void scheduleLeReconnectLocked(String mac, String reason, boolean force) {
         if (mac == null) return;
         Object proxy = acquireProxyBlocking();
         if (proxy == null
@@ -319,6 +559,13 @@ public final class BluetoothLeAudioBridge {
     }
 
     private void reconnectLeAudio(
+            String mac, long generation, int attempt, boolean lastAttempt) {
+        synchronized (writeLock) {
+            reconnectLeAudioLocked(mac, generation, attempt, lastAttempt);
+        }
+    }
+
+    private void reconnectLeAudioLocked(
             String mac, long generation, int attempt, boolean lastAttempt) {
         if (!reconnectGate.isCurrent(mac, generation)) return;
         Object proxy = acquireProxyBlocking();
@@ -392,25 +639,30 @@ public final class BluetoothLeAudioBridge {
         }
     }
 
-    private void reconnectA2dpLater(BluetoothDevice device, long delayMs, int attempt) {
+    private void reconnectA2dpLater(
+            BluetoothDevice device, long generation, long delayMs, int attempt) {
         Thread worker = new Thread(() -> {
             try {
                 Thread.sleep(delayMs);
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
+                return;
             }
-            reconnectA2dp(device, attempt);
+            synchronized (writeLock) {
+                reconnectA2dp(device, generation, attempt);
+            }
         }, "MelodyCodecLsp-a2dp-reconnect");
         worker.setDaemon(true);
         worker.start();
     }
 
-    private void reconnectA2dp(BluetoothDevice device, int attempt) {
+    private void reconnectA2dp(BluetoothDevice device, long generation, int attempt) {
         Object proxy = acquireA2dpProxyBlocking();
         if (proxy == null || device == null) {
             MLog.w("le.bt.a2dp.reconnect skipped");
             return;
         }
+        if (!canRestoreA2dp(device, generation)) return;
         int stateBefore = getProfileConnectionState(proxy, device);
         Integer policyBefore = getConnectionPolicy(proxy, device);
         if (stateBefore == BluetoothProfile.STATE_CONNECTED) {
@@ -439,6 +691,7 @@ public final class BluetoothLeAudioBridge {
         }
         Boolean policyOk = null;
         if (policyBefore != null && policyBefore < CONNECTION_POLICY_ALLOWED) {
+            if (!canRestoreA2dp(device, generation)) return;
             policyOk = setConnectionPolicy(proxy, device, CONNECTION_POLICY_ALLOWED);
             sleepQuietly(250L);
             int stateAfterPolicy = getProfileConnectionState(proxy, device);
@@ -454,6 +707,7 @@ public final class BluetoothLeAudioBridge {
                 return;
             }
         }
+        if (!canRestoreA2dp(device, generation)) return;
         Boolean connectOk = invokeBoolean(proxy, "connect",
                 new Class[]{BluetoothDevice.class}, new Object[]{device});
         int stateAfter = getProfileConnectionState(proxy, device);
@@ -465,6 +719,19 @@ public final class BluetoothLeAudioBridge {
                 "stateBefore", stateBefore,
                 "stateAfter", stateAfter,
                 "action", "connect");
+    }
+
+    private boolean canRestoreA2dp(BluetoothDevice device, long generation) {
+        String mac = device.getAddress();
+        if (!a2dpRestoreGate.isCurrent(mac, generation)) return false;
+        Boolean enabled = readLeAudioEnabledForGame(mac);
+        boolean allowed = a2dpRestoreGate.mayRestore(mac, generation, enabled);
+        if (!allowed) {
+            MLog.event("le.bt.a2dp.reconnect.skipped",
+                    "reason", enabled == null ? "le_state_unknown" : "le_enabled",
+                    "generation", generation);
+        }
+        return allowed;
     }
 
     private static void sleepQuietly(long delayMs) {
@@ -485,10 +752,14 @@ public final class BluetoothLeAudioBridge {
     }
 
     private void replyState(String mac, boolean ok) {
-        Object proxy = acquireProxyBlocking();
-        boolean supported = proxy != null;
-        boolean enabled = supported && isLeAudioEnabled(proxy, mac);
-        boolean connected = supported && isLeAudioConnected(proxy, mac);
+        boolean supported;
+        boolean enabled;
+        boolean connected;
+        synchronized (writeLock) {
+            supported = acquireProxyBlocking() != null;
+            enabled = supported && Boolean.TRUE.equals(readLeAudioEnabledForGame(mac));
+            connected = supported && isLeAudioConnectedNow(mac);
+        }
         Intent reply = new Intent(LeAudioIpc.ACTION_LE_AUDIO_STATE);
         reply.setPackage(LeAudioIpc.MELODY_PKG);
         reply.putExtra(LeAudioIpc.EXTRA_TOKEN, LeAudioIpc.TOKEN);
@@ -514,16 +785,42 @@ public final class BluetoothLeAudioBridge {
     private static boolean isLeAudioEnabled(Object proxy, String mac) {
         BluetoothDevice device = resolveDevice(mac);
         if (proxy == null || device == null) return false;
+        Boolean enabled = readLeAudioEnabled(proxy, device);
+        if (enabled != null) return enabled;
+        return getProfileConnectionState(proxy, device) == BluetoothProfile.STATE_CONNECTED;
+    }
+
+    private static Boolean readLeAudioEnabled(Object proxy, BluetoothDevice device) {
         Integer policy = getConnectionPolicy(proxy, device);
-        if (policy != null) return policy >= CONNECTION_POLICY_ALLOWED;
+        if (policy != null && policy >= 0) return enabledFromReadback(policy, null);
         Boolean enabled = invokeBoolean(proxy, "isEnabled",
                 new Class[]{BluetoothDevice.class}, new Object[]{device});
-        if (enabled != null) return enabled;
-        try {
-            return getProfileConnectionState(proxy, device) == BluetoothProfile.STATE_CONNECTED;
-        } catch (Throwable t) {
-            return false;
+        return enabledFromReadback(policy, enabled);
+    }
+
+    static Boolean enabledFromReadback(Integer policy, Boolean enabled) {
+        if (policy != null && policy >= 0) return policy > 0;
+        return enabled;
+    }
+
+    static Boolean anyLeAudioEnabled(List<Boolean> states) {
+        if (states.isEmpty()) return null;
+        boolean unknown = false;
+        for (Boolean state : states) {
+            if (Boolean.TRUE.equals(state)) return true;
+            if (state == null) unknown = true;
         }
+        return unknown ? null : Boolean.FALSE;
+    }
+
+    static boolean hasLeAudioCapability(int deviceType, UUID[] uuids) {
+        if (deviceType != BluetoothDevice.DEVICE_TYPE_LE
+                && deviceType != BluetoothDevice.DEVICE_TYPE_DUAL) return false;
+        if (uuids == null) return false;
+        for (UUID uuid : uuids) {
+            if (UUID_LE_AUDIO.equals(uuid) || UUID_HAS.equals(uuid)) return true;
+        }
+        return false;
     }
 
     private static boolean isLeAudioConnected(Object proxy, String mac) {
@@ -580,6 +877,26 @@ public final class BluetoothLeAudioBridge {
             }
         }
         return null;
+    }
+
+    /** Each new request invalidates A2DP work from all previous requests for the BR device. */
+    static final class A2dpRestoreGate {
+        private final Map<String, Long> generations = new HashMap<>();
+
+        synchronized long advance(String mac) {
+            long generation = generations.getOrDefault(mac, 0L) + 1L;
+            generations.put(mac, generation);
+            return generation;
+        }
+
+        synchronized boolean isCurrent(String mac, long generation) {
+            Long current = generations.get(mac);
+            return current != null && current == generation;
+        }
+
+        synchronized boolean mayRestore(String mac, long generation, Boolean leAudioEnabled) {
+            return isCurrent(mac, generation) && Boolean.FALSE.equals(leAudioEnabled);
+        }
     }
 
     /** Per-device generation/cooldown gate preventing duplicate Melody processes from storming. */

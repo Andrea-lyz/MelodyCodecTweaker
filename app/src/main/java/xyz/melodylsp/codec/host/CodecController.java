@@ -50,6 +50,7 @@ import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.bt.BluetoothCodecReflect;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
+import xyz.melodylsp.codec.leaudio.LeAudioIpc;
 import xyz.melodylsp.codec.storage.PreferenceStore;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
@@ -111,6 +112,11 @@ public final class CodecController {
     /** Logical LHDC policy is separate from AUTO used by the quality governor on the wire. */
     private final Map<String, Integer> lhdcPoliciesByMac = new HashMap<>();
     private BroadcastReceiver memorySnapshotReceiver;
+    private BroadcastReceiver gameLatencyStateReceiver;
+    private String gameLatencyRequestId;
+    private boolean gameLatencyStateConfirmed;
+    private final ThreadLocal<Boolean> applyingGameRowState = ThreadLocal.withInitial(() -> false);
+    private static final long[] GAME_STATE_RETRY_DELAYS_MS = {300L, 1_000L, 2_500L, 5_000L};
     private volatile boolean nativePatchUnsupported;
     private String lastNativePatchFastSwitchStatus = "";
     private int lhdcGovernorBitrateKbps;
@@ -145,6 +151,8 @@ public final class CodecController {
         prefs.emitDiagnosticSnapshot("controller_ready");
         registerNativePatchStateReceiver();
         queryNativePatchStateSoon();
+        registerGameLatencyStateReceiver();
+        sendGameLatencyState("controller_ready");
     }
 
     public void onOfficialGameModeState(
@@ -521,6 +529,7 @@ public final class CodecController {
         for (Subscription sub : subscriptions.values()) {
             if (!isSubscriptionActive(sub) || !sameDevice(sub.mac, mac)) continue;
             applyLeAudioToSwitch(sub);
+            applyGameAutoLeaVisibility(sub);
             if (leOn) {
                 if (isClassicRestorePending(mac)) {
                     // Disable is in flight and stale LE replies may still report enabled=true.
@@ -672,6 +681,7 @@ public final class CodecController {
         wireClickListeners(sub);
         wireRememberToggle(sub);
         wireLeAudio(sub);
+        wireGameRows(sub);
         sub.registerReceiver();
         mainHandler.post(() -> {
             if (isSubscriptionActive(sub)) refreshSnapshot(sub);
@@ -1088,6 +1098,257 @@ public final class CodecController {
                         : connected
                         ? Strings.LE_AUDIO_SUMMARY_ON
                         : Strings.LE_AUDIO_SUMMARY_CONNECTING);
+    }
+
+    // ---- game-function rows (游戏低延迟 / 游戏自动切换 LE Audio) ----
+
+    /** Late binding for game rows injected after {@link #attach} (async host group build). */
+    public void attachGameRows(Object fragment, Object lowLatencySwitch,
+            Object autoLeaSwitch, Object gameModeAnchor) {
+        if (fragment == null) return;
+        Subscription sub = subscriptions.get(fragment);
+        if (sub == null) return;
+        sub.prefs.gameLowLatencySwitch = lowLatencySwitch;
+        sub.prefs.gameAutoLeaSwitch = autoLeaSwitch;
+        sub.prefs.gameModeAnchor = gameModeAnchor;
+        wireGameRows(sub);
+    }
+
+    /** Wire the game rows to the module preferences and mirror the state to bluetooth. */
+    private void wireGameRows(Subscription sub) {
+        if (!isSubscriptionActive(sub) || sub.gameRowsWired) return;
+        Object lowLatencySwitch = sub.prefs.gameLowLatencySwitch;
+        Object autoLeaSwitch = sub.prefs.gameAutoLeaSwitch;
+        if (lowLatencySwitch == null && autoLeaSwitch == null) return;
+        sub.gameRowsWired = true;
+        captureGameAnchorHostState(sub);
+        ClassLoader cl = context.getClassLoader();
+        if (lowLatencySwitch != null) {
+            boolean lowLatencyEnabled = prefs.isGameLowLatencyEnabled();
+            PrefRef.setChecked(lowLatencySwitch, lowLatencyEnabled);
+            PrefRef.setSummary(lowLatencySwitch, lowLatencyEnabled
+                    ? Strings.GAME_LOW_LATENCY_SUMMARY_ON
+                    : Strings.GAME_LOW_LATENCY_SUMMARY_OFF);
+            Class<?> listenerCls = resolveChangeListenerInterface(cl, lowLatencySwitch);
+            if (listenerCls != null) {
+                Object listener = Proxy.newProxyInstance(cl, new Class[]{listenerCls},
+                        (proxy, method, args) -> {
+                            if (args == null || args.length < 2
+                                    || !(args[1] instanceof Boolean)) {
+                                return false;
+                            }
+                            onGameLowLatencyToggled(sub, (Boolean) args[1]);
+                            return true;
+                        });
+                invokeSetChangeListener(lowLatencySwitch, listener, listenerCls);
+            }
+        }
+        if (autoLeaSwitch != null) {
+            PrefRef.setChecked(autoLeaSwitch, prefs.isGameAutoLeaEnabled());
+            PrefRef.setSummary(autoLeaSwitch, Strings.GAME_AUTO_LEA_SUMMARY);
+            Class<?> listenerCls = resolveChangeListenerInterface(cl, autoLeaSwitch);
+            if (listenerCls != null) {
+                Object listener = Proxy.newProxyInstance(cl, new Class[]{listenerCls},
+                        (proxy, method, args) -> {
+                            if (args == null || args.length < 2
+                                    || !(args[1] instanceof Boolean)) {
+                                return false;
+                            }
+                            onGameAutoLeaToggled(sub, (Boolean) args[1]);
+                            return true;
+                        });
+                invokeSetChangeListener(autoLeaSwitch, listener, listenerCls);
+            }
+        }
+        applyGameRowEnableState(sub, prefs.isGameLowLatencyEnabled());
+        applyGameAutoLeaVisibility(sub);
+        sendGameLatencyState("attach");
+        // The host re-styles the game group while earphone state arrives; re-apply afterwards.
+        mainHandler.postDelayed(() -> {
+            if (isSubscriptionActive(sub)) {
+                applyGameRowEnableState(sub, prefs.isGameLowLatencyEnabled());
+                applyGameAutoLeaVisibility(sub);
+            }
+        }, 1_500L);
+    }
+
+    private void onGameLowLatencyToggled(Subscription sub, boolean enabled) {
+        if (!isSubscriptionActive(sub)) return;
+        prefs.setGameLowLatencyEnabled(enabled);
+        refreshGameRows();
+        sendGameLatencyState("master_toggle");
+    }
+
+    private void onGameAutoLeaToggled(Subscription sub, boolean enabled) {
+        if (!isSubscriptionActive(sub)) return;
+        prefs.setGameAutoLeaEnabled(enabled);
+        refreshGameRows();
+        sendGameLatencyState("auto_lea_toggle");
+    }
+
+    /** 游戏低延迟=off greys out the official 游戏模式 row and the auto-LEA switch. */
+    private void applyGameRowEnableState(Subscription sub, boolean lowLatencyEnabled) {
+        if (sub.prefs.gameAutoLeaSwitch != null) {
+            PrefRef.setDisabled(sub.prefs.gameAutoLeaSwitch, !lowLatencyEnabled);
+        }
+        Object anchor = sub.prefs.gameModeAnchor;
+        if (anchor == null) return;
+        if (lowLatencyEnabled && !sub.gameAnchorDisabledByUs) return;
+        applyingGameRowState.set(true);
+        try {
+            PrefRef.setDisabled(anchor, !lowLatencyEnabled || sub.gameAnchorHostDisabled);
+            // Jump rows can allow clicks while visually disabled. Gate Preference.performClick
+            // too, while preserving the host's independent connection/capability enable flag.
+            PrefRef.setEnabled(anchor, lowLatencyEnabled && sub.gameAnchorHostEnabled);
+            sub.gameAnchorDisabledByUs = !lowLatencyEnabled;
+        } finally {
+            applyingGameRowState.set(false);
+        }
+    }
+
+    /**
+     * 「游戏自动切换 LE Audio」只对确认支持 LE Audio 的耳机显示，判据与主 LE Audio 开关
+     * 相同（{@link LeAudioManager#isSupported(String)}）；能力状态变化时重新刷新。
+     */
+    private void applyGameAutoLeaVisibility(Subscription sub) {
+        if (sub.prefs.gameAutoLeaSwitch == null) return;
+        PrefRef.setVisible(sub.prefs.gameAutoLeaSwitch, leAudioManager.isSupported(sub.mac));
+    }
+
+    /** Called only after the host's own setter; module-originated setters are ignored. */
+    public void onGameRowHostStateChanged(Object row, String setter, boolean value) {
+        if (applyingGameRowState.get()) return;
+        for (Subscription sub : subscriptions.values()) {
+            if (!isSubscriptionActive(sub) || sub.prefs.gameModeAnchor != row) continue;
+            if ("setDisabled".equals(setter)) sub.gameAnchorHostDisabled = value;
+            if ("setEnabled".equals(setter)) sub.gameAnchorHostEnabled = value;
+            applyGameRowEnableState(sub, prefs.isGameLowLatencyEnabled());
+        }
+    }
+
+    private static void captureGameAnchorHostState(Subscription sub) {
+        Object anchor = sub.prefs.gameModeAnchor;
+        if (anchor == null) return;
+        try {
+            Object enabled = anchor.getClass().getMethod("isEnabled").invoke(anchor);
+            if (enabled instanceof Boolean) sub.gameAnchorHostEnabled = (Boolean) enabled;
+        } catch (Throwable ignored) {
+        }
+        for (Class<?> cls = anchor.getClass(); cls != null; cls = cls.getSuperclass()) {
+            try {
+                Field field = cls.getDeclaredField("mDisabled");
+                field.setAccessible(true);
+                Object disabled = field.get(anchor);
+                if (disabled instanceof Boolean) sub.gameAnchorHostDisabled = (Boolean) disabled;
+                break;
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private void sendGameLatencyState(String reason) {
+        String requestId = java.util.UUID.randomUUID().toString();
+        gameLatencyRequestId = requestId;
+        gameLatencyStateConfirmed = false;
+        pushGameLatencyState(requestId, reason);
+        scheduleGameLatencyStateRetry(requestId, 0);
+    }
+
+    private void pushGameLatencyState(String requestId, String reason) {
+        boolean lowLatencyEnabled = prefs.isGameLowLatencyEnabled();
+        boolean autoLeaEnabled = prefs.isGameAutoLeaEnabled();
+        try {
+            Intent intent = new Intent(LeAudioIpc.ACTION_SET_GAME_LATENCY_STATE);
+            intent.setPackage(LeAudioIpc.BLUETOOTH_PKG);
+            intent.putExtra(LeAudioIpc.EXTRA_TOKEN, LeAudioIpc.TOKEN);
+            intent.putExtra(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, lowLatencyEnabled);
+            intent.putExtra(LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED, autoLeaEnabled);
+            boolean sent = TrustedBroadcasts.send(context, intent);
+            MLog.event("game.ll.state.sent", "reason", reason,
+                    "lowLatency", lowLatencyEnabled, "autoLea", autoLeaEnabled, "sent", sent);
+            Intent query = new Intent(LeAudioIpc.ACTION_QUERY_GAME_LATENCY_STATE);
+            query.setPackage(LeAudioIpc.BLUETOOTH_PKG);
+            query.putExtra(LeAudioIpc.EXTRA_TOKEN, LeAudioIpc.TOKEN);
+            query.putExtra(LeAudioIpc.EXTRA_GAME_STATE_REQUEST_ID, requestId);
+            query.putExtra(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, lowLatencyEnabled);
+            query.putExtra(LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED, autoLeaEnabled);
+            TrustedBroadcasts.send(context, query);
+        } catch (Throwable t) {
+            MLog.w("game latency state broadcast failed", t);
+        }
+    }
+
+    private void scheduleGameLatencyStateRetry(String requestId, int attempt) {
+        if (attempt >= GAME_STATE_RETRY_DELAYS_MS.length) return;
+        mainHandler.postDelayed(() -> {
+            if (!requestId.equals(gameLatencyRequestId) || gameLatencyStateConfirmed) return;
+            pushGameLatencyState(requestId, "retry_" + (attempt + 1));
+            if (attempt + 1 < GAME_STATE_RETRY_DELAYS_MS.length) {
+                scheduleGameLatencyStateRetry(requestId, attempt + 1);
+            } else {
+                // Give the last readback time to arrive before reporting an unconfirmed mirror.
+                mainHandler.postDelayed(() -> {
+                    if (requestId.equals(gameLatencyRequestId) && !gameLatencyStateConfirmed) {
+                        MLog.w("game latency state not confirmed by bluetooth");
+                    }
+                }, 1_000L);
+            }
+        }, GAME_STATE_RETRY_DELAYS_MS[attempt]);
+    }
+
+    private void registerGameLatencyStateReceiver() {
+        gameLatencyStateReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                if (intent == null || !LeAudioIpc.TOKEN.equals(
+                        intent.getStringExtra(LeAudioIpc.EXTRA_TOKEN))) return;
+                if (TrustedBroadcasts.supportsSenderIdentity()
+                        && !TrustedBroadcasts.isTrustedSender(context,
+                                TrustedBroadcasts.captureSender(this), LeAudioIpc.BLUETOOTH_PKG)) {
+                    return;
+                }
+                if (LeAudioIpc.ACTION_REQUEST_GAME_LATENCY_STATE.equals(intent.getAction())) {
+                    refreshGameRows();
+                    sendGameLatencyState("bluetooth_ready");
+                    return;
+                }
+                if (!LeAudioIpc.ACTION_GAME_LATENCY_STATE.equals(intent.getAction())) return;
+                String requestId = intent.getStringExtra(LeAudioIpc.EXTRA_GAME_STATE_REQUEST_ID);
+                if (requestId == null || !requestId.equals(gameLatencyRequestId)) return;
+                boolean confirmed = intent.getBooleanExtra(LeAudioIpc.EXTRA_GAME_STATE_READY, false)
+                        && intent.hasExtra(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED)
+                        && intent.hasExtra(LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED)
+                        && intent.getBooleanExtra(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, true)
+                                == prefs.isGameLowLatencyEnabled()
+                        && intent.getBooleanExtra(LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED, false)
+                                == prefs.isGameAutoLeaEnabled();
+                if (confirmed) {
+                    gameLatencyStateConfirmed = true;
+                    refreshGameRows();
+                    MLog.event("game.ll.state.confirmed");
+                }
+            }
+        };
+        IntentFilter filter = new IntentFilter(LeAudioIpc.ACTION_GAME_LATENCY_STATE);
+        filter.addAction(LeAudioIpc.ACTION_REQUEST_GAME_LATENCY_STATE);
+        if (!TrustedBroadcasts.registerExportedReceiver(context, gameLatencyStateReceiver, filter,
+                TrustedBroadcasts.PERMISSION_OPLUS_COMPONENT_SAFE, mainHandler)) {
+            MLog.w("game latency readback receiver registration failed");
+        }
+    }
+
+    private void refreshGameRows() {
+        boolean lowLatencyEnabled = prefs.isGameLowLatencyEnabled();
+        boolean autoLeaEnabled = prefs.isGameAutoLeaEnabled();
+        for (Subscription sub : subscriptions.values()) {
+            if (!isSubscriptionActive(sub) || !sub.gameRowsWired) continue;
+            PrefRef.setChecked(sub.prefs.gameLowLatencySwitch, lowLatencyEnabled);
+            PrefRef.setSummary(sub.prefs.gameLowLatencySwitch, lowLatencyEnabled
+                    ? Strings.GAME_LOW_LATENCY_SUMMARY_ON : Strings.GAME_LOW_LATENCY_SUMMARY_OFF);
+            PrefRef.setChecked(sub.prefs.gameAutoLeaSwitch, autoLeaEnabled);
+            applyGameRowEnableState(sub, lowLatencyEnabled);
+            applyGameAutoLeaVisibility(sub);
+        }
     }
 
     private void restoreClassicAudioRowsForMac(String mac) {
@@ -3533,6 +3794,10 @@ public final class CodecController {
         BroadcastReceiver receiver;
         Boolean connected;
         boolean renderedLeAudioActive;
+        boolean gameRowsWired;
+        boolean gameAnchorDisabledByUs;
+        boolean gameAnchorHostDisabled;
+        boolean gameAnchorHostEnabled = true;
         java.lang.ref.WeakReference<Activity> hostActivity;
         volatile boolean active = true;
         private long refreshGeneration;
