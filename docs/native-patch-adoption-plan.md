@@ -186,6 +186,15 @@ unsupported 分支）：
 - 同一版本线的多机型若 so 相同（如 .401/.402）可共用 spec；
 - **未来可选优化**：为等价补丁增加 ARM64 语义扫描定位（与码率 branch 的语义兜底一致），
   缓解版本漂移，但写入仍需精确字节。
+- ColorOS 17（Android 17）实测（2026-10-12，PJZ110_17.0.0.103）：`A2DP_CodecEquals`
+  重新原生分发 LHDC V5——0x98f1e4 构建 codec id 0x4c35053aff、0x98f1f4 不等落到
+  unsupported logger 块（0x98f220）、相等时 0x98f208 尾调
+  `A2DP_VendorCodecEqualsLhdcV5`@0x725880；同库另有 `A2DP_VendorCodecTypeEqualsLhdcV5`@0x725744。
+  作为对照，16.0.9.401 / 16.0.10.501 的 `libbluetooth_jni.so` 完全没有该符号（该常量只出现在
+  packet-timestamp 分发链），即 C16 漏接是真实回归、C17 已修回系统侧。
+  因此快切等价补丁按 ≥ 17.0.0.0 版本线门控为 `not_required`
+  （`NativeLhdcMemoryPatch.isNativeEqualityBuild`，detail=`native_equality_dispatch_17`）；
+  码率 branch 在同一版本线上仍命中 `branch_plus_68_pjz110_1609401_1610501`，必须继续写入。
 
 ## 7. 验证清单
 

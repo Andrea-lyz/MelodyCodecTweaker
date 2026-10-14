@@ -32,7 +32,7 @@ import xyz.melodylsp.codec.BuildConfig;
  * mapped library inside {@code com.android.bluetooth}: scan the mapped bytes, temporarily make the
  * target page writable, write the branch instruction, verify, then restore page protection.</p>
  */
-final class NativeLhdcMemoryPatch {
+public final class NativeLhdcMemoryPatch {
 
     private static final String LIB_NAME = "libbluetooth_jni.so";
     private static final PatternSpec[] PATTERN_SPECS = {
@@ -258,6 +258,43 @@ final class NativeLhdcMemoryPatch {
         return 0;
     }
 
+    /**
+     * ColorOS 17（Android 17）重新引入 LHDC V5 的 vendor equality 分发：实测
+     * PJZ110_17.0.0.103 的 libbluetooth_jni.so（md5 949730f446771af5e680922604947618）
+     * 中 A2DP_CodecEquals@0x98f024 在 0x98f1e4 构建 codec id 0x4c35053aff、0x98f1f4
+     * 不相等时落到 unsupported logger 块（0x98f220），相等时 0x98f208 尾调
+     * A2DP_VendorCodecEqualsLhdcV5@0x725880 —— 即 ColorOS 16 漏接、快切等价补丁手工
+     * 补回的行为已回归系统原生。同一常量在 16.0.9.401 / 16.0.10.501 上只出现在
+     * packet-timestamp 分发链，两个版本线都没有 A2DP_VendorCodecEqualsLhdcV5 符号。
+     */
+    private static final int[] NATIVE_EQUALITY_BUILD_LINE = {17, 0, 0, 0};
+
+    /**
+     * 版本线主版本号上限：ColorOS 版本线目前是 11..17，而「型号_其它 4 段数字(地区)」形状的
+     * 显示名（例如 PJD110_2026.08.13.999(CN01)）会让年/月/日匹配成版本线。超过该上限一律
+     * 当作解析不出、交给扫描如实上报，避免把 ColorOS 16 及更早设备误判成「自带等价分发」
+     * 而静默跳过补丁与提醒。
+     */
+    private static final int NATIVE_EQUALITY_MAX_BUILD_MAJOR = 99;
+
+    /**
+     * 判定该构建是否自带 LHDC V5 equality 分发：版本线 >= 17.0.0.0 返回 true，这类构建
+     * 不需要快切等价补丁。解析不出版本线时返回 false，交给 pattern / 语义扫描决定，保持
+     * 「宁可报 unsupported 也不猜测」的漂移策略。
+     *
+     * <p>只对快切等价补丁生效：码率 branch 在同一版本线上仍是新字节（C17 实测命中
+     * branch_plus_68_pjz110_1609401_1610501），必须继续扫描并写入。
+     */
+    public static boolean isNativeEqualityBuild(String display) {
+        int[] version = parseColorOsVersionLine(display);
+        if (version == null
+                || version[0] < NATIVE_EQUALITY_BUILD_LINE[0]
+                || version[0] > NATIVE_EQUALITY_MAX_BUILD_MAJOR) {
+            return false;
+        }
+        return compareVersionLines(version, NATIVE_EQUALITY_BUILD_LINE) >= 0;
+    }
+
     static synchronized PatchResult apply() {
         // Toast-matrix 设备验证门：debug 构建且显式开启时模拟补丁未适配（release 恒 false，
         // 且此处 DEBUG 二次门控保证 release 永不生效）。
@@ -297,6 +334,14 @@ final class NativeLhdcMemoryPatch {
         }
         if (isPreNativePatchBuild(Build.DISPLAY)) {
             PatchResult nativeSupported = PatchResult.notRequired("native_lhdc_v5_available");
+            lastQualitySwitchResult = nativeSupported;
+            return nativeSupported;
+        }
+        // ColorOS 17 起 A2DP_CodecEquals 原生分发 LHDC V5（见 NATIVE_EQUALITY_BUILD_LINE），
+        // 快切等价补丁不需要，也不该按 unsupported 上报——宿主会把 unsupported 当成
+        // 「未完整适配」弹提醒并在诊断页显示红叉。
+        if (isNativeEqualityBuild(Build.DISPLAY)) {
+            PatchResult nativeSupported = PatchResult.notRequired("native_equality_dispatch_17");
             lastQualitySwitchResult = nativeSupported;
             return nativeSupported;
         }

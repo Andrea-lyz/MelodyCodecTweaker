@@ -4,7 +4,7 @@ plugins {
 
 android {
     namespace = "xyz.melodylsp.codec"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "xyz.melodylsp.codec"
@@ -21,6 +21,11 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += "-std=c++17"
+                // Android 15+ 的 16 KB 页面大小要求：NDK r27 该开关会追加
+                // -Wl,-z,max-page-size=16384，让 LOAD 段与 PT_GNU_RELRO 段末都按
+                // 16 KB 对齐（否则可调试包会在打开时弹「应用兼容性」警告，16 KB
+                // 内核设备上还会导致 so 加载失败）。
+                arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON"
             }
         }
     }
@@ -85,6 +90,7 @@ android {
 dependencies {
     // Modern Xposed API. Provided by LSPosed at runtime.
     compileOnly("io.github.libxposed:api:101.0.1")
+    implementation("io.github.libxposed:service:102.0.0")
     // Runtime dex scanner used to locate R8-renamed Melody host classes by stable strings.
     implementation("org.luckypray:dexkit:2.2.0")
     // androidx.annotation is used inline (@NonNull etc.); we don't compile against

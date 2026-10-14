@@ -23,9 +23,11 @@
         <package android:name="com.oplus.melody" />
         <package android:name="com.android.bluetooth" />
         <package android:name="com.oplus.wirelesssettings" />
+        <package android:name="com.android.settings" />
     </queries>
 
     <application
+        android:name=".ui.FrameworkStatusApplication"
         android:allowBackup="false"
         android:label="@string/app_label"
         android:description="@string/app_description"

@@ -476,6 +476,36 @@
       margin-top: 4px; font-size: 12px; color: var(--muted);
       font-variant-numeric: tabular-nums;
     }
+    /* ── v3-35: 实时探测来源与点按原因弹层 ── */
+    .row.has-note, .key-status-item.has-note { cursor: pointer; }
+    .row.has-note, .row.has-note *,
+    .key-status-item.has-note, .key-status-item.has-note *,
+    .env-value .scope-mark, .note-ok {
+      -webkit-tap-highlight-color: transparent;
+    }
+    .key-status-item.has-note { user-select: none; -webkit-user-select: none; }
+    .key-status-item.has-note .name::after {
+      content: ' ⓘ'; color: var(--muted); font-size: 12px;
+    }
+    .row.has-note:active, .key-status-item.has-note:active { opacity: .7; }
+    .note-overlay {
+      position: fixed; inset: 0; z-index: 40;
+      display: flex; align-items: center; justify-content: center;
+      padding: 24px; background: rgba(0, 0, 0, .45);
+    }
+    .note-overlay[hidden] { display: none; }
+    .scope-mark.dim { opacity: .42; }
+    .note-card {
+      width: 100%; max-width: 420px; border-radius: 16px;
+      background: #ffffff; color: #17171a;
+      padding: 18px 18px 14px; box-shadow: 0 12px 40px rgba(0, 0, 0, .32);
+    }
+    .note-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; }
+    .note-body { font-size: 14px; line-height: 1.55; color: #5c5f66; }
+    .note-ok {
+      margin-top: 14px; width: 100%; height: 42px; border: none; border-radius: 12px;
+      background: #3b6ef6; color: #ffffff; font-size: 15px; font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -500,9 +530,9 @@
     <div class="switch-row">
       <div class="label">
         <strong>模块激活状态</strong>
-        <p id="module-active-detail">当前版本：2.2.0</p>
+        <p id="module-active-detail">正在查询框架与作用域</p>
       </div>
-      <span class="pill ok" id="module-active-pill"><span class="dot"></span>已激活</span>
+      <span class="pill idle" id="module-active-pill"><span class="dot"></span>正在检测</span>
     </div>
   </section>
 
@@ -564,7 +594,7 @@
   <!-- ═══════════════ 关键状态速览（v3 新增） ═══════════════ -->
   <section class="card" id="key-status">
     <h2>关键状态</h2>
-    <p class="hint">从诊断状态中甄选的关键项，仅显示名称与状态；完整列表见「状态」页。</p>
+    <p class="hint">点按带 ⓘ 标记的状态卡片可查看说明；完整列表见「状态」页。</p>
     <div class="key-status-grid" id="key-status-grid">
       <div class="key-status-item"><span class="name">码率 branch 补丁</span><span class="scope-mark ok">✓</span></div>
       <div class="key-status-item"><span class="name">快切等价补丁</span><span class="scope-mark ok">✓</span></div>
@@ -966,6 +996,15 @@
   </div>
 </nav>
 
+<!-- ═══════════════ v3-35: 状态说明弹层（点按灰色状态卡/行打开） ═══════════════ -->
+<div class="note-overlay" id="note-overlay" hidden>
+  <div class="note-card" role="dialog" aria-modal="true">
+    <div class="note-title" id="note-title">状态说明</div>
+    <div class="note-body" id="note-body"></div>
+    <button class="note-ok" id="note-ok" type="button">知道了</button>
+  </div>
+</div>
+
 <script>
   const bridge = window.MelodyDiagBridge;
   const HISTORY_BUCKETS = 24;
@@ -1039,15 +1078,28 @@
   }
   function statusTier(status) {
     const normalized = String(status || '').trim().toLowerCase();
-    if (status === '未发现'
-        || ['ok','ready','loaded','hooked','injected','registered','patched','active','armed'].includes(normalized)) return 'ok';
+    if (status === '未发现' || status === '已启用'
+        || ['ok','ready','loaded','enabled','hooked','injected','registered','patched','active','armed'].includes(normalized)) return 'ok';
     if (['attention','error','failed'].includes(normalized)) return 'err';
-    if (['pending','warning','would_protect'].includes(normalized)) return 'warn';
+    if (['pending','warning','would_protect','待重启作用域'].includes(normalized)) return 'warn';
     return 'idle';
   }
 
+  /* ── v3-35: 实时探测快照（applySnapshot 写入；能力行以它为准，活动行仍看最近事件） ── */
+  let liveTakenAt = 0;
+  const STATE_LABELS = {
+    offline: '未加载',
+    native: '系统原生',
+    live_pending: '待上报',
+    enabled: '已启用',
+    restart_required: '待重启作用域',
+    unconfirmed: '待确认',
+    on_demand: '按需运行'
+  };
+
   function displayStatus(item) {
     const status = String(item && item.status || '').trim();
+    if (STATE_LABELS[status]) return STATE_LABELS[status];
     if (status) return status;
     const key = String(item && item.key || '');
     if (key === 'last.warning' || key === 'last.error') return '未发现';
@@ -1055,6 +1107,27 @@
   }
 
   function statusSubtext(item, status) {
+    const source = String(item && item.source || '');
+    const hint = item && item.note ? '（点按查看原因）' : '';
+    if (source === 'live') {
+      return (liveTakenAt ? '实时探测 · ' + fmtClock(liveTakenAt) : '实时探测') + hint;
+    }
+    if (source === 'framework') return '框架已确认' + hint;
+    if (source === 'confirmed') {
+      return '当前版本已确认' + (item.time ? ' · ' + fmtClock(item.time) : '') + hint;
+    }
+    if (source === 'waiting') return (item.note || '等待对应功能运行') + hint;
+    if (source === 'stale') {
+      const last = item && item.status && item.time ? ' · 上次 ' + fmtClock(item.time) : '';
+      return '未实时确认（应用未运行或模块未启用）' + last;
+    }
+    if (source === 'offline') return item.note || '未实时确认（应用未运行或模块未启用）';
+    if (source === 'native') {
+      return (item.note || '系统原生支持，无需该补丁') + '（点按查看原因）';
+    }
+    if (source === 'live_pending') {
+      return '本进程尚未上报' + (item.time ? ' · 上次 ' + fmtClock(item.time) : '');
+    }
     if (item && item.time) return fmtClock(item.time);
     if (status === '未发现') {
       return item && item.key === 'last.error'
@@ -1065,6 +1138,25 @@
     if (status === '本次未触发') return '本次会话未触发对应路径';
     if (status === '等待状态') return '等待对应作用域上报状态';
     return '尚未采集（不代表模块未生效）';
+  }
+
+  /* ── v3-35: 点按说明弹层 ── */
+  let noteBackdropPressed = false;
+  function showNote(title, text) {
+    const overlay = byId('note-overlay');
+    if (!overlay) return;
+    const titleEl = byId('note-title');
+    const bodyEl = byId('note-body');
+    if (titleEl) titleEl.textContent = title || '状态说明';
+    if (bodyEl) bodyEl.textContent = text || '';
+    noteBackdropPressed = false;
+    overlay.hidden = false;
+  }
+
+  function hideNote() {
+    noteBackdropPressed = false;
+    const overlay = byId('note-overlay');
+    if (overlay) overlay.hidden = true;
   }
   function setKpi(id, value, tier) {
     const el = byId(id);
@@ -1476,29 +1568,39 @@
       const pill = document.createElement('span');
       setPill(pill, statusTier(status), status, false);
       row.append(content, pill);
+      if (item.note) {
+        row.classList.add('has-note');
+        row.addEventListener('click', () => showNote(item.label || item.key || '', item.note));
+      }
       holder.appendChild(row);
     });
   }
 
-  /* ── v3: 概览顶部模块激活状态卡，由现有快照字段派生 ── */
+  /* 激活依据框架配置及真实加载结果，与耳机连接和宿主进程存活独立。 */
   function renderModuleActive(s) {
     const pill = byId('module-active-pill');
     const detail = byId('module-active-detail');
     if (!pill || !detail) return;
-    const rows = Array.isArray(s.statuses) ? s.statuses : [];
-    const host = rows.find(item => item.key === 'scope.host');
-    const hostStatus = String(host && host.status || '').trim();
+    const activation = s.activation || {};
     const env = s.environment || {};
     // environment.module 形如 "2.2.0 (23)"，只取版本名部分。
     const rawVersion = String(env.module || '').trim();
     const versionName = rawVersion.split(' (')[0].trim() || '未知';
     detail.textContent = '当前版本：' + versionName;
-    if (hostStatus === 'loaded' || hostStatus === 'ok') {
+    if (activation.state === 'active' || activation.state === 'enabled') {
       setPill(pill, 'ok', '已激活', false);
-    } else if (hostStatus === 'attention' || hostStatus === 'failed') {
-      setPill(pill, 'err', '未激活', false);
+      detail.textContent += ' · 连接耳机即可使用';
+    } else if (activation.state === 'disabled') {
+      setPill(pill, 'idle', '已停用', false);
+      detail.textContent += ' · 模块总开关已关闭';
+    } else if (activation.state === 'restart_required') {
+      setPill(pill, 'warn', '待重启作用域', false);
+      detail.textContent += ' · 安装后请重启作用域';
+    } else if (activation.state === 'checking' || !activation.state) {
+      setPill(pill, 'idle', '正在检测', true);
     } else {
-      setPill(pill, 'idle', '等待激活', false);
+      setPill(pill, 'warn', '待启用或重启', false);
+      detail.textContent += ' · 请在 LSPosed 启用模块并重启作用域';
     }
   }
 
@@ -1515,11 +1617,12 @@
   }
 
   /* ── v3: 状态标记：ok 系 → 绿勾，attention/failed → 红叉，其余灰横线 ── */
-  function scopeMark(status) {
+  function scopeMark(status, source) {
     const s = String(status || '').trim();
-    if (['ok','ready','loaded','hooked','injected','registered',
-         'patched','active','armed'].includes(s)) return ['ok', '✓'];
-    if (s === 'attention' || s === 'failed' || s === 'error') return ['err', '✗'];
+    const dim = source === 'stale' ? ' dim' : '';
+    if (['ok','ready','loaded','enabled','hooked','injected','registered',
+         'patched','active','armed'].includes(s)) return ['ok' + dim, '✓'];
+    if (s === 'attention' || s === 'failed' || s === 'error') return ['err' + dim, '✗'];
     return ['idle', '—'];
   }
 
@@ -1541,7 +1644,7 @@
     const rows = Array.isArray(statuses) ? statuses : [];
     KEY_STATUS_ITEMS.forEach(entry => {
       const statusRow = rows.find(item => item.key === entry[0]);
-      const mark = scopeMark(statusRow && statusRow.status);
+      const mark = scopeMark(statusRow && statusRow.status, statusRow && statusRow.source);
       const item = document.createElement('div');
       item.className = 'key-status-item';
       const name = document.createElement('span');
@@ -1551,20 +1654,47 @@
       icon.className = 'scope-mark ' + mark[0];
       icon.textContent = mark[1];
       item.append(name, icon);
+      if (statusRow && statusRow.note) {
+        item.classList.add('has-note');
+        item.addEventListener('click',
+          () => showNote(entry[1], statusRow.note));
+      }
       holder.appendChild(item);
     });
   }
 
-  function renderEnvironment(env, statuses) {
+  /* ── v3-35: 框架信息取自实时探测回执（libxposed getFrameworkName/Version/ApiVersion） ── */
+  function frameworkText(live, framework) {
+    if (framework && framework.bound && framework.framework) {
+      return String(framework.framework)
+        + (framework.frameworkVersion ? ' ' + framework.frameworkVersion : '')
+        + (framework.api ? ' · API ' + framework.api : '');
+    }
+    const scopes = (live && live.scopes) || {};
+    const order = ['host', 'bluetooth', 'wirelesssettings', 'settings'];
+    for (let i = 0; i < order.length; i++) {
+      const scope = scopes[order[i]];
+      if (!scope || !scope.framework) continue;
+      const version = String(scope.frameworkVersion || '').trim();
+      const api = scope.api ? ' · API ' + scope.api : '';
+      return String(scope.framework) + (version ? ' ' + version : '') + api;
+    }
+    return '';
+  }
+
+  function renderEnvironment(env, statuses, live, frameworkStatus) {
     const holder = byId('environment-grid');
     clear(holder);
     appendInfoRow(holder, '模块版本', env.module);
     appendInfoRow(holder, '系统', env.system);
+    const framework = frameworkText(live, frameworkStatus);
+    if (framework) appendInfoRow(holder, '框架', framework);
     const rows = Array.isArray(statuses) ? statuses : [];
     const scopeKeys = [
       ['无线耳机', 'scope.host', env.melody],
       ['蓝牙', 'scope.bluetooth', env.bluetooth],
-      ['无线设置', 'scope.wirelesssettings', env.wirelessSettings]
+      ['无线设置', 'scope.wirelesssettings', env.wirelessSettings],
+      ['系统设置', 'scope.settings', env.settings]
     ];
     scopeKeys.forEach(entry => {
       const row = document.createElement('div');
@@ -1577,12 +1707,16 @@
       const code = document.createElement('code');
       code.textContent = entry[2] || '—';
       const statusRow = rows.find(item => item.key === entry[1]);
-      const mark = scopeMark(statusRow && statusRow.status);
+      const mark = scopeMark(statusRow && statusRow.status, statusRow && statusRow.source);
       const span = document.createElement('span');
       span.className = 'scope-mark ' + mark[0];
       span.textContent = mark[1];
-      span.title = mark[0] === 'ok' ? '作用域已挂载'
-        : mark[0] === 'err' ? '作用域未正确挂载' : '等待作用域上报';
+      span.title = statusRow && statusRow.note ? statusRow.note
+        : String(mark[0]).indexOf('dim') >= 0
+        ? '未实时确认（应用未运行或模块未启用），显示最近一次结果'
+        : mark[0] === 'ok' ? '实时探测已回执'
+        : mark[0] === 'err' ? '作用域已回执但状态异常' : '未回执：模块未启用、应用未运行，或安装后未重启';
+      span.addEventListener('click', () => showNote(entry[0], span.title));
       wrap.append(code, span);
       row.append(label, wrap);
       holder.appendChild(row);
@@ -1692,10 +1826,11 @@
     enabledSwitch.checked = !!s.enabled;
     hideSwitch.checked = !!s.hideLauncherIcon;
     governorSwitch.checked = !!s.governorEnabled;
+    liveTakenAt = number(s.live && s.live.takenAt, 0);
     renderRecording(s);
     renderBqr(s.bqr);
     renderStatuses(s.statuses || []);
-    renderEnvironment(s.environment || {}, s.statuses || []);
+    renderEnvironment(s.environment || {}, s.statuses || [], s.live || {}, s.framework || {});
     renderModuleActive(s);
     renderKeyStatus(s.statuses || []);
     renderMemory(s.memory || {});
@@ -1752,6 +1887,7 @@
     button.disabled = true;
     button.textContent = '刷新中…';
     if (bridge && bridge.requestNativePatchState) bridge.requestNativePatchState();
+    if (bridge && bridge.probeStatus) bridge.probeStatus();
     refresh();
     setTimeout(() => {
       refresh();
@@ -1761,6 +1897,20 @@
         button.textContent = '刷新';
       }, 1200);
     }, 800);
+  });
+  /* ── v3-35: 状态说明弹层关闭 ── */
+  byId('note-ok').addEventListener('click', hideNote);
+  byId('note-overlay').addEventListener('pointerdown', event => {
+    // 只有这次手势从遮罩开始，才允许点击遮罩关闭。打开弹窗的触摸
+    // 可能随后落到新出现的遮罩上，不能把它当作第二次关闭操作。
+    noteBackdropPressed = event.target === byId('note-overlay');
+  });
+  byId('note-overlay').addEventListener('pointercancel', () => {
+    noteBackdropPressed = false;
+  });
+  byId('note-overlay').addEventListener('click', event => {
+    if (noteBackdropPressed && event.target === byId('note-overlay')) hideNote();
+    noteBackdropPressed = false;
   });
   document.querySelectorAll('[data-history-window]').forEach(button => {
     button.addEventListener('click', () => {

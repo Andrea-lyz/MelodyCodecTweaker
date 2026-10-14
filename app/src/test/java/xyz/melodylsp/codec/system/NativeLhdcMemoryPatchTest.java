@@ -458,6 +458,32 @@ public final class NativeLhdcMemoryPatchTest {
     }
 
     @Test
+    public void nativeEqualityBuildLineIsDetectedFromDisplay() {
+        // ColorOS 17 起 A2DP_CodecEquals 原生分发 LHDC V5：快切等价补丁短路为 not_required
+        assertTrue(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJZ110_17.0.0.103(CN01)"));
+        assertTrue(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJZ110_17.0.0.0(CN01)"));
+        assertTrue(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJD110_18.1.2.300(CN01)"));
+        // 阈值以下（ColorOS 16 及更早）仍走真实扫描：已适配与未适配的 OTA 都要上报
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJZ110_16.0.10.501(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJZ110_16.0.9.401(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJD110_15.0.1.100(CN01)"));
+        // 16.0.7 起仍需补丁的版本线不受影响（两把门控互不重叠）
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("OP15_16.0.7.201(CN01)"));
+        // 版本线前出现其它 4 段数字时仍锚定「型号_版本线(地区)」形状
+        assertTrue(NativeLhdcMemoryPatch.isNativeEqualityBuild(
+                "PJZ110_2026.08.13.999_17.0.0.103(CN01)"));
+        // 日期型 4 段数字（2026.08.13.999）不是版本线：不得据此短路成「原生支持」，
+        // 仍走扫描如实上报（C16 及更早设备不能因此静默跳过补丁与提醒）
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJD110_2026.08.13.999(CN01)"));
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJZ110_2026.08.13.999(IN01)"));
+        // 无法解析版本线时不拦截：交给 pattern / 语义扫描决定（不猜测）
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("BP2A.250605.015"));
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild("PJZ110_17.0.0.103"));
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild(""));
+        assertFalse(NativeLhdcMemoryPatch.isNativeEqualityBuild(null));
+    }
+
+    @Test
     public void preNativePatchVersionLineParsesOnlyOplusShapedSegments() {
         int[] v = NativeLhdcMemoryPatch.parseColorOsVersionLine("PJD110_16.0.3.500(CN01)");
         assertEquals(16, v[0]);

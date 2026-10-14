@@ -214,6 +214,43 @@ public final class CodecBlockBuilder {
                 /* includeRemember= */ true);
     }
 
+    /**
+     * Build a detached switch row for the game-function group, cloning the host's switch
+     * styling when a plain COUI switch is present on the surface. Insertion / ordering stays
+     * with the caller.
+     */
+    public static Object buildSwitchRow(
+            Context context, Object styleSource, String key, String title, String summary) {
+        Object pref = newOf(context, COUI_SWITCH_PREFERENCE, ANDX_SWITCH_PREFERENCE_COMPAT);
+        if (pref == null) return null;
+        cloneVisualStyleFrom(pref, findSwitchTemplate(styleSource));
+        PrefRef.setKey(pref, key);
+        PrefRef.setTitle(pref, title);
+        PrefRef.setSummary(pref, summary);
+        PrefRef.setIconSpaceReserved(pref, false);
+        PrefRef.setPersistent(pref, false);
+        return pref;
+    }
+
+    /** Prefer the plain COUI switch; the Melody tips switch would import an unused tip slot. */
+    private static Object findSwitchTemplate(Object container) {
+        if (container == null) return null;
+        int count = PrefRef.getPreferenceCount(container);
+        for (int i = 0; i < count; i++) {
+            Object pref = PrefRef.getPreference(container, i);
+            if (pref == null) continue;
+            String name = pref.getClass().getName();
+            if (name.contains("COUISwitchPreference") && !name.contains("Tips")) return pref;
+        }
+        for (int i = 0; i < count; i++) {
+            Object pref = PrefRef.getPreference(container, i);
+            if (pref == null) continue;
+            Object found = findSwitchTemplate(pref);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
     private static void cloneVisualStyleFrom(Object to, Object from) {
         if (to == null || from == null) return;
         int layout = PrefRef.getLayoutResource(from);

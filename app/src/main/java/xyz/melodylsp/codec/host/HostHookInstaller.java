@@ -105,6 +105,11 @@ public final class HostHookInstaller {
     private static final String KEY_NOISE_SWITCH_CATEGORY = "pref_noise_switch_category";
     private static final String KEY_MORE_SETTING = "pref_more_setting";
     private static final String KEY_FOOTER = "footer_preference";
+    /** 游戏功能 rows injected around the official 游戏模式 entry (DetailMain only). */
+    private static final String KEY_GAME_LOW_LATENCY = "melody_codec_lsp_game_low_latency";
+    private static final String KEY_GAME_AUTO_LEA = "melody_codec_lsp_game_auto_lea";
+    private static final String GAME_MODE_ROW_TITLE = "游戏模式";
+    private static final String[] GAME_ROW_CLASS_HINTS = {"GameSetItem", "GameModeItem"};
     private static final Pattern MAC_PATTERN =
             Pattern.compile("(?i)(?:[0-9a-f]{2}:){5}[0-9a-f]{2}");
 
@@ -150,6 +155,7 @@ public final class HostHookInstaller {
             hookDetailMainActivity();
             hookOneSpaceActivity();
             hookOfficialGameModeState();
+            hookGameRowHostState();
         } finally {
             dexKit.close();
         }
@@ -383,6 +389,7 @@ public final class HostHookInstaller {
                 Object screen = PrefRef.getPreferenceScreen(fragment);
                 if (screen != null && attachedScreens.contains(screen)) {
                     if (hasCodecMarker(screen)) {
+                        ensureGameRows(fragment, screen);
                         scheduleNextSurfaceCheck(fragment, attempt);
                         return;
                     }
@@ -449,8 +456,10 @@ public final class HostHookInstaller {
         boolean oneSpaceHost = isOneSpaceHost(fragment);
 
         if (hasCodecMarker(screen)) {
-            // Already injected on this screen.
+            // Already injected on this screen; the game rows can still arrive late because the
+            // host builds the 游戏功能 group asynchronously.
             attachedScreens.add(screen);
+            ensureGameRows(fragment, screen);
             return true;
         }
 
@@ -503,6 +512,12 @@ public final class HostHookInstaller {
                 /* wrapInCategory= */ false, /* includeRemember= */ true,
                 /* includeLeAudio= */ true);
         if (prefs == null) return false;
+        Object[] gameRows = injectGameRows(fragment, screen);
+        if (gameRows != null) {
+            prefs.gameLowLatencySwitch = gameRows[0];
+            prefs.gameAutoLeaSwitch = gameRows[1];
+            prefs.gameModeAnchor = gameRows[2];
+        }
         controller.attach(mac, prefs, fragment);
         attachedScreens.add(screen);
         MLog.event("detailmain_fallback.injected", "mac_len", mac.length(),
@@ -535,6 +550,12 @@ public final class HostHookInstaller {
                 /* wrapInCategory= */ false, /* includeRemember= */ true,
                 /* includeLeAudio= */ true);
         if (prefs == null) return false;
+        Object[] gameRows = injectGameRows(fragment, screen);
+        if (gameRows != null) {
+            prefs.gameLowLatencySwitch = gameRows[0];
+            prefs.gameAutoLeaSwitch = gameRows[1];
+            prefs.gameModeAnchor = gameRows[2];
+        }
         controller.attach(mac, prefs, fragment);
         attachedScreens.add(screen);
         MLog.event("hires_anchored.injected", "mac_len", mac.length(),
@@ -697,6 +718,141 @@ public final class HostHookInstaller {
                 PrefRef.setOrder(pref, order + delta);
             }
         }
+    }
+
+    // ---- game-function rows (游戏低延迟 / 游戏自动切换 LE Audio) ----
+
+    /** Preserve the module gate when the host re-renders connection/mutex state later. */
+    private void hookGameRowHostState() {
+        Set<Method> hooked = new java.util.HashSet<>();
+        for (String hint : GAME_ROW_CLASS_HINTS) {
+            Class<?> cls = loadHostClass(
+                    "com.oplus.melody.ui.component.detail.gamemode." + hint);
+            if (cls == null) continue;
+            for (String setter : new String[]{"setEnabled", "setDisabled"}) {
+                try {
+                    Method method = cls.getMethod(setter, boolean.class);
+                    if (!hooked.add(method)) continue;
+                    method.setAccessible(true);
+                    module.hook(method).intercept(chain -> {
+                        Object result = chain.proceed();
+                        CodecController current = controller;
+                        if (current != null) {
+                            try {
+                                current.onGameRowHostStateChanged(chain.getThisObject(), setter,
+                                        Boolean.TRUE.equals(chain.getArgs().get(0)));
+                            } catch (Throwable t) {
+                                MLog.w("game row host-state reconciliation failed", t);
+                            }
+                        }
+                        return result;
+                    });
+                } catch (NoSuchMethodException ignored) {
+                    // The switch row uses setEnabled; the jump row also has setDisabled.
+                } catch (Throwable t) {
+                    MLog.w("game row host-state hook failed: " + setter, t);
+                }
+            }
+        }
+    }
+
+    private static boolean hasGameRowMarker(Object screen) {
+        return PrefRef.findPreference(screen, KEY_GAME_LOW_LATENCY) != null
+                || PrefRef.findPreference(screen, KEY_GAME_AUTO_LEA) != null;
+    }
+
+    /** Late-arrival retry for the DetailMain game rows; idempotent. */
+    private void ensureGameRows(Object fragment, Object screen) {
+        if (controller == null || !isDetailMainHost(fragment)) return;
+        if (hasGameRowMarker(screen)) return;
+        Object[] rows = injectGameRows(fragment, screen);
+        if (rows != null) {
+            controller.attachGameRows(fragment, rows[0], rows[1], rows[2]);
+        }
+    }
+
+    /**
+     * Insert the module game rows around the official 游戏模式 entry in the requested order:
+     * 游戏低延迟 -> 游戏模式 -> 游戏自动切换 LE Audio. Returns
+     * {@code {lowLatencySwitch, autoLeaSwitch, gameModeAnchor}}, or {@code null} when the
+     * anchor is not on this surface.
+     */
+    private Object[] injectGameRows(Object fragment, Object screen) {
+        if (PrefRef.findPreference(screen, KEY_GAME_LOW_LATENCY) != null
+                || PrefRef.findPreference(screen, KEY_GAME_AUTO_LEA) != null) {
+            return null;
+        }
+        Object anchor = findGameModeAnchor(screen);
+        if (anchor == null) return null;
+        Context themedContext = resolveThemedContext(fragment);
+        if (themedContext == null) return null;
+        Object lowLatencySwitch = CodecBlockBuilder.buildSwitchRow(
+                themedContext, screen, KEY_GAME_LOW_LATENCY,
+                Strings.GAME_LOW_LATENCY_TITLE, Strings.GAME_LOW_LATENCY_SUMMARY_ON);
+        Object autoLeaSwitch = CodecBlockBuilder.buildSwitchRow(
+                themedContext, screen, KEY_GAME_AUTO_LEA,
+                Strings.GAME_AUTO_LEA_TITLE, Strings.GAME_AUTO_LEA_SUMMARY);
+        if (lowLatencySwitch == null || autoLeaSwitch == null) {
+            MLog.w("game rows: switch rows could not be constructed");
+            return null;
+        }
+        Object parent = PrefRef.getParent(anchor);
+        if (parent == null) parent = screen;
+        int anchorOrder = PrefRef.getOrder(anchor);
+        // Target order: 游戏低延迟, 游戏模式, 游戏自动切换 LE Audio. Move every row after the
+        // anchor down by two so the new rows can straddle it.
+        shiftPreferenceOrders(parent, anchorOrder + 1, +2);
+        PrefRef.setOrder(anchor, anchorOrder + 1);
+        PrefRef.setOrder(lowLatencySwitch, anchorOrder);
+        PrefRef.setOrder(autoLeaSwitch, anchorOrder + 2);
+        PrefRef.addPreference(parent, lowLatencySwitch);
+        PrefRef.addPreference(parent, autoLeaSwitch);
+        MLog.event("game.rows.injected",
+                "anchor", PrefRef.getKey(anchor),
+                "anchorClass", anchor.getClass().getName(),
+                "order", anchorOrder);
+        return new Object[]{lowLatencySwitch, autoLeaSwitch, anchor};
+    }
+
+    /** Locate the official 游戏模式 row by class hint, falling back to its title. */
+    private static Object findGameModeAnchor(Object screen) {
+        for (String hint : GAME_ROW_CLASS_HINTS) {
+            Object found = findPreferenceByClassHint(screen, hint, 0);
+            if (found != null) return found;
+        }
+        return findPreferenceByTitle(screen, GAME_MODE_ROW_TITLE, 0);
+    }
+
+    private static Object findPreferenceByClassHint(Object container, String hint, int depth) {
+        if (container == null || depth > 6) return null;
+        int count = PrefRef.getPreferenceCount(container);
+        for (int i = 0; i < count; i++) {
+            Object pref = PrefRef.getPreference(container, i);
+            if (pref != null && pref.getClass().getName().contains(hint)) return pref;
+        }
+        for (int i = 0; i < count; i++) {
+            Object found = findPreferenceByClassHint(
+                    PrefRef.getPreference(container, i), hint, depth + 1);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    private static Object findPreferenceByTitle(Object container, String title, int depth) {
+        if (container == null || depth > 6) return null;
+        int count = PrefRef.getPreferenceCount(container);
+        for (int i = 0; i < count; i++) {
+            Object pref = PrefRef.getPreference(container, i);
+            if (pref == null) continue;
+            CharSequence value = PrefRef.getTitle(pref);
+            if (value != null && title.contentEquals(value)) return pref;
+        }
+        for (int i = 0; i < count; i++) {
+            Object found = findPreferenceByTitle(
+                    PrefRef.getPreference(container, i), title, depth + 1);
+            if (found != null) return found;
+        }
+        return null;
     }
 
     private void hookHighAudio() {

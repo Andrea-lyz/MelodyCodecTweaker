@@ -26,6 +26,10 @@ public final class PreferenceStore {
     public static final String MELODY_PREFS = "melody_lsp_codec_prefs";
 
     public static final String KEY_ENABLED = "enabled";
+    /** 游戏低延迟 master switch: OFF keeps the classic codec (LHDC) during games. */
+    private static final String KEY_GAME_LOW_LATENCY = "game_low_latency_enabled";
+    /** "游戏自动切换 LE Audio" switch: enable LC3 automatically while a game runs. */
+    private static final String KEY_GAME_AUTO_LEA = "game_auto_lea_enabled";
     private static final String KEY_REMEMBER_SUFFIX = "_remember";
     private static final String KEY_CODEC_TYPE_SUFFIX = "_codec_type";
     private static final String KEY_SPECIFIC1_SUFFIX = "_specific1";
@@ -65,6 +69,30 @@ public final class PreferenceStore {
         }
         MLog.event("remember.set", "mac", redact(key), "remembered", remembered);
         emitDiagnosticSnapshot("remember_set");
+    }
+
+    /** Module-wide game low-latency master switch (default ON preserves the stock behaviour). */
+    public boolean isGameLowLatencyEnabled() {
+        return prefs().getBoolean(KEY_GAME_LOW_LATENCY, true);
+    }
+
+    public void setGameLowLatencyEnabled(boolean enabled) {
+        if (!prefs().edit().putBoolean(KEY_GAME_LOW_LATENCY, enabled).commit()) {
+            MLog.w("game.low_latency.set commit failed");
+        }
+        MLog.event("game.low_latency.set", "enabled", enabled);
+    }
+
+    /** "游戏自动切换 LE Audio" switch (default OFF). */
+    public boolean isGameAutoLeaEnabled() {
+        return prefs().getBoolean(KEY_GAME_AUTO_LEA, false);
+    }
+
+    public void setGameAutoLeaEnabled(boolean enabled) {
+        if (!prefs().edit().putBoolean(KEY_GAME_AUTO_LEA, enabled).commit()) {
+            MLog.w("game.auto_lea.set commit failed");
+        }
+        MLog.event("game.auto_lea.set", "enabled", enabled);
     }
 
     public RememberedValue readSnapshot(String mac) {

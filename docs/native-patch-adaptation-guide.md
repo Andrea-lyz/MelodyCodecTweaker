@@ -27,6 +27,12 @@
 **无需人工适配**；只有块的布局结构真正变化、语义扫描不再唯一命中时才需要人工介入
 （此时通常要扩展语义扫描器或新增结构变体，而不是加字节 spec）。
 
+前置短路（先于上表）：ColorOS 17.0.0 起系统重新自带 LHDC V5 vendor equality 分发
+（`A2DP_CodecEquals` 在 0x4c35053aff 分支上直接尾调 `A2DP_VendorCodecEqualsLhdcV5`，
+见 `native_research/PJZ110_17.0.0.103/libbluetooth_jni.so`），模块按版本线让**快切等价**
+补丁短路并上报 `not_required`（`NativeLhdcMemoryPatch.isNativeEqualityBuild`）。
+这类构建不需要也不该补快切块，只需按本指南核对**码率 branch**（§3 起仍然适用）。
+
 ## 1. 样本准备
 
 - 目录约定：`native_research/<设备>_<版本>/libbluetooth_jni.so`；`liblhdcv5BT_enc.so`
@@ -119,6 +125,9 @@
 - 安装 → 重启 `com.android.bluetooth` → 诊断页两行状态或 logcat：
   - `evt=lhdc.memory_patch` → `status=patched`
   - `evt=lhdc.memory_patch.fast_switch` → `status=patched`
+  - ColorOS 17 及以上版本线：快切等价一行应为
+    `status=not_required detail=native_equality_dispatch_17`（系统原生），
+    码率 branch 一行仍应为 `status=patched`
 - 切「音质优先」不应出现「未适配 / 未完整适配」toast。
 - 通过后才把 README 适配矩阵标注「真机验证」。
 

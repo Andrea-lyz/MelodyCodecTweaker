@@ -13,10 +13,13 @@ import android.os.Binder;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.util.Log;
 
 import java.lang.reflect.Array;
 import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.HashMap;
@@ -24,6 +27,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -40,6 +47,7 @@ import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.leaudio.BluetoothLeAudioBridge;
+import xyz.melodylsp.codec.leaudio.LeAudioIpc;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
@@ -66,6 +74,14 @@ public final class SystemHookInstaller {
     private static final String CLASS_BT_UTILS = "com.android.bluetooth.Utils";
     private static final String CLASS_OPLUS_SMART_AUDIO =
             "com.oplus.bluetooth.feature.smartaudio.OplusBluetoothSmartAudioInterface";
+    private static final String CLASS_LL_SERVICE =
+            "com.oplus.bluetooth.feature.lowlatency.BluetoothLowLatencyService";
+    private static final String CLASS_LL_STATE_MACHINE =
+            "com.oplus.bluetooth.feature.lowlatency.BluetoothLowLatencyStateMachine";
+    /** The extension dex is attached lazily; retries cover the first minute of process life. */
+    private static final long[] GAME_LATENCY_HOOK_RETRY_DELAYS_MS = {
+            1_500L, 3_000L, 6_000L, 12_000L, 25_000L, 45_000L
+    };
     private static final String MELODY_PKG = "com.oplus.melody";
     private static final String ACTION_A2DP_CONNECTION_STATE_CHANGED =
             "android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED";
@@ -96,6 +112,24 @@ public final class SystemHookInstaller {
     private volatile Object a2dpServiceInstance;
     private CodecBroadcastBridge codecBroadcastBridge;
     private BluetoothLeAudioBridge leAudioBridge;
+    private volatile GameLeaController gameLeaController;
+    private final AtomicBoolean gameLatencyHookScheduled = new AtomicBoolean();
+    private final AtomicBoolean gameLatencyHookQueued = new AtomicBoolean();
+    private final ScheduledExecutorService gameLatencyHookWorker =
+            Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread worker = new Thread(runnable, "MC-game-hook");
+                worker.setDaemon(true);
+                return worker;
+            });
+    private volatile boolean gameLatencyDexTriggerHooked;
+    private volatile ClassLoader gameLatencyClassLoader;
+    private volatile boolean gameLatencyServiceHooked;
+    private volatile boolean gameLatencySmHooked;
+    private volatile boolean gameLatencyReadyHookResolved;
+    private volatile boolean gameLatencyProcessDiedHookResolved;
+    private volatile Object gameLatencyServiceInstance;
+    private volatile SharedPreferences gameLatencyStatePrefs;
+    private BroadcastReceiver gameLatencyStateReceiver;
     private Context appContext;
     private boolean serviceManagerAttempted;
     private boolean nativePatchTerminal;
@@ -250,8 +284,10 @@ public final class SystemHookInstaller {
         hookLifecycle(a2dpCls);
         hookCodecConfigUpdated(a2dpCls);
         hookNativeCodecPreferenceLogger();
+        hookGameLatencyExtensionReady();
         hookSmartAudioQueueSampler();
         hookRemoteChoppyReport();
+        scheduleGameLatencyHooks();
     }
 
     private Class<?> resolveA2dpServiceClass() {
@@ -348,6 +384,7 @@ public final class SystemHookInstaller {
             Method onCreate = Application.class.getMethod("onCreate");
             module.hook(onCreate).intercept(chain -> {
                 Object result = chain.proceed();
+                hookGameLatencyExtensionReady();
                 Object app = chain.getThisObject();
                 if (app instanceof Context) {
                     appContext = ((Context) app).getApplicationContext();
@@ -365,6 +402,7 @@ public final class SystemHookInstaller {
                     MLog.setDiagnosticContext(appContext, "bluetooth");
                     MLog.event("scope.system.context.ready");
                     ensureLeAudioBridge(appContext);
+                    scheduleGameLatencyHooks();
                     ensureCodecBroadcastBridge(appContext, bridgeService);
                     scheduleNativeLhdcMemoryPatch("application.onCreate");
                 }
@@ -856,6 +894,7 @@ public final class SystemHookInstaller {
         if (context != null) {
             NativeLhdcMemoryPatch.configureModuleContext(context);
             ensureLeAudioBridge(context);
+            scheduleGameLatencyHooks();
         }
         if (a2dpService == null) return;
         a2dpServiceInstance = a2dpService;
@@ -883,14 +922,84 @@ public final class SystemHookInstaller {
     }
 
     private synchronized void ensureLeAudioBridge(Context context) {
-        if (leAudioBridge != null || context == null) return;
+        if (context == null) return;
         try {
-            leAudioBridge = new BluetoothLeAudioBridge(context);
+            gameLatencyStatePrefs = context.getSharedPreferences(
+                    LeAudioIpc.GAME_LATENCY_PREFS, Context.MODE_PRIVATE);
+            if (leAudioBridge == null) {
+                leAudioBridge = new BluetoothLeAudioBridge(context);
+            }
+            boolean created = false;
+            if (gameLeaController == null) {
+                GameLeaController controller = new GameLeaController(context, leAudioBridge);
+                leAudioBridge.setGameLatencyListener(controller);
+                gameLeaController = controller;
+                created = true;
+                MLog.event("game.ll.controller.ready");
+            }
+            // Bind the listener before exposing SET_GAME_LATENCY_STATE to another process.
             leAudioBridge.register();
+            ensureGameLatencyStateReceiver(context);
+            if (created) {
+                requestGameLatencyState(context);
+                notifyGameServiceReady(gameLatencyServiceInstance, "controller_ready");
+            }
         } catch (Throwable t) {
-            leAudioBridge = null;
             MLog.w("ensureLeAudioBridge failed", t);
         }
+    }
+
+    private void ensureGameLatencyStateReceiver(Context context) {
+        if (gameLatencyStateReceiver != null) return;
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                if (intent == null || !LeAudioIpc.TOKEN.equals(
+                        intent.getStringExtra(LeAudioIpc.EXTRA_TOKEN))) return;
+                if (TrustedBroadcasts.supportsSenderIdentity()
+                        && !TrustedBroadcasts.isTrustedSender(ctx,
+                                TrustedBroadcasts.captureSender(this), LeAudioIpc.MELODY_PKG)) {
+                    return;
+                }
+                String requestId = intent.getStringExtra(LeAudioIpc.EXTRA_GAME_STATE_REQUEST_ID);
+                if (requestId == null || requestId.isEmpty()) return;
+                SharedPreferences sp = gameLatencyStatePrefs;
+                if (sp == null) return;
+                boolean lowLatency = sp.getBoolean(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, true);
+                boolean autoLea = sp.getBoolean(LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED, false);
+                boolean ready = gameLeaController != null;
+                // The SET receiver has its own executor. Do not treat an earlier QUERY as an
+                // acknowledgement of new values that have not reached that executor yet.
+                if (ready && intent.hasExtra(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED)
+                        && intent.hasExtra(LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED)
+                        && lowLatency == intent.getBooleanExtra(
+                                LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, true)
+                        && autoLea == intent.getBooleanExtra(
+                                LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED, false)) {
+                    notifyGameServiceReady(gameLatencyServiceInstance, "state_confirmed");
+                }
+                Intent reply = new Intent(LeAudioIpc.ACTION_GAME_LATENCY_STATE);
+                reply.setPackage(LeAudioIpc.MELODY_PKG);
+                reply.putExtra(LeAudioIpc.EXTRA_TOKEN, LeAudioIpc.TOKEN);
+                reply.putExtra(LeAudioIpc.EXTRA_GAME_STATE_REQUEST_ID, requestId);
+                reply.putExtra(LeAudioIpc.EXTRA_GAME_STATE_READY, ready);
+                reply.putExtra(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, lowLatency);
+                reply.putExtra(LeAudioIpc.EXTRA_GAME_AUTO_LEA_ENABLED, autoLea);
+                TrustedBroadcasts.send(ctx, reply);
+            }
+        };
+        if (TrustedBroadcasts.registerExportedReceiver(context, receiver,
+                new IntentFilter(LeAudioIpc.ACTION_QUERY_GAME_LATENCY_STATE),
+                TrustedBroadcasts.PERMISSION_OPLUS_COMPONENT_SAFE, mainHandler)) {
+            gameLatencyStateReceiver = receiver;
+        }
+    }
+
+    private void requestGameLatencyState(Context context) {
+        Intent request = new Intent(LeAudioIpc.ACTION_REQUEST_GAME_LATENCY_STATE);
+        request.setPackage(LeAudioIpc.MELODY_PKG);
+        request.putExtra(LeAudioIpc.EXTRA_TOKEN, LeAudioIpc.TOKEN);
+        TrustedBroadcasts.send(context, request);
     }
 
     private synchronized void ensureCodecBroadcastBridge(
@@ -1533,6 +1642,9 @@ public final class SystemHookInstaller {
             }
         }
         if (changed) MLog.event("lhdc.governor.queue_source", "source", source);
+        // The smartaudio singleton is created once the bluetooth stack has attached the
+        // extension dex, which is exactly when the game low-latency classes become loadable.
+        scheduleGameLatencyHooks();
     }
 
     private void sampleLhdcQueue() {
@@ -2095,6 +2207,267 @@ public final class SystemHookInstaller {
     private static Context findContext(Object[] args) {
         for (Object arg : args) {
             if (arg instanceof Context) return (Context) arg;
+        }
+        return null;
+    }
+
+    /**
+     * Installs the game low-latency hooks against the OPlus bluetooth extension jar. The
+     * extension dex is attached to the app classloader lazily, so early attempts can fail and
+     * the retry schedule covers the first minute of process lifetime.
+     */
+    private void scheduleGameLatencyHooks() {
+        queueGameLatencyHookAttempt("lifecycle");
+        if (!gameLatencyHookScheduled.compareAndSet(false, true)) return;
+        for (long delay : GAME_LATENCY_HOOK_RETRY_DELAYS_MS) {
+            gameLatencyHookWorker.schedule(() -> queueGameLatencyHookAttempt("retry"),
+                    delay, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** The factory appends the extension to its own loader, which may differ from the entry's. */
+    private void hookGameLatencyExtensionReady() {
+        if (gameLatencyDexTriggerHooked) return;
+        try {
+            Class<?> factory = Class.forName("com.oplus.bluetooth.common.OplusBTFactory",
+                    false, classLoader);
+            gameLatencyClassLoader = factory.getClassLoader();
+            Method getter = factory.getDeclaredMethod("getInstance");
+            getter.setAccessible(true);
+            module.hook(getter).intercept(chain -> {
+                Object result = chain.proceed();
+                // getInstance returns after newInstance/addDexPath and releases its singleton
+                // lock. Never load/hook feature classes while the factory callback holds it.
+                if (!gameLatencyHooksComplete()) {
+                    gameLatencyClassLoader = factory.getClassLoader();
+                    Log.i(MLog.TAG, "evt=game.ll.dex_ready source=OplusBTFactory");
+                    queueGameLatencyHookAttempt("dex_ready");
+                }
+                return result;
+            });
+            gameLatencyDexTriggerHooked = true;
+            MLog.event("game.ll.hook", "target", "OplusBTFactory.getInstance");
+        } catch (Throwable t) {
+            MLog.w("game.ll.dex_trigger unavailable", t);
+        }
+    }
+
+    private void queueGameLatencyHookAttempt(String reason) {
+        if (gameLatencyHooksComplete() || !gameLatencyHookQueued.compareAndSet(false, true)) return;
+        try {
+            gameLatencyHookWorker.execute(() -> {
+                Log.i(MLog.TAG, "evt=game.ll.worker.enter reason=" + reason);
+                try {
+                    attemptGameLatencyHooks();
+                } catch (Throwable t) {
+                    Log.w(MLog.TAG, "game latency hook worker failed", t);
+                } finally {
+                    gameLatencyHookQueued.set(false);
+                    Log.i(MLog.TAG, "evt=game.ll.worker.exit complete=" + gameLatencyHooksComplete());
+                }
+            });
+        } catch (Throwable t) {
+            gameLatencyHookQueued.set(false);
+            Log.w(MLog.TAG, "game latency hook queue failed", t);
+        }
+    }
+
+    /** Only the dedicated serial worker enters this method; no installer monitor is held. */
+    private void attemptGameLatencyHooks() {
+        if (gameLatencyHooksComplete()) return;
+        ClassLoader loader = gameLatencyClassLoader != null ? gameLatencyClassLoader : classLoader;
+        MLog.event("game.ll.hook.attempt",
+                "service", gameLatencyServiceHooked, "sm", gameLatencySmHooked);
+        if (!gameLatencyServiceHooked || !gameLatencyReadyHookResolved
+                || !gameLatencyProcessDiedHookResolved) {
+            try {
+                Class<?> cls = Class.forName(CLASS_LL_SERVICE, false, loader);
+                boolean found = gameLatencyServiceHooked;
+                for (Method method : cls.getDeclaredMethods()) {
+                    if (gameLatencyServiceHooked) break;
+                    if (!"onGameModeChanged".equals(method.getName())) continue;
+                    Class<?>[] params = method.getParameterTypes();
+                    if (params.length != 1 || params[0] != boolean.class) continue;
+                    found = true;
+                    method.setAccessible(true);
+                    module.hook(method).intercept(chain -> {
+                        GameLeaController controller = gameLeaController;
+                        if (controller != null) {
+                            try {
+                                boolean isGame = Boolean.TRUE.equals(chain.getArgs().get(0));
+                                // Establish the session before the vendor can enqueue classic
+                                // low-latency entry; reconcile its util after the vendor returns.
+                                controller.onGameModeChanged(isGame, chain.getThisObject());
+                            } catch (Throwable t) {
+                                MLog.w("game low latency game-mode hook failed", t);
+                            }
+                        }
+                        Object result = chain.proceed();
+                        notifyGameServiceReady(chain.getThisObject(), "game_mode_changed");
+                        return result;
+                    });
+                    gameLatencyServiceHooked = true;
+                    MLog.event("game.ll.hook", "target", "onGameModeChanged");
+                    break;
+                }
+                if (!found) {
+                    MLog.w("game.ll.hook.method_missing target=onGameModeChanged");
+                }
+                try {
+                    hookGameLatencyServiceReady(cls);
+                } catch (Throwable t) {
+                    MLog.w("game.ll.hook.ready failed", t);
+                }
+                try {
+                    hookGameLatencyProcessDied(cls);
+                } catch (Throwable t) {
+                    MLog.w("game.ll.hook.process_died failed", t);
+                }
+                // The singleton may predate hook installation. Read it without constructing a
+                // vendor service, then replay its actual mode once the controller is ready.
+                Object existing = readGameLatencyField(cls, "sInstance");
+                if (cls.isInstance(existing) && existing != gameLatencyServiceInstance) {
+                    notifyGameServiceReady(existing, "existing_service");
+                }
+            } catch (Throwable t) {
+                MLog.w("game.ll.hook.service failed", t);
+            }
+        }
+        if (!gameLatencySmHooked) {
+            try {
+                Class<?> cls = Class.forName(CLASS_LL_STATE_MACHINE, false, loader);
+                boolean found = false;
+                for (Method method : cls.getDeclaredMethods()) {
+                    if (!"selectBestLowLatencyCodec".equals(method.getName())
+                            || method.getParameterCount() != 0) {
+                        continue;
+                    }
+                    found = true;
+                    method.setAccessible(true);
+                    module.hook(method).intercept(chain -> {
+                        SharedPreferences sp = gameLatencyStatePrefs;
+                        if (sp != null && !sp.getBoolean(
+                                LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, true)) {
+                            // This selector is used only for game low-latency entry. Returning
+                            // null also blocks modes 8/9 without disabling ordinary LE Audio.
+                            MLog.event("game.ll.suppress", "reason", "master_off_entry");
+                            return null;
+                        }
+                        Object result = chain.proceed();
+                        GameLeaController controller = gameLeaController;
+                        if (controller == null) return result;
+                        try {
+                            return controller.filterLowLatencySelection(
+                                    chain.getThisObject(), result);
+                        } catch (Throwable t) {
+                            MLog.w("game low latency selection filter failed", t);
+                            return result;
+                        }
+                    });
+                    gameLatencySmHooked = true;
+                    MLog.event("game.ll.hook", "target", "selectBestLowLatencyCodec");
+                    break;
+                }
+                if (!found) {
+                    MLog.w("game.ll.hook.method_missing target=selectBestLowLatencyCodec");
+                }
+            } catch (Throwable t) {
+                MLog.w("game.ll.hook.sm failed", t);
+            }
+        }
+    }
+
+    private boolean gameLatencyHooksComplete() {
+        return gameLatencyServiceHooked && gameLatencySmHooked
+                && gameLatencyReadyHookResolved && gameLatencyProcessDiedHookResolved;
+    }
+
+    private void hookGameLatencyServiceReady(Class<?> cls) {
+        if (gameLatencyReadyHookResolved) return;
+        for (Method method : cls.getDeclaredMethods()) {
+            if (!"getInstance".equals(method.getName())
+                    || !Modifier.isStatic(method.getModifiers())
+                    || method.getReturnType() == void.class) continue;
+            method.setAccessible(true);
+            module.hook(method).intercept(chain -> {
+                Object result = chain.proceed();
+                if (cls.isInstance(result)) notifyGameServiceReady(result, "getInstance");
+                return result;
+            });
+            gameLatencyReadyHookResolved = true;
+            MLog.event("game.ll.hook", "target", "getInstance");
+            return;
+        }
+        gameLatencyReadyHookResolved = true;
+        MLog.w("game.ll.hook.optional_missing target=getInstance");
+    }
+
+    private void hookGameLatencyProcessDied(Class<?> cls) {
+        if (gameLatencyProcessDiedHookResolved) return;
+        for (Method method : cls.getDeclaredMethods()) {
+            Class<?>[] params = method.getParameterTypes();
+            if (!"onProcessDied".equals(method.getName()) || params.length != 2
+                    || params[0] != int.class || params[1] != int.class) continue;
+            method.setAccessible(true);
+            module.hook(method).intercept(chain -> {
+                Object service = chain.getThisObject();
+                int pid = (Integer) chain.getArgs().get(0);
+                int uid = (Integer) chain.getArgs().get(1);
+                Object util = readGameLatencyField(service, "mUtil");
+                Object process = readGameLatencyField(util, "mLastGamePackageProcess");
+                Object gamePid = readGameLatencyField(process, "mPid");
+                Object gameUid = readGameLatencyField(process, "mUid");
+                boolean matched = gamePid instanceof Number && ((Number) gamePid).intValue() == pid
+                        && gameUid instanceof Number && ((Number) gameUid).intValue() == uid;
+                Object result = chain.proceed();
+                if (matched) {
+                    Object handler = readGameLatencyField(service, "mHandler");
+                    Handler scheduler = handler instanceof Handler ? (Handler) handler : mainHandler;
+                    scheduler.post(() -> {
+                        GameLeaController controller = gameLeaController;
+                        if (controller != null) {
+                            controller.onGameProcessDied(pid, uid, service);
+                        }
+                    });
+                }
+                return result;
+            });
+            gameLatencyProcessDiedHookResolved = true;
+            MLog.event("game.ll.hook", "target", "onProcessDied");
+            return;
+        }
+        gameLatencyProcessDiedHookResolved = true;
+        MLog.w("game.ll.hook.optional_missing target=onProcessDied");
+    }
+
+    private void notifyGameServiceReady(Object service, String reason) {
+        if (service == null) return;
+        gameLatencyServiceInstance = service;
+        Object handler = readGameLatencyField(service, "mHandler");
+        Handler scheduler = handler instanceof Handler ? (Handler) handler : mainHandler;
+        // onGameModeChanged updates mGameMode synchronously and queues the mUtil update. Post
+        // behind that message so getLowlatencyExitDelay observes the current official timer.
+        scheduler.post(() -> {
+            GameLeaController controller = gameLeaController;
+            if (controller == null) return;
+            try {
+                controller.onGameServiceReady(service);
+            } catch (Throwable t) {
+                MLog.w("game service state replay failed: " + reason, t);
+            }
+        });
+    }
+
+    private static Object readGameLatencyField(Object target, String name) {
+        if (target == null) return null;
+        Class<?> cls = target instanceof Class<?> ? (Class<?>) target : target.getClass();
+        for (Class<?> current = cls; current != null; current = current.getSuperclass()) {
+            try {
+                Field field = current.getDeclaredField(name);
+                field.setAccessible(true);
+                return field.get(target instanceof Class<?> ? null : target);
+            } catch (Throwable ignored) {
+            }
         }
         return null;
     }
