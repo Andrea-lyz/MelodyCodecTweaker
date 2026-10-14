@@ -24,6 +24,16 @@ public final class CodecIpc {
             "xyz.melodylsp.codec.action.NATIVE_PATCH_STATE";
     public static final String ACTION_GAME_MODE_STATE =
             "xyz.melodylsp.codec.action.GAME_MODE_STATE";
+    /**
+     * 模块 App 向单个作用域进程请求一次「当前状态」快照（只读）。见
+     * {@code diag.StatusProbe}：探测请求只带 token 与随机 probe id，作用域以
+     * {@link #ACTION_STATUS_REPORT} 定向回给模块 App 包。
+     */
+    public static final String ACTION_STATUS_PROBE =
+            "xyz.melodylsp.codec.action.STATUS_PROBE";
+    /** 作用域 → 模块 App 的状态快照回复，正文为 {@link #EXTRA_STATUS_REPORT} 里的 JSON。 */
+    public static final String ACTION_STATUS_REPORT =
+            "xyz.melodylsp.codec.action.STATUS_REPORT";
     public static final String ACTION_SET_LHDC_POLICY =
             "xyz.melodylsp.codec.action.SET_LHDC_POLICY";
     public static final String ACTION_LHDC_DIAGNOSTIC_LIVE_CONTROL =
@@ -96,6 +106,12 @@ public final class CodecIpc {
     /** Carried by {@link #ACTION_LHDC_DIAGNOSTIC_LIVE_CONTROL}: experimental governor state. */
     public static final String EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED =
             "governor_experimental_enabled";
+    /** 随机探测标识（{@link #ACTION_STATUS_PROBE} / {@link #ACTION_STATUS_REPORT}）。 */
+    public static final String EXTRA_PROBE_ID = "probe_id";
+    /** 回复方作用域名：host / bluetooth / wirelesssettings。 */
+    public static final String EXTRA_STATUS_SCOPE = "status_scope";
+    /** 回复正文：作用域当前事实的 JSON（见 {@code diag.StatusProbe}）。 */
+    public static final String EXTRA_STATUS_REPORT = "status_report";
 
     public static final String TOKEN = "mlcdc-codec-v1";
 

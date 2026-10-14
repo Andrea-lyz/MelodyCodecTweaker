@@ -17,6 +17,7 @@ import io.github.libxposed.api.XposedInterface;
 import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.MelodyCodecLspEntry;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
+import xyz.melodylsp.codec.diag.StatusProbe;
 
 /**
  * Module-wide logging facade. Logs go to standard {@link Log} as well as the libxposed
@@ -187,6 +188,7 @@ public final class MLog {
             sb.append(' ').append(kvPairs[i]).append('=').append(kvPairs[i + 1]);
         }
         emit(Log.INFO, sb.toString(), null, persistDiagnostic, name);
+        StatusProbe.observe(name, kvPairs);
     }
 
     /** Returns a single-token throwable summary suitable for structured event values. */

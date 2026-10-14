@@ -1,5 +1,7 @@
 package xyz.melodylsp.codec;
 
+import android.app.Application;
+import android.app.Instrumentation;
 import android.content.SharedPreferences;
 import android.util.Log;
 
@@ -9,6 +11,7 @@ import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
+import xyz.melodylsp.codec.diag.StatusProbe;
 import xyz.melodylsp.codec.host.HostHookInstaller;
 import xyz.melodylsp.codec.leaudio.WirelessSettingsHookInstaller;
 import xyz.melodylsp.codec.settings.SettingsHookInstaller;
@@ -75,6 +78,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
             return;
         }
         MLog.event("scope.host.start", "process", param.getApplicationInfo().processName);
+        attachProbeScope(StatusProbe.SCOPE_HOST);
         new HostHookInstaller(this, param.getDefaultClassLoader(),
                 param.getApplicationInfo().sourceDir).install();
     }
@@ -85,6 +89,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
             return;
         }
         MLog.event("scope.system.start", "process", param.getApplicationInfo().processName);
+        attachProbeScope(StatusProbe.SCOPE_BLUETOOTH);
         new SystemHookInstaller(this, param.getDefaultClassLoader(),
                 param.getApplicationInfo().sourceDir).install();
     }
@@ -97,6 +102,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
         }
         String processName = param.getApplicationInfo().processName;
         MLog.event("scope.wirelesssettings.start", "process", processName);
+        attachProbeScope(StatusProbe.SCOPE_WIRELESS_SETTINGS);
         new WirelessSettingsHookInstaller(this, param.getDefaultClassLoader(), processName,
                 param.getApplicationInfo().sourceDir)
                 .install();
@@ -113,7 +119,31 @@ public final class MelodyCodecLspEntry extends XposedModule {
             return;
         }
         MLog.event("scope.settings.start", "process", processName);
+        attachProbeScope(StatusProbe.SCOPE_SETTINGS);
         new SettingsHookInstaller(this).install();
+    }
+
+    /** 注册实时状态探测：作用域名 + libxposed 框架信息，供模块 App 的状态页实时查询。 */
+    private void attachProbeScope(String scope) {
+        try {
+            StatusProbe.attachScope(
+                    scope, getFrameworkName(), getFrameworkVersion(), getApiVersion(),
+                    getModuleApplicationInfo().sourceDir);
+            // 此时 Application 可能尚未创建。统一在框架调用 onCreate 后注册应答，
+            // 与耳机连接、宿主 UI、native 初始化和 LE Audio 权限路径无关。
+            hookMethod(Instrumentation.class.getDeclaredMethod(
+                    "callApplicationOnCreate", Application.class), chain -> {
+                Object result = chain.proceed();
+                try {
+                    StatusProbe.attachContext((Application) chain.getArgs().get(0));
+                } catch (Throwable t) {
+                    MLog.w("status probe application attach failed", t);
+                }
+                return result;
+            });
+        } catch (Throwable t) {
+            MLog.w("status probe scope attach failed", t);
+        }
     }
 
     /**

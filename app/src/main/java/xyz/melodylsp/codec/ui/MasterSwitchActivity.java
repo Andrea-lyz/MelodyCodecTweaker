@@ -28,6 +28,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayDeque;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -37,6 +38,8 @@ import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.diag.FeedbackCollector;
 import xyz.melodylsp.codec.diag.RootBluetoothLogCapture;
+import xyz.melodylsp.codec.diag.StatusProbe;
+import xyz.melodylsp.codec.system.NativeLhdcMemoryPatch;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
@@ -50,6 +53,8 @@ public final class MasterSwitchActivity extends Activity {
             "xyz.melodylsp.codec.ui.LauncherActivity";
     private static final String DIAGNOSTICS_URL =
             "file:///android_asset/diagnostics-v3.html";
+    /** 前台状态页的实时探测周期：一轮探测收集窗口 1.2s，周期性地刷新，避免只显示历史事件。 */
+    private static final long LIVE_PROBE_INTERVAL_MS = 15_000L;
     private static final int LIGHT_BG = 0xFFF6F7FB;
     private static final long[] RECORDING_CONTROL_RETRY_DELAYS_MS = {
             500L, 2_000L, 5_000L
@@ -65,6 +70,7 @@ public final class MasterSwitchActivity extends Activity {
             {"A2DP Bridge", "bridge.codec"},
             {"LE Audio 蓝牙桥", "bridge.le.bt"},
             {"无线设置作用域", "scope.wirelesssettings"},
+            {"系统设置作用域", "scope.settings"},
             {"LE Audio 无线设置桥", "bridge.le.ws"},
             {"码率 branch 补丁", "native.patch.bitrate"},
             {"快切等价补丁", "native.patch.fast_switch"},
@@ -90,6 +96,16 @@ public final class MasterSwitchActivity extends Activity {
     private boolean liveReceiverRegistered;
     private volatile boolean feedbackBusy;
     private JSONObject cachedEnvironment;
+    private StatusProbeCoordinator statusProbe;
+    /** 前台期间的周期探测。 */
+    private final Runnable liveProbeTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!foreground) return;
+            requestStatusProbe();
+            mainHandler.postDelayed(this, LIVE_PROBE_INTERVAL_MS);
+        }
+    };
 
     private final BroadcastReceiver liveBqrReceiver = new BroadcastReceiver() {
         @Override
@@ -125,6 +141,7 @@ public final class MasterSwitchActivity extends Activity {
         DiagnosticEvents.reconcileReceiverState(this);
         applyLauncherIconState(modulePrefs.getBoolean(KEY_HIDE_LAUNCHER_ICON, false), false);
         cachedEnvironment = buildEnvironmentSnapshot();
+        statusProbe = new StatusProbeCoordinator(this);
         getWindow().setDecorFitsSystemWindows(false);
         configureSystemBars();
         setContentView(createWebView());
@@ -140,6 +157,9 @@ public final class MasterSwitchActivity extends Activity {
         if (webView != null) webView.onResume();
         evaluate("window.MelodyDiagnostics&&window.MelodyDiagnostics.start()");
         pushSnapshotToPage();
+        if (statusProbe != null) statusProbe.register();
+        mainHandler.removeCallbacks(liveProbeTick);
+        mainHandler.post(liveProbeTick);
     }
 
     @Override
@@ -149,6 +169,8 @@ public final class MasterSwitchActivity extends Activity {
         sendLiveSubscription(false);
         unregisterLiveBqrReceiver();
         if (webView != null) webView.onPause();
+        if (statusProbe != null) statusProbe.unregister();
+        mainHandler.removeCallbacks(liveProbeTick);
         super.onPause();
     }
 
@@ -214,6 +236,7 @@ public final class MasterSwitchActivity extends Activity {
                 if (pageReady && foreground) {
                     evaluate("window.MelodyDiagnostics&&window.MelodyDiagnostics.start()");
                     pushSnapshotToPage();
+                    requestStatusProbe();
                 }
             }
 
@@ -299,6 +322,9 @@ public final class MasterSwitchActivity extends Activity {
             root.put("environment", cachedEnvironment != null
                     ? cachedEnvironment : buildEnvironmentSnapshot());
             root.put("statuses", buildStatusSnapshot());
+            root.put("live", buildLiveSnapshot());
+            root.put("framework", FrameworkStatusApplication.snapshot());
+            root.put("activation", buildActivationSnapshot());
             root.put("memory", buildMemorySnapshot());
             root.put("events", buildRecentEventsSnapshot());
             root.put("bqr", liveBqrStore.snapshot());
@@ -327,6 +353,7 @@ public final class MasterSwitchActivity extends Activity {
             out.put("melody", packageVersion(CodecIpc.MELODY_PKG));
             out.put("bluetooth", packageVersion(CodecIpc.BLUETOOTH_PKG));
             out.put("wirelessSettings", packageVersion("com.oplus.wirelesssettings"));
+            out.put("settings", packageVersion("com.android.settings"));
         } catch (Throwable ignored) {
         }
         return out;
@@ -334,6 +361,8 @@ public final class MasterSwitchActivity extends Activity {
 
     private JSONArray buildStatusSnapshot() {
         JSONArray rows = new JSONArray();
+        Map<String, JSONObject> live = statusProbe != null
+                ? statusProbe.snapshot() : Collections.emptyMap();
         for (String[] entry : STATUS_ROWS) {
             try {
                 String key = entry[1];
@@ -343,11 +372,168 @@ public final class MasterSwitchActivity extends Activity {
                 row.put("status", DiagnosticEvents.status(diagPrefs, key));
                 row.put("detail", valueOrEmpty(DiagnosticEvents.detail(diagPrefs, key)));
                 row.put("time", DiagnosticEvents.time(diagPrefs, key));
+                applyLiveStatus(row, key, live);
                 rows.put(row);
             } catch (Throwable ignored) {
             }
         }
         return rows;
+    }
+
+    /**
+     * 作用域以框架与当次回执为准；能力可保留本次开机、当前安装包的已确认结果。
+     * 活动类状态行（最近写入 / 重放 / 警告 / 错误）保持事件驱动，标记 source=event。
+     */
+    private void applyLiveStatus(JSONObject row, String key, Map<String, JSONObject> live)
+            throws Exception {
+        String scope = StatusProbe.scopeForKey(key);
+        JSONObject report = scope != null ? live.get(scope) : null;
+        JSONObject keys = report != null ? report.optJSONObject("keys") : null;
+        JSONArray pair = keys != null ? keys.optJSONArray(key) : null;
+        if (pair != null && pair.length() >= 2) {
+            row.put("status", pair.optString(0));
+            row.put("detail", pair.optString(1));
+            row.put("source", "live");
+            row.put("time", report.optLong("confirmed_at"));
+        } else if (scope == null) {
+            row.put("source", "event");
+        } else {
+            JSONObject confirmed = statusProbe != null
+                    ? statusProbe.confirmedSnapshot().get(scope) : null;
+            JSONObject confirmedKeys = confirmed != null ? confirmed.optJSONObject("keys") : null;
+            JSONArray confirmedPair = confirmedKeys != null ? confirmedKeys.optJSONArray(key) : null;
+            String scopeState = frameworkScopeState(scope, FrameworkStatusApplication.snapshot());
+            if (key.startsWith("scope.") && !scopeState.isEmpty()) {
+                row.put("status", scopeState);
+                row.put("detail", "");
+                row.put("source", "framework");
+                row.put("note", "loaded".equals(scopeState)
+                        ? "框架已确认该作用域加载模块。"
+                        : "restart_required".equals(scopeState)
+                        ? "该作用域仍使用旧模块，请重启作用域。"
+                        : "作用域已在框架启用，应用启动后自动加载模块。无需连接耳机来激活。");
+            } else if (confirmedPair != null && confirmedPair.length() >= 2) {
+                row.put("status", confirmedPair.optString(0));
+                row.put("detail", confirmedPair.optString(1));
+                row.put("time", confirmed.optLong("confirmed_at"));
+                row.put("source", "confirmed");
+                row.put("note", "当前安装版本已确认此项；应用暂未运行不代表模块失效。");
+            } else {
+                row.put("status", key.startsWith("scope.") ? "unconfirmed" : "on_demand");
+                row.put("detail", "");
+                row.put("time", 0L);
+                row.put("source", "waiting");
+                row.put("note", key.startsWith("scope.")
+                        ? "请确认 LSPosed 已启用该作用域，并在安装后重启作用域。"
+                        : "此项在连接耳机或打开对应页面时运行，尚未触发不代表模块未激活。");
+            }
+        }
+        applyNativeFastSwitchNote(row, key);
+    }
+
+    /** Android 17 起 LHDC V5 等价判定回归系统原生：快切等价补丁灰置并给出短原因。 */
+    private void applyNativeFastSwitchNote(JSONObject row, String key) throws Exception {
+        if (!"native.patch.fast_switch".equals(key)) return;
+        if (!NativeLhdcMemoryPatch.isNativeEqualityBuild(Build.DISPLAY)) return;
+        row.put("note", "Android 17 起系统自带 LHDC V5 等价判定，快切等价补丁无需存在");
+        if (!"live".equals(row.optString("source"))) {
+            row.put("status", "native");
+            row.put("source", "native");
+            row.put("detail", "native_equality_dispatch_17");
+        }
+    }
+
+    /** 实时探测结果摘要：每个作用域是否回执、进程号、libxposed 框架信息。 */
+    private JSONObject buildLiveSnapshot() {
+        JSONObject out = new JSONObject();
+        try {
+            Map<String, JSONObject> reports = statusProbe != null
+                    ? statusProbe.snapshot() : Collections.emptyMap();
+            JSONObject scopes = new JSONObject();
+            for (Map.Entry<String, JSONObject> entry : reports.entrySet()) {
+                JSONObject report = entry.getValue();
+                JSONObject scope = new JSONObject();
+                scope.put("pid", report.optInt("pid", 0));
+                scope.put("process", report.optString("process", ""));
+                scope.put("framework", report.optString("framework", ""));
+                scope.put("frameworkVersion", report.optString("framework_version", ""));
+                scope.put("api", report.optInt("api", 0));
+                scopes.put(entry.getKey(), scope);
+            }
+            out.put("takenAt", System.currentTimeMillis());
+            out.put("scopes", scopes);
+        } catch (Throwable ignored) {
+        }
+        return out;
+    }
+
+    /** 触发一轮实时探测；窗口结束后把新快照推给页面。 */
+    private void requestStatusProbe() {
+        FrameworkStatusApplication.refresh();
+        StatusProbeCoordinator coordinator = statusProbe;
+        if (coordinator == null) return;
+        coordinator.probe(reports -> pushSnapshotToPage());
+    }
+
+    /** 激活与耳机连接、宿主页面注入独立，任一真实作用域加载即可证明模块已运行。 */
+    private JSONObject buildActivationSnapshot() throws Exception {
+        JSONObject out = new JSONObject();
+        JSONObject framework = FrameworkStatusApplication.snapshot();
+        Map<String, JSONObject> current = statusProbe != null
+                ? statusProbe.snapshot() : Collections.emptyMap();
+        Map<String, JSONObject> confirmed = statusProbe != null
+                ? statusProbe.confirmedSnapshot() : Collections.emptyMap();
+        int loaded = 0;
+        int configured = 0;
+        boolean restart = false;
+        for (String scope : new String[] {StatusProbe.SCOPE_HOST, StatusProbe.SCOPE_BLUETOOTH,
+                StatusProbe.SCOPE_WIRELESS_SETTINGS, StatusProbe.SCOPE_SETTINGS}) {
+            String state = frameworkScopeState(scope, framework);
+            if (!state.isEmpty()) configured++;
+            if (current.containsKey(scope) || "loaded".equals(state)) loaded++;
+            if ("restart_required".equals(state)) restart = true;
+        }
+        boolean firstProbe = statusProbe == null || !statusProbe.hasProbed();
+        boolean cached = loaded == 0 && firstProbe && !confirmed.isEmpty();
+        String state;
+        if (!modulePrefs.getBoolean(KEY_ENABLED, true)) state = "disabled";
+        else if (loaded > 0 || cached) state = "active";
+        else if (restart) state = "restart_required";
+        else if (configured > 0) state = "enabled";
+        else if (firstProbe || framework.optBoolean("loading")) state = "checking";
+        else state = "unconfirmed";
+        out.put("state", state);
+        out.put("loadedScopes", loaded);
+        out.put("configuredScopes", configured);
+        out.put("cached", cached);
+        return out;
+    }
+
+    /** getScope 证明已选作用域；getRunningTargets 的当前版本目标才证明已经加载。 */
+    private static String frameworkScopeState(String scope, JSONObject framework) {
+        String pkg = StatusProbe.packageForScope(scope);
+        if (pkg == null || framework == null || !framework.optBoolean("bound")) return "";
+        JSONArray targets = framework.optJSONArray("targets");
+        boolean restart = false;
+        if (targets != null) {
+            for (int i = 0; i < targets.length(); i++) {
+                JSONObject target = targets.optJSONObject(i);
+                if (target == null) continue;
+                String process = target.optString("process");
+                if (!pkg.equals(process) && !process.startsWith(pkg + ":")) continue;
+                if (target.optLong("versionCode") == BuildConfig.VERSION_CODE
+                        && "UP_TO_DATE".equals(target.optString("state"))) return "loaded";
+                restart = true;
+            }
+        }
+        if (restart) return "restart_required";
+        JSONArray packages = framework.optJSONArray("scopePackages");
+        if (packages != null) {
+            for (int i = 0; i < packages.length(); i++) {
+                if (pkg.equals(packages.optString(i))) return "enabled";
+            }
+        }
+        return "";
     }
 
     private JSONObject buildMemorySnapshot() throws Exception {
@@ -459,6 +645,12 @@ public final class MasterSwitchActivity extends Activity {
         @JavascriptInterface
         public void requestNativePatchState() {
             runOnUiThread(MasterSwitchActivity.this::queryNativePatchState);
+        }
+
+        /** 状态页「刷新」按钮：立即重跑一轮实时探测（只读，不触发任何写入）。 */
+        @JavascriptInterface
+        public void probeStatus() {
+            runOnUiThread(MasterSwitchActivity.this::requestStatusProbe);
         }
     }
 
