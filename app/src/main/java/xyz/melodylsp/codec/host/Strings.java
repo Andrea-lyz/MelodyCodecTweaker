@@ -66,9 +66,14 @@ public final class Strings {
     public static final String LE_AUDIO_TITLE = "LE Audio";
     public static final String LE_AUDIO_SUMMARY_ON = "已开启（LC3 低功耗音频）";
     public static final String LE_AUDIO_SUMMARY_CONNECTING = "已开启，正在连接 LE Audio…";
+    public static final String LE_AUDIO_SUMMARY_COEXIST_CLASSIC =
+            "已允许 LE Audio（系统按场景切换）";
+    public static final String LE_AUDIO_SUMMARY_ROUTE_UNKNOWN =
+            "已允许 LE Audio，正在确认音频协议…";
     public static final String LE_AUDIO_SUMMARY_OFF = "已关闭（经典蓝牙音频）";
     public static final String LE_AUDIO_SUMMARY_UNKNOWN = "正在获取状态…";
     public static final String STATE_LE_AUDIO_CONNECTING = "LE Audio 正在连接…";
+    public static final String STATE_AUDIO_ROUTE_UNKNOWN = "正在确认音频协议…";
 
     // 游戏功能 rows (injected around Melody's official 游戏模式 entry).
     public static final String GAME_LOW_LATENCY_TITLE = "游戏低延迟";

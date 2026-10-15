@@ -764,7 +764,14 @@ public final class HostHookInstaller {
     /** Late-arrival retry for the DetailMain game rows; idempotent. */
     private void ensureGameRows(Object fragment, Object screen) {
         if (controller == null || !isDetailMainHost(fragment)) return;
-        if (hasGameRowMarker(screen)) return;
+        if (hasGameRowMarker(screen)) {
+            // The official row may arrive after the independent codec-block switches.
+            controller.attachGameRows(fragment,
+                    PrefRef.findPreference(screen, KEY_GAME_LOW_LATENCY),
+                    PrefRef.findPreference(screen, KEY_GAME_AUTO_LEA),
+                    findGameModeAnchor(screen));
+            return;
+        }
         Object[] rows = injectGameRows(fragment, screen);
         if (rows != null) {
             controller.attachGameRows(fragment, rows[0], rows[1], rows[2]);
@@ -774,15 +781,17 @@ public final class HostHookInstaller {
     /**
      * Insert the module game rows around the official 游戏模式 entry in the requested order:
      * 游戏低延迟 -> 游戏模式 -> 游戏自动切换 LE Audio. Returns
-     * {@code {lowLatencySwitch, autoLeaSwitch, gameModeAnchor}}, or {@code null} when the
-     * anchor is not on this surface.
+     * {@code {lowLatencySwitch, autoLeaSwitch, gameModeAnchor}}. Without an official entry,
+     * append the switches to the module codec block and leave gameModeAnchor null.
      */
     private Object[] injectGameRows(Object fragment, Object screen) {
         if (PrefRef.findPreference(screen, KEY_GAME_LOW_LATENCY) != null
                 || PrefRef.findPreference(screen, KEY_GAME_AUTO_LEA) != null) {
             return null;
         }
-        Object anchor = findGameModeAnchor(screen);
+        Object officialAnchor = findGameModeAnchor(screen);
+        Object anchor = officialAnchor != null
+                ? officialAnchor : findGameRowsFallbackAnchor(screen);
         if (anchor == null) return null;
         Context themedContext = resolveThemedContext(fragment);
         if (themedContext == null) return null;
@@ -796,22 +805,35 @@ public final class HostHookInstaller {
             MLog.w("game rows: switch rows could not be constructed");
             return null;
         }
+        // Capability confirmation in CodecController reveals this row only for LE Audio peers.
+        PrefRef.setVisible(autoLeaSwitch, false);
         Object parent = PrefRef.getParent(anchor);
         if (parent == null) parent = screen;
         int anchorOrder = PrefRef.getOrder(anchor);
-        // Target order: 游戏低延迟, 游戏模式, 游戏自动切换 LE Audio. Move every row after the
-        // anchor down by two so the new rows can straddle it.
+        int lowLatencyOrder = officialAnchor != null ? anchorOrder : anchorOrder + 1;
         shiftPreferenceOrders(parent, anchorOrder + 1, +2);
-        PrefRef.setOrder(anchor, anchorOrder + 1);
-        PrefRef.setOrder(lowLatencySwitch, anchorOrder);
-        PrefRef.setOrder(autoLeaSwitch, anchorOrder + 2);
+        if (officialAnchor != null) PrefRef.setOrder(officialAnchor, anchorOrder + 1);
+        PrefRef.setOrder(lowLatencySwitch, lowLatencyOrder);
+        PrefRef.setOrder(autoLeaSwitch,
+                officialAnchor != null ? anchorOrder + 2 : lowLatencyOrder + 1);
         PrefRef.addPreference(parent, lowLatencySwitch);
         PrefRef.addPreference(parent, autoLeaSwitch);
         MLog.event("game.rows.injected",
                 "anchor", PrefRef.getKey(anchor),
                 "anchorClass", anchor.getClass().getName(),
+                "placement", officialAnchor != null ? "official_game" : "codec_block",
                 "order", anchorOrder);
-        return new Object[]{lowLatencySwitch, autoLeaSwitch, anchor};
+        return new Object[]{lowLatencySwitch, autoLeaSwitch, officialAnchor};
+    }
+
+    /** The codec block exists even when the peer has no official game-mode capability. */
+    private static Object findGameRowsFallbackAnchor(Object screen) {
+        for (String key : new String[]{"melody_codec_lsp_le_audio", "melody_codec_lsp_remember",
+                "melody_codec_lsp_sample_rate", KEY_CODEC_QUALITY, KEY_CODEC_MODE, KEY_CODEC_HEADER}) {
+            Object row = PrefRef.findPreference(screen, key);
+            if (row != null) return row;
+        }
+        return null;
     }
 
     /** Locate the official 游戏模式 row by class hint, falling back to its title. */

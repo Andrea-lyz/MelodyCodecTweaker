@@ -29,6 +29,7 @@ import java.util.Set;
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
+import xyz.melodylsp.codec.bridge.GameModeCodecPolicy;
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.storage.PreferenceStore;
@@ -1242,8 +1243,8 @@ public final class ConnectionStateReplayer {
 
     private static boolean isGameModeSbcSnapshot(CodecSnapshot snapshot) {
         return snapshot != null
-                && snapshot.activeCodecType == CodecLabelTable.CODEC_SBC
-                && snapshot.activeCodecSpecific2 > 0L;
+                && GameModeCodecPolicy.isSbcLowLatencyEntry(
+                        snapshot.activeCodecType, snapshot.activeCodecSpecific2);
     }
 
     private static boolean sameRememberedValue(

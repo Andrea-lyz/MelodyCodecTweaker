@@ -60,6 +60,12 @@ public final class LeAudioManager {
             "android.bluetooth.action.LE_AUDIO_CONNECTION_STATE_CHANGED";
     private static final String ACTION_A2DP_CONNECTION_STATE_CHANGED =
             "android.bluetooth.a2dp.profile.action.CONNECTION_STATE_CHANGED";
+    private static final String ACTION_A2DP_ACTIVE_DEVICE_CHANGED =
+            "android.bluetooth.a2dp.profile.action.ACTIVE_DEVICE_CHANGED";
+    private static final String ACTION_LE_AUDIO_ACTIVE_DEVICE_CHANGED =
+            "android.bluetooth.action.LE_AUDIO_ACTIVE_DEVICE_CHANGED";
+    private static final String ACTION_A2DP_CODEC_CONFIG_CHANGED =
+            "android.bluetooth.a2dp.profile.action.CODEC_CONFIG_CHANGED";
     private static final String EXTRA_CONNECTION_STATE = "android.bluetooth.profile.extra.STATE";
     private static final long QUERY_DEBOUNCE_MS = 500L;
 
@@ -73,6 +79,7 @@ public final class LeAudioManager {
     private final Map<String, Boolean> connectedByMac = new ConcurrentHashMap<>();
     /** X4-class official coexistence report ("LE Audio + classic" on the same device). */
     private final Map<String, Boolean> coexistByMac = new ConcurrentHashMap<>();
+    private final Map<String, Integer> mediaProfileByMac = new ConcurrentHashMap<>();
     private final Map<String, Long> lastQueryElapsedByMac = new ConcurrentHashMap<>();
 
     private BroadcastReceiver receiver;
@@ -109,6 +116,16 @@ public final class LeAudioManager {
     public boolean isOfficialCoexist(String mac) {
         Boolean v = mac != null ? coexistByMac.get(mac) : null;
         return v != null && v;
+    }
+
+    public int mediaProfile(String mac) {
+        Integer profile = mac != null ? mediaProfileByMac.get(mac) : null;
+        return profile != null ? profile : LeAudioIpc.MEDIA_PROFILE_UNKNOWN;
+    }
+
+    public LeAudioPlaybackState playbackState(String mac) {
+        return LeAudioPlaybackState.resolve(
+                isEnabled(mac), isConnected(mac), isOfficialCoexist(mac), mediaProfile(mac));
     }
 
     /**
@@ -180,7 +197,8 @@ public final class LeAudioManager {
         intent.setPackage(LeAudioIpc.BLUETOOTH_PKG);
         intent.putExtra(LeAudioIpc.EXTRA_TOKEN, LeAudioIpc.TOKEN);
         intent.putExtra(LeAudioIpc.EXTRA_MAC, mac);
-        intent.putExtra(LeAudioIpc.EXTRA_REPAIR_CONNECTION, repairConnection);
+        intent.putExtra(LeAudioIpc.EXTRA_REPAIR_CONNECTION,
+                repairConnection && !isOfficialCoexist(mac));
         try {
             if (!TrustedBroadcasts.send(appContext, intent)) {
                 MLog.w("LE Audio query broadcast was not delivered");
@@ -200,6 +218,9 @@ public final class LeAudioManager {
                     handleBridgeState(intent, TrustedBroadcasts.captureSender(this));
                 } else if (ACTION_LE_AUDIO_CONNECTION_STATE_CHANGED.equals(action)
                         || ACTION_A2DP_CONNECTION_STATE_CHANGED.equals(action)
+                        || ACTION_A2DP_ACTIVE_DEVICE_CHANGED.equals(action)
+                        || ACTION_LE_AUDIO_ACTIVE_DEVICE_CHANGED.equals(action)
+                        || ACTION_A2DP_CODEC_CONFIG_CHANGED.equals(action)
                         || BluetoothDevice.ACTION_ACL_CONNECTED.equals(action)) {
                     handleBluetoothProfileState(intent);
                 }
@@ -208,6 +229,9 @@ public final class LeAudioManager {
         IntentFilter bridgeFilter = new IntentFilter(LeAudioIpc.ACTION_LE_AUDIO_STATE);
         bridgeFilter.addAction(ACTION_LE_AUDIO_CONNECTION_STATE_CHANGED);
         bridgeFilter.addAction(ACTION_A2DP_CONNECTION_STATE_CHANGED);
+        bridgeFilter.addAction(ACTION_A2DP_ACTIVE_DEVICE_CHANGED);
+        bridgeFilter.addAction(ACTION_LE_AUDIO_ACTIVE_DEVICE_CHANGED);
+        bridgeFilter.addAction(ACTION_A2DP_CODEC_CONFIG_CHANGED);
         bridgeFilter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
         if (!TrustedBroadcasts.registerExportedReceiver(
                 appContext,
@@ -262,7 +286,9 @@ public final class LeAudioManager {
         boolean en = intent.getBooleanExtra(LeAudioIpc.EXTRA_ENABLED, wasEnabled);
         boolean connected = intent.getBooleanExtra(
                 LeAudioIpc.EXTRA_CONNECTED, isConnected(mac));
-        boolean coexist = intent.getBooleanExtra(LeAudioIpc.EXTRA_LEA_COEXIST, false);
+        boolean coexist = intent.getBooleanExtra(
+                LeAudioIpc.EXTRA_LEA_COEXIST, isOfficialCoexist(mac));
+        int mediaProfile = intent.getIntExtra(LeAudioIpc.EXTRA_MEDIA_PROFILE, mediaProfile(mac));
         boolean localSup = probeSupport(mac);
         // The bluetooth process can only tell us whether the system has a LE Audio profile
         // proxy. That is not the same thing as "this headset exposes LE Audio"; otherwise every
@@ -277,11 +303,14 @@ public final class LeAudioManager {
         enabledByMac.put(mac, en);
         connectedByMac.put(mac, connected);
         coexistByMac.put(mac, coexist);
+        mediaProfileByMac.put(mac, mediaProfile);
         MLog.event("le.melody.state.recv",
                 "supported", sup,
                 "enabled", en,
                 "connected", connected,
-                "coexist", coexist);
+                "coexist", coexist,
+                "mediaProfile", mediaProfile,
+                "playback", playbackState(mac));
         notifyChanged(mac);
     }
 
@@ -318,9 +347,13 @@ public final class LeAudioManager {
         }
         String mac = device != null ? device.getAddress() : null;
         if (mac == null || !enabledByMac.containsKey(mac)) {
+            // LE group addresses may differ from the BR address used by Melody.
+            mediaProfileByMac.clear();
             refreshTrackedFromPrefsAndBridge(800L, false);
+            refreshTrackedFromPrefsAndBridge(2200L, false);
             return;
         }
+        mediaProfileByMac.remove(mac);
         int state = intent.getIntExtra(EXTRA_CONNECTION_STATE, -1);
         String action = intent.getAction();
         boolean changed = false;
@@ -351,11 +384,12 @@ public final class LeAudioManager {
         if (changed) {
             notifyChanged(mac);
         }
-        final boolean repairHint = repairConnection;
+        final boolean repairHint = repairConnection && !isOfficialCoexist(mac);
         mainHandler.postDelayed(() -> queryBridge(
                 mac,
                 repairHint && isEnabled(mac) && !isConnected(mac)),
                 repairHint ? 250L : 1200L);
+        mainHandler.postDelayed(() -> queryBridge(mac, false), 3000L);
     }
 
     private void notifyChanged(String mac) {

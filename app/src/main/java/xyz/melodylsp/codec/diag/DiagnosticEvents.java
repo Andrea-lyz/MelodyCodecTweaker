@@ -588,8 +588,7 @@ public final class DiagnosticEvents {
         if (message.contains("evt=replay.")) {
             mark(editor, "remember.replay", stateFromMessage(message), message, time);
         }
-        if (message.contains("evt=game.mode.")
-                || message.contains("evt=replay.suppress.game")) {
+        if (isGameModeMessage(message)) {
             mark(editor, "game.mode", stateFromMessage(message), message, time);
         }
         if (priority >= Log.WARN && !isRecoverableFallbackWarning(message)) {
@@ -845,7 +844,20 @@ public final class DiagnosticEvents {
         return "V";
     }
 
+    static boolean isGameModeMessage(String message) {
+        String event = eventName(message);
+        return event != null && (event.startsWith("game.mode.")
+                || event.startsWith("replay.suppress.game")
+                || "game.ll.mode".equals(event));
+    }
+
     static String stateFromMessage(String message) {
+        if ("game.ll.mode".equals(eventName(message))) {
+            String game = valueOf(message, "game");
+            if ("true".equals(game)) return "pending";
+            if ("false".equals(game)) return "ok";
+            return "seen";
+        }
         if (message.contains("success=true")
                 || message.contains("outcome=CONFIRMED")
                 || message.contains("evt=replay.stable")
