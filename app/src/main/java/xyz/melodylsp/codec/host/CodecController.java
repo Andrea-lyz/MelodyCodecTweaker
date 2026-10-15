@@ -51,6 +51,7 @@ import xyz.melodylsp.codec.bt.BluetoothCodecReflect;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.leaudio.LeAudioIpc;
+import xyz.melodylsp.codec.leaudio.LeAudioPlaybackState;
 import xyz.melodylsp.codec.storage.PreferenceStore;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
@@ -525,7 +526,6 @@ public final class CodecController {
      */
     private void onLeAudioStateChanged(String mac) {
         boolean leOn = leAudioManager.isEnabled(mac);
-        boolean leConnected = leAudioManager.isConnected(mac);
         for (Subscription sub : subscriptions.values()) {
             if (!isSubscriptionActive(sub) || !sameDevice(sub.mac, mac)) continue;
             applyLeAudioToSwitch(sub);
@@ -538,19 +538,20 @@ public final class CodecController {
                     scheduleClassicAudioRefresh(sub);
                     continue;
                 }
-                if (!leConnected) {
-                    renderLeAudioConnecting(sub);
-                    continue;
+                if (renderLeAudioIfNeeded(sub)) continue;
+                // Coexistence permits A2DP while LE remains enabled. Re-read the real classic
+                // codec, including after a game exits without changing the LE permission.
+                boolean leftLeAudio = sub.renderedLeAudioActive;
+                sub.renderedLeAudioActive = false;
+                if (leAudioManager.mediaProfile(mac) == LeAudioIpc.MEDIA_PROFILE_A2DP) {
+                    sub.connected = Boolean.TRUE;
                 }
-                // LC3 takes over the LE transport and A2DP reports DISCONNECTED. Keep the
-                // injected block interactive instead of treating that as "no earphone".
-                sub.connected = Boolean.TRUE;
-                CodecSnapshot snap = snapshotFor(sub);
-                if (snap != null && !Boolean.FALSE.equals(sub.connected)) {
-                    renderSnapshot(snap, sub, /* fromCache= */ false);
+                if (leftLeAudio) {
+                    clearSnapshot(mac);
+                    restoreClassicAudioRows(sub);
+                    scheduleClassicAudioRefresh(sub);
                 } else {
-                    // LE Audio took over the transport; renderUnknown shows the LC3 state.
-                    renderUnknown(sub);
+                    refreshSnapshot(sub);
                 }
             } else {
                 // LE Audio turned off: A2DP is coming back, so re-read the real codec status
@@ -827,6 +828,9 @@ public final class CodecController {
                 configureAndShowDialog(builder, title, message, positive, negative, action);
                 MLog.event("le.melody.dialog", "builder", name);
                 return true;
+            } catch (ClassNotFoundException ignored) {
+                // Candidate names span host versions; absence is an expected compatibility probe.
+                MLog.d("evt=le.melody.dialog.candidate_missing class=" + name);
             } catch (Throwable t) {
                 MLog.w("LE Audio melody dialog builder failed: " + name, t);
             }
@@ -1090,14 +1094,25 @@ public final class CodecController {
         PrefRef.setVisible(sw, supported);
         if (!supported) return;
         boolean enabled = leAudioManager.isEnabled(sub.mac);
-        boolean connected = leAudioManager.isConnected(sub.mac);
         PrefRef.setChecked(sw, enabled);
-        PrefRef.setSummary(sw,
-                !enabled
-                        ? Strings.LE_AUDIO_SUMMARY_OFF
-                        : connected
-                        ? Strings.LE_AUDIO_SUMMARY_ON
-                        : Strings.LE_AUDIO_SUMMARY_CONNECTING);
+        String summary = Strings.LE_AUDIO_SUMMARY_OFF;
+        if (enabled) {
+            switch (leAudioManager.playbackState(sub.mac)) {
+                case CLASSIC:
+                    summary = Strings.LE_AUDIO_SUMMARY_COEXIST_CLASSIC;
+                    break;
+                case LE_ACTIVE:
+                    summary = Strings.LE_AUDIO_SUMMARY_ON;
+                    break;
+                case CONNECTING:
+                    summary = Strings.LE_AUDIO_SUMMARY_CONNECTING;
+                    break;
+                case ROUTE_UNKNOWN:
+                    summary = Strings.LE_AUDIO_SUMMARY_ROUTE_UNKNOWN;
+                    break;
+            }
+        }
+        PrefRef.setSummary(sw, summary);
     }
 
     // ---- game-function rows (游戏低延迟 / 游戏自动切换 LE Audio) ----
@@ -1108,9 +1123,20 @@ public final class CodecController {
         if (fragment == null) return;
         Subscription sub = subscriptions.get(fragment);
         if (sub == null) return;
+        boolean anchorChanged = sub.prefs.gameModeAnchor != gameModeAnchor;
         sub.prefs.gameLowLatencySwitch = lowLatencySwitch;
         sub.prefs.gameAutoLeaSwitch = autoLeaSwitch;
         sub.prefs.gameModeAnchor = gameModeAnchor;
+        if (sub.gameRowsWired) {
+            if (anchorChanged) {
+                sub.gameAnchorHostEnabled = true;
+                sub.gameAnchorHostDisabled = false;
+                sub.gameAnchorDisabledByUs = false;
+                captureGameAnchorHostState(sub);
+                applyGameRowEnableState(sub, prefs.isGameLowLatencyEnabled());
+            }
+            return;
+        }
         wireGameRows(sub);
     }
 
@@ -1391,8 +1417,13 @@ public final class CodecController {
         setBlockDisabled(sub, true);
         if (sub.prefs.leAudioSwitch != null) {
             PrefRef.setVisible(sub.prefs.leAudioSwitch, leAudioManager.isSupported(sub.mac));
-            PrefRef.setChecked(sub.prefs.leAudioSwitch, false);
-            PrefRef.setSummary(sub.prefs.leAudioSwitch, Strings.LE_AUDIO_SUMMARY_OFF);
+            if (leAudioManager.isOfficialCoexist(sub.mac)
+                    && !isClassicRestorePending(sub.mac)) {
+                applyLeAudioToSwitch(sub);
+            } else {
+                PrefRef.setChecked(sub.prefs.leAudioSwitch, false);
+                PrefRef.setSummary(sub.prefs.leAudioSwitch, Strings.LE_AUDIO_SUMMARY_OFF);
+            }
         }
         if (sub.prefs.rememberToggle != null) {
             PrefRef.setChecked(sub.prefs.rememberToggle, prefs.isRemembered(sub.mac));
@@ -1490,7 +1521,7 @@ public final class CodecController {
         // LC3 runs over the LE transport: the codec mode picker only lists classic A2DP tiers
         // (LHDC/AAC/SBC) and must not open while LC3 is the active codec. This applies to every
         // injected surface (OneSpace + DetailMain) because they share this controller.
-        if (shouldRenderLeAudioActive(sub)) return;
+        if (renderLeAudioIfNeeded(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
@@ -1570,7 +1601,7 @@ public final class CodecController {
      * (vendor codec quirk on every OPPO LHDC variant).
      */
     private void showQualityPicker(Subscription sub, Object sourcePref) {
-        if (shouldRenderLeAudioActive(sub)) return;
+        if (renderLeAudioIfNeeded(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
@@ -1812,7 +1843,7 @@ public final class CodecController {
     }
 
     private void showSampleRatePicker(Subscription sub, Object sourcePref) {
-        if (shouldRenderLeAudioActive(sub)) return;
+        if (renderLeAudioIfNeeded(sub)) return;
         if (!ensureA2dpReadyForUser(sub)) return;
         CodecSnapshot snapshot = snapshotFor(sub);
         if (snapshot == null) {
@@ -3245,17 +3276,8 @@ public final class CodecController {
             restoreClassicAudioRows(sub);
             return;
         }
-        if (leAudioManager.isEnabled(sub.mac) && !leAudioManager.isConnected(sub.mac)) {
-            renderLeAudioConnecting(sub);
-            return;
-        }
+        if (renderLeAudioIfNeeded(sub)) return;
         sub.renderedLeAudioActive = false;
-        // When LE Audio is enabled the A2DP codec status is unavailable (the device is on the
-        // LE transport), but that is NOT a disconnect — show LC3 and keep the switch usable.
-        if (shouldRenderLeAudioActive(sub)) {
-            renderLeAudioActive(sub);
-            return;
-        }
         boolean connected = Boolean.TRUE.equals(sub.connected);
         if (connected && !isA2dpReadyOrUnknown(sub)) {
             renderA2dpWaiting(sub);
@@ -3302,13 +3324,9 @@ public final class CodecController {
         if (!isSubscriptionActive(sub)
                 || snapshot == null
                 || !sameDevice(sub.mac, snapshot.mac)) return;
-        // LE Audio override (TODO B): when LE Audio is on, the device runs LC3 over the LE
-        // transport, so the A2DP codec / quality / sample-rate controls do not apply. Show
-        // "蓝牙音质 : LC3" and hide the quality + sample-rate rows on BOTH surfaces.
-        if (shouldRenderLeAudioActive(sub)) {
-            renderLeAudioActive(sub);
-            return;
-        }
+        // Permission and profile connectivity do not select the media transport on coexistence
+        // devices. Only override the classic snapshot when the playback state requires it.
+        if (renderLeAudioIfNeeded(sub)) return;
         sub.renderedLeAudioActive = false;
         clearClassicRestorePending(sub.mac);
         if (Boolean.FALSE.equals(sub.connected)) {
@@ -3344,10 +3362,19 @@ public final class CodecController {
         updateGovernorBitratePolling();
     }
 
-    private boolean shouldRenderLeAudioActive(Subscription sub) {
-        return leAudioManager.isEnabled(sub.mac)
-                && leAudioManager.isConnected(sub.mac)
-                && !isClassicRestorePending(sub.mac);
+    private boolean renderLeAudioIfNeeded(Subscription sub) {
+        if (!isSubscriptionActive(sub) || isClassicRestorePending(sub.mac)) return false;
+        LeAudioPlaybackState state = leAudioManager.playbackState(sub.mac);
+        if (state == LeAudioPlaybackState.LE_ACTIVE) {
+            renderLeAudioActive(sub);
+            return true;
+        }
+        if (state == LeAudioPlaybackState.CONNECTING
+                || state == LeAudioPlaybackState.ROUTE_UNKNOWN) {
+            renderLeAudioConnecting(sub);
+            return true;
+        }
+        return false;
     }
 
     private void renderLeAudioConnecting(Subscription sub) {
@@ -3355,7 +3382,10 @@ public final class CodecController {
         sub.renderedLeAudioActive = false;
         if (sub.prefs.codecDisplay != null) {
             PrefRef.setTitle(sub.prefs.codecDisplay,
-                    Strings.CODEC_BLOCK_TITLE + " : " + Strings.STATE_LE_AUDIO_CONNECTING);
+                    Strings.CODEC_BLOCK_TITLE + " : "
+                            + (leAudioManager.playbackState(sub.mac)
+                            == LeAudioPlaybackState.ROUTE_UNKNOWN
+                            ? Strings.STATE_AUDIO_ROUTE_UNKNOWN : Strings.STATE_LE_AUDIO_CONNECTING));
         }
         PrefRef.setVisible(sub.prefs.codecModeOption, false);
         PrefRef.setVisible(sub.prefs.qualityOption, false);
@@ -3369,6 +3399,7 @@ public final class CodecController {
 
     private void renderLeAudioActive(Subscription sub) {
         if (!isSubscriptionActive(sub)) return;
+        sub.connected = Boolean.TRUE;
         sub.renderedLeAudioActive = true;
         if (sub.prefs.codecDisplay != null) {
             PrefRef.setTitle(sub.prefs.codecDisplay,
@@ -3825,17 +3856,6 @@ public final class CodecController {
                             mainHandler.post(() -> {
                                 if (!active) return;
                                 invalidateRefreshes();
-                                if (leAudioManager.isEnabled(mac)
-                                        && !isClassicRestorePending(mac)) {
-                                    if (leAudioManager.isConnected(mac)) {
-                                        connected = Boolean.TRUE;
-                                        renderLeAudioActive(Subscription.this);
-                                    } else {
-                                        connected = Boolean.FALSE;
-                                        renderLeAudioConnecting(Subscription.this);
-                                    }
-                                    return;
-                                }
                                 connected = Boolean.FALSE;
                                 clearSnapshot(mac);
                                 renderUnknown(Subscription.this);
@@ -3851,18 +3871,13 @@ public final class CodecController {
                             refreshSnapshotDelayed(Subscription.this, 3200L);
                         }
                     } else if (ACTION_CODEC_CONFIG_CHANGED.equals(action)) {
-                        if (leAudioManager.isEnabled(mac)
-                                && !isClassicRestorePending(mac)) {
-                            if (leAudioManager.isConnected(mac)) {
-                                renderLeAudioActive(Subscription.this);
-                            } else {
-                                renderLeAudioConnecting(Subscription.this);
-                            }
-                            return;
+                        if (!matchesSubscriptionDevice(intent)) return;
+                        if (!renderLeAudioIfNeeded(Subscription.this)) {
+                            refreshSnapshot(Subscription.this);
                         }
-                        refreshSnapshot(Subscription.this);
                     } else if (A2dpRouteReadiness.ACTION_ACTIVE_DEVICE_CHANGED.equals(action)) {
                         boolean ready = routeReadiness.updateFromActiveDeviceIntent(intent, mac);
+                        if (renderLeAudioIfNeeded(Subscription.this)) return;
                         if (ready) {
                             refreshSnapshot(Subscription.this);
                             refreshSnapshotDelayed(Subscription.this, 700L);

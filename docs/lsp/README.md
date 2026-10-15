@@ -18,6 +18,20 @@
 - 在官方耳机主面板和 OneSpace 快捷面板中使用同一套控制。
 - 出现问题时可一键生成反馈包，方便适配不同机型和系统版本。
 
+## 2.5.3 更新 / Updates
+
+- 无官方「游戏模式」入口的耳机也会显示模块「游戏低延迟」总开关；关闭后阻止 SBC 低延迟入场，帮助保持已选择的 AAC。
+- 修正退出标记对记忆回放的影响，收敛缺类重复重试与堆栈日志；扩展晚加载后仍可继续安装。
+- 包含 2.5.2 的 X4 共存状态修复：按实际媒体路由显示经典协议或 LC3，经典播放时保留音质控制，避免误显示或一直连接中。
+- 已经处于低延迟 SBC 的旧系统，关闭开关后请先退游戏或重连并恢复 AAC。升级后重新加载宿主与蓝牙作用域。
+
+- Headsets without an official Game Mode entry now receive the module's Game Low Latency master switch. Disabling it blocks SBC low-latency entry requests and helps retain the selected AAC codec.
+- Corrects exit-marker handling for memory replay and prevents duplicate missing-class retries and stack-trace floods, while allowing late extension installation.
+- Includes the 2.5.2 X4 coexistence fixes: media routes determine classic-codec versus LC3 display, and classic playback keeps its audio-quality controls.
+- If an older system is already in SBC low latency, leave the game or reconnect and restore AAC after disabling the switch. Reload the host and Bluetooth scopes after upgrading.
+
+[完整中英文说明 / Full bilingual release notes](https://github.com/Andrea-lyz/MelodyCodecTweaker/blob/main/docs/releases/2.5.3.md)
+
 ## 2.5.1 更新
 
 - X4 类耳机（支持「LE Audio + 经典共存」，即官方 LE Audio 版本）上隐藏「游戏自动切换 LE Audio」开关，运行期交由官方链路接管，避免双重控制。

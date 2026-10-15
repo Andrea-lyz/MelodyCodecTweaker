@@ -1,10 +1,38 @@
 package xyz.melodylsp.codec.diag;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
 
 public final class DiagnosticEventsTest {
+
+    @Test
+    public void gameModeIncludesActualLowLatencyEventsAndExistingReplayEvents() {
+        assertTrue(DiagnosticEvents.isGameModeMessage(
+                "[mod=2.5.1 host=?] evt=game.ll.mode game=true lowLatency=true autoLea=false"));
+        assertTrue(DiagnosticEvents.isGameModeMessage("evt=game.mode.state active=true"));
+        assertTrue(DiagnosticEvents.isGameModeMessage("evt=replay.suppress.game_exit"));
+    }
+
+    @Test
+    public void gameConfigurationReportsDoNotCountAsEnteringAGame() {
+        assertFalse(DiagnosticEvents.isGameModeMessage(
+                "evt=game.ll.state.sent lowLatency=true autoLea=false"));
+        assertFalse(DiagnosticEvents.isGameModeMessage("evt=game.ll.mode.extra game=true"));
+        assertFalse(DiagnosticEvents.isGameModeMessage("unrelated message"));
+    }
+
+    @Test
+    public void gameEntryIsPendingAndNormalExitIsOk() {
+        assertEquals("pending", DiagnosticEvents.stateFromMessage(
+                "evt=game.ll.mode game=true lowLatency=true autoLea=false"));
+        assertEquals("ok", DiagnosticEvents.stateFromMessage(
+                "evt=game.ll.mode game=false lowLatency=true autoLea=true"));
+        assertEquals("seen", DiagnosticEvents.stateFromMessage(
+                "evt=game.ll.mode lowLatency=true autoLea=false"));
+    }
 
     @Test
     public void notRequiredPatchStatusRendersOkNotAttention() {

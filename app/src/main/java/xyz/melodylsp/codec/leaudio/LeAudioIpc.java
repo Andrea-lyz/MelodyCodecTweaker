@@ -64,10 +64,16 @@ public final class LeAudioIpc {
     public static final String EXTRA_SUPPORTED = "supported";
     /** boolean, whether LE Audio is currently enabled (in {@link #ACTION_LE_AUDIO_STATE}). */
     public static final String EXTRA_ENABLED = "enabled";
-    /** boolean, whether the LE Audio profile is currently connected / active. */
+    /** boolean, whether the LE Audio profile is connected (not necessarily selected for media). */
     public static final String EXTRA_CONNECTED = "connected";
     /** boolean, X4-class "LE Audio + classic coexistence" report used by the official chain. */
     public static final String EXTRA_LEA_COEXIST = "lea_coexist";
+    /** int, media transport for the requested device, reported by the bluetooth process. */
+    public static final String EXTRA_MEDIA_PROFILE = "media_profile";
+    public static final int MEDIA_PROFILE_UNKNOWN = 0;
+    public static final int MEDIA_PROFILE_OTHER = -1;
+    public static final int MEDIA_PROFILE_A2DP = 2;
+    public static final int MEDIA_PROFILE_LE_AUDIO = 22;
     /** boolean, whether the toggle request succeeded (in {@link #ACTION_LE_AUDIO_STATE}). */
     public static final String EXTRA_OK = "ok";
     /** String, the coarse anti-spoof token shared by both module instances. */

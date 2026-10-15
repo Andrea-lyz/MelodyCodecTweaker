@@ -18,7 +18,7 @@ public final class CodecPreferences {
     public final Object rememberToggle;
     /** Optional LE Audio toggle (DetailMain only). Null on surfaces that omit it. */
     public final Object leAudioSwitch;
-    /** Game-function rows injected next to the official 游戏模式 entry (DetailMain only). */
+    /** DetailMain game switches; gameModeAnchor is null when the peer has no official entry. */
     public Object gameLowLatencySwitch;
     public Object gameAutoLeaSwitch;
     public Object gameModeAnchor;

@@ -15,6 +15,48 @@ import org.junit.Test;
 public final class BluetoothLeAudioBridgeTest {
 
     @Test
+    public void mediaRouteIsMatchedToTheRequestedBrAndLeAddresses() {
+        String br = "AA:BB:CC:DD:EE:FF";
+        String le = "11:22:33:44:55:66";
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_A2DP,
+                BluetoothLeAudioBridge.mediaProfileForOutput(8, br.toLowerCase(),
+                        Collections.singletonList(br), Collections.singletonList(le)));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_LE_AUDIO,
+                BluetoothLeAudioBridge.mediaProfileForOutput(26, le,
+                        Collections.singletonList(br), Collections.singletonList(le)));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_LE_AUDIO,
+                BluetoothLeAudioBridge.mediaProfileForOutput(27, le,
+                        Collections.singletonList(br), Collections.singletonList(le)));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_OTHER,
+                BluetoothLeAudioBridge.mediaProfileForOutput(26, "00:00:00:00:00:00",
+                        Collections.singletonList(br), Collections.singletonList(le)));
+    }
+
+    @Test
+    public void missingRouteAddressAndNonBluetoothOutputCannotClaimThisHeadset() {
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_UNKNOWN,
+                BluetoothLeAudioBridge.mediaProfileForOutput(26, "",
+                        Collections.emptyList(), Collections.emptyList()));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_OTHER,
+                BluetoothLeAudioBridge.mediaProfileForOutput(2, "",
+                        Collections.emptyList(), Collections.emptyList()));
+    }
+
+    @Test
+    public void fallbackRequiresOneProfileToBeExclusivelyConnected() {
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_A2DP,
+                BluetoothLeAudioBridge.mediaProfileFromConnections(false, true));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_LE_AUDIO,
+                BluetoothLeAudioBridge.mediaProfileFromConnections(true, false));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_UNKNOWN,
+                BluetoothLeAudioBridge.mediaProfileFromConnections(true, true));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_UNKNOWN,
+                BluetoothLeAudioBridge.mediaProfileFromConnections(true, null));
+        assertEquals(LeAudioIpc.MEDIA_PROFILE_UNKNOWN,
+                BluetoothLeAudioBridge.mediaProfileFromConnections(false, false));
+    }
+
+    @Test
     public void reconnectGateCoalescesConcurrentRepairSeries() {
         BluetoothLeAudioBridge.ReconnectGate gate =
                 new BluetoothLeAudioBridge.ReconnectGate();

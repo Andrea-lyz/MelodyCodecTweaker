@@ -43,6 +43,7 @@ import xyz.melodylsp.codec.MelodyCodecLspEntry;
 import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
+import xyz.melodylsp.codec.bridge.GameModeCodecPolicy;
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
 import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
@@ -114,7 +115,8 @@ public final class SystemHookInstaller {
     private BluetoothLeAudioBridge leAudioBridge;
     private volatile GameLeaController gameLeaController;
     private final AtomicBoolean gameLatencyHookScheduled = new AtomicBoolean();
-    private final AtomicBoolean gameLatencyHookQueued = new AtomicBoolean();
+    private final GameLatencyHookState gameLatencyHookState = new GameLatencyHookState();
+    private final AtomicBoolean gameLatencyDexTriggerInstalling = new AtomicBoolean();
     private final ScheduledExecutorService gameLatencyHookWorker =
             Executors.newSingleThreadScheduledExecutor(runnable -> {
                 Thread worker = new Thread(runnable, "MC-game-hook");
@@ -125,6 +127,7 @@ public final class SystemHookInstaller {
     private volatile ClassLoader gameLatencyClassLoader;
     private volatile boolean gameLatencyServiceHooked;
     private volatile boolean gameLatencySmHooked;
+    private volatile boolean gameLatencySbcCompatHooked;
     private volatile boolean gameLatencyReadyHookResolved;
     private volatile boolean gameLatencyProcessDiedHookResolved;
     private volatile Object gameLatencyServiceInstance;
@@ -1197,6 +1200,15 @@ public final class SystemHookInstaller {
                 MLog.event("bt.native.setCodecConfigPreference",
                         "device", args.length > 0 ? describeDevice(args[0]) : "?",
                         "configs", args.length > 1 ? describeCodecConfigArray(args[1]) : "[]");
+                if (m.getReturnType() == boolean.class && shouldSuppressGameModeSbcRequest(args)) {
+                    // Some ROMs do not expose the private low-latency classes. This stable
+                    // A2DP boundary still receives their explicit SBC entry command. Report
+                    // failure so the vendor state machine does not enter a fictitious LL state.
+                    MLog.event("game.ll.suppress", "reason", "master_off_native_entry",
+                            "device", describeDevice(args[0]),
+                            "s2", findGameModeSbcMarker(args[1]));
+                    return false;
+                }
                 maybeBroadcastGameModeSbcHint(args);
                 try {
                     Object result = chain.proceed();
@@ -1210,6 +1222,7 @@ public final class SystemHookInstaller {
                 }
             });
             hooked++;
+            if (m.getReturnType() == boolean.class) gameLatencySbcCompatHooked = true;
         }
         MLog.event("bt.native.codec.hooks", "count", hooked, "class", nativeCls.getName());
     }
@@ -1969,6 +1982,20 @@ public final class SystemHookInstaller {
         return hasDevice && hasStatus;
     }
 
+    private boolean shouldSuppressGameModeSbcRequest(Object[] args) {
+        SharedPreferences sp = gameLatencyStatePrefs;
+        if (sp == null || args == null || args.length < 2) return false;
+        Object configs = args[1];
+        if (configs == null || !configs.getClass().isArray()) return false;
+        int count = Array.getLength(configs);
+        if (count != 1) return false;
+        Object config = Array.get(configs, 0);
+        if (config == null) return false;
+        return GameModeCodecPolicy.shouldBlockSbcEntry(
+                sp.getBoolean(LeAudioIpc.EXTRA_GAME_LOW_LATENCY_ENABLED, true), count,
+                readInt(config, "getCodecType"), readLong(config, "getCodecSpecific2"));
+    }
+
     private void maybeBroadcastGameModeSbcHint(Object[] args) {
         if (args == null || args.length < 2) return;
         long marker = findGameModeSbcMarker(args[1]);
@@ -2011,9 +2038,9 @@ public final class SystemHookInstaller {
 
     private static long gameModeSbcMarker(Object config) {
         if (config == null) return 0L;
-        if (readInt(config, "getCodecType") != 0) return 0L;
+        int codecType = readInt(config, "getCodecType");
         long marker = readLong(config, "getCodecSpecific2");
-        return marker > 0L ? marker : 0L;
+        return GameModeCodecPolicy.isSbcLowLatencyEntry(codecType, marker) ? marker : 0L;
     }
 
     private static String macFromDeviceArg(Object device) {
@@ -2217,17 +2244,23 @@ public final class SystemHookInstaller {
      * the retry schedule covers the first minute of process lifetime.
      */
     private void scheduleGameLatencyHooks() {
-        queueGameLatencyHookAttempt("lifecycle");
         if (!gameLatencyHookScheduled.compareAndSet(false, true)) return;
-        for (long delay : GAME_LATENCY_HOOK_RETRY_DELAYS_MS) {
-            gameLatencyHookWorker.schedule(() -> queueGameLatencyHookAttempt("retry"),
+        queueGameLatencyHookAttempt("lifecycle");
+        for (int i = 0; i < GAME_LATENCY_HOOK_RETRY_DELAYS_MS.length; i++) {
+            long delay = GAME_LATENCY_HOOK_RETRY_DELAYS_MS[i];
+            boolean lastRetry = i == GAME_LATENCY_HOOK_RETRY_DELAYS_MS.length - 1;
+            gameLatencyHookWorker.schedule(() -> {
+                if (lastRetry) gameLatencyHookState.exhaustRetrySchedule();
+                queueGameLatencyHookAttempt(lastRetry ? "retry_final" : "retry");
+            },
                     delay, TimeUnit.MILLISECONDS);
         }
     }
 
     /** The factory appends the extension to its own loader, which may differ from the entry's. */
     private void hookGameLatencyExtensionReady() {
-        if (gameLatencyDexTriggerHooked) return;
+        if (gameLatencyDexTriggerHooked
+                || !gameLatencyDexTriggerInstalling.compareAndSet(false, true)) return;
         try {
             Class<?> factory = Class.forName("com.oplus.bluetooth.common.OplusBTFactory",
                     false, classLoader);
@@ -2238,50 +2271,94 @@ public final class SystemHookInstaller {
                 Object result = chain.proceed();
                 // getInstance returns after newInstance/addDexPath and releases its singleton
                 // lock. Never load/hook feature classes while the factory callback holds it.
-                if (!gameLatencyHooksComplete()) {
-                    gameLatencyClassLoader = factory.getClassLoader();
-                    Log.i(MLog.TAG, "evt=game.ll.dex_ready source=OplusBTFactory");
-                    queueGameLatencyHookAttempt("dex_ready");
-                }
+                captureGameLatencyExtension(factory, result, "getInstance");
                 return result;
             });
             gameLatencyDexTriggerHooked = true;
             MLog.event("game.ll.hook", "target", "OplusBTFactory.getInstance");
+            // The singleton may already exist when the module reaches this lifecycle point.
+            captureGameLatencyExtension(factory,
+                    readGameLatencyField(factory, "sInstance"), "existing_factory");
         } catch (Throwable t) {
-            MLog.w("game.ll.dex_trigger unavailable", t);
+            reportGameLatencyHookIssue("factory",
+                    t instanceof ClassNotFoundException ? "class_missing" : "install_failed", t);
+        } finally {
+            gameLatencyDexTriggerInstalling.set(false);
         }
     }
 
+    private void captureGameLatencyExtension(Class<?> factory, Object instance, String source) {
+        if (gameLatencyHooksComplete()
+                || !gameLatencyHookState.captureFactory(factory, instance)) return;
+        // Use the actual implementation's loader; retain the entry loader as a lookup fallback.
+        gameLatencyClassLoader = gameLatencyHookState.factoryClassLoader();
+        Log.i(MLog.TAG, "evt=game.ll.dex_ready source=OplusBTFactory instance="
+                + instance.getClass().getName() + " reason=" + source);
+        queueGameLatencyHookAttempt("dex_ready");
+    }
+
     private void queueGameLatencyHookAttempt(String reason) {
-        if (gameLatencyHooksComplete() || !gameLatencyHookQueued.compareAndSet(false, true)) return;
+        if (gameLatencyHooksComplete() || !gameLatencyHookState.requestAttempt()) return;
         try {
             gameLatencyHookWorker.execute(() -> {
-                Log.i(MLog.TAG, "evt=game.ll.worker.enter reason=" + reason);
-                try {
-                    attemptGameLatencyHooks();
-                } catch (Throwable t) {
-                    Log.w(MLog.TAG, "game latency hook worker failed", t);
-                } finally {
-                    gameLatencyHookQueued.set(false);
-                    Log.i(MLog.TAG, "evt=game.ll.worker.exit complete=" + gameLatencyHooksComplete());
-                }
+                String attemptReason = reason;
+                boolean repeat;
+                do {
+                    Log.i(MLog.TAG, "evt=game.ll.worker.enter reason=" + attemptReason);
+                    try {
+                        attemptGameLatencyHooks();
+                        if (gameLatencyHooksComplete()) {
+                            MLog.event("game.ll.hook.state", "mode", "private_hooks_ready");
+                        } else if (gameLatencyHookState.reportCompatOnce()) {
+                            MLog.event("game.ll.hook.state", "mode", gameLatencySbcCompatHooked
+                                            ? "classic_sbc_compat" : "private_hooks_unavailable",
+                                    "service", gameLatencyServiceHooked, "sm", gameLatencySmHooked);
+                        }
+                    } catch (Throwable t) {
+                        reportGameLatencyHookIssue("worker", "install_failed", t);
+                    } finally {
+                        boolean complete = gameLatencyHooksComplete();
+                        repeat = gameLatencyHookState.finishAttempt(complete);
+                        Log.i(MLog.TAG, "evt=game.ll.worker.exit complete=" + complete);
+                    }
+                    attemptReason = "pending_extension";
+                } while (repeat);
             });
         } catch (Throwable t) {
-            gameLatencyHookQueued.set(false);
+            gameLatencyHookState.cancelQueuedAttempt();
             Log.w(MLog.TAG, "game latency hook queue failed", t);
+        }
+    }
+
+    private Class<?> resolveGameLatencyClass(String name) throws ClassNotFoundException {
+        ClassLoader loader = gameLatencyClassLoader != null ? gameLatencyClassLoader : classLoader;
+        try {
+            return Class.forName(name, false, loader);
+        } catch (ClassNotFoundException missing) {
+            if (loader == classLoader) throw missing;
+            return Class.forName(name, false, classLoader);
+        }
+    }
+
+    private void reportGameLatencyHookIssue(String target, String reason, Throwable error) {
+        if (!gameLatencyHookState.reportIssueOnce(target, reason)) return;
+        if (error == null || error instanceof ClassNotFoundException) {
+            // A missing private ROM class is expected on the legacy compatibility path.
+            MLog.event("game.ll.hook.unavailable", "target", target, "reason", reason);
+        } else {
+            MLog.w("game.ll.hook." + target + " failed: " + reason, error);
         }
     }
 
     /** Only the dedicated serial worker enters this method; no installer monitor is held. */
     private void attemptGameLatencyHooks() {
         if (gameLatencyHooksComplete()) return;
-        ClassLoader loader = gameLatencyClassLoader != null ? gameLatencyClassLoader : classLoader;
         MLog.event("game.ll.hook.attempt",
                 "service", gameLatencyServiceHooked, "sm", gameLatencySmHooked);
         if (!gameLatencyServiceHooked || !gameLatencyReadyHookResolved
                 || !gameLatencyProcessDiedHookResolved) {
             try {
-                Class<?> cls = Class.forName(CLASS_LL_SERVICE, false, loader);
+                Class<?> cls = resolveGameLatencyClass(CLASS_LL_SERVICE);
                 boolean found = gameLatencyServiceHooked;
                 for (Method method : cls.getDeclaredMethods()) {
                     if (gameLatencyServiceHooked) break;
@@ -2311,17 +2388,17 @@ public final class SystemHookInstaller {
                     break;
                 }
                 if (!found) {
-                    MLog.w("game.ll.hook.method_missing target=onGameModeChanged");
+                    reportGameLatencyHookIssue("onGameModeChanged", "method_missing", null);
                 }
                 try {
                     hookGameLatencyServiceReady(cls);
                 } catch (Throwable t) {
-                    MLog.w("game.ll.hook.ready failed", t);
+                    reportGameLatencyHookIssue("ready", "install_failed", t);
                 }
                 try {
                     hookGameLatencyProcessDied(cls);
                 } catch (Throwable t) {
-                    MLog.w("game.ll.hook.process_died failed", t);
+                    reportGameLatencyHookIssue("process_died", "install_failed", t);
                 }
                 // The singleton may predate hook installation. Read it without constructing a
                 // vendor service, then replay its actual mode once the controller is ready.
@@ -2330,12 +2407,13 @@ public final class SystemHookInstaller {
                     notifyGameServiceReady(existing, "existing_service");
                 }
             } catch (Throwable t) {
-                MLog.w("game.ll.hook.service failed", t);
+                reportGameLatencyHookIssue("service",
+                        t instanceof ClassNotFoundException ? "class_missing" : "install_failed", t);
             }
         }
         if (!gameLatencySmHooked) {
             try {
-                Class<?> cls = Class.forName(CLASS_LL_STATE_MACHINE, false, loader);
+                Class<?> cls = resolveGameLatencyClass(CLASS_LL_STATE_MACHINE);
                 boolean found = false;
                 for (Method method : cls.getDeclaredMethods()) {
                     if (!"selectBestLowLatencyCodec".equals(method.getName())
@@ -2369,10 +2447,11 @@ public final class SystemHookInstaller {
                     break;
                 }
                 if (!found) {
-                    MLog.w("game.ll.hook.method_missing target=selectBestLowLatencyCodec");
+                    reportGameLatencyHookIssue("selectBestLowLatencyCodec", "method_missing", null);
                 }
             } catch (Throwable t) {
-                MLog.w("game.ll.hook.sm failed", t);
+                reportGameLatencyHookIssue("sm",
+                        t instanceof ClassNotFoundException ? "class_missing" : "install_failed", t);
             }
         }
     }

@@ -18,6 +18,19 @@
 
 The module primarily targets `com.oplus.melody` on ColorOS / OPlus devices, working alongside the `com.android.bluetooth` and `com.oplus.wirelesssettings` scopes for more stable state reading and writing.
 
+## 2.5.3 Update Highlights
+
+- Adds an independent Game Low Latency master switch for AAC/SBC headsets without an official Game Mode entry. When disabled, the compatibility path rejects SBC low-latency entry requests while preserving normal codec choices and exit requests.
+- Corrects the SBC exit marker so AAC memory replay can resume. Coalesces extension installation signals, prevents duplicate retries and missing-class stack-trace floods, and retains support for late extension readiness.
+- A supplied PJZ110 / Android 16 capture confirms control injection, rejection of an SBC request, and subsequent AAC stream startup. If an older system is already in SBC low latency, leave the game or reconnect and restore AAC after disabling the switch.
+- See the [complete bilingual 2.5.3 release notes](docs/releases/2.5.3.md).
+
+## 2.5.2 Update Highlights
+
+- Fixes playback-state classification for X4-class headsets supporting LE Audio and classic Bluetooth coexistence. Permission to use LE Audio no longer implies that media currently uses LC3.
+- Resolves the media route against the headset's BR/LE identity mapping. Classic playback retains codec, quality, and sample-rate controls; unconfirmed routes are shown as awaiting confirmation.
+- Refreshes routes, classic-codec snapshots, and diagnostics after in-game switching and restoration, reducing incorrect LC3, connecting, and stale-state displays.
+
 ## 2.3.0 Update Highlights
 
 **LHDC V5 fast-switch equivalence patch (native memory patch)**

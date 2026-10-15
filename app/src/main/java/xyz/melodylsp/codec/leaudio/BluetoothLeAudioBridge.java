@@ -8,6 +8,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
 import android.os.ParcelUuid;
 
 import java.lang.reflect.Method;
@@ -156,7 +159,8 @@ public final class BluetoothLeAudioBridge {
             } else if (LeAudioIpc.ACTION_QUERY_LE_AUDIO.equals(action)) {
                 replyState(mac, true);
                 if (intent.getBooleanExtra(
-                        LeAudioIpc.EXTRA_REPAIR_CONNECTION, false)) {
+                        LeAudioIpc.EXTRA_REPAIR_CONNECTION, false)
+                        && !Boolean.TRUE.equals(readLeaCoexistSupportedForGame(mac))) {
                     scheduleLeReconnect(mac, "state_event", false);
                 }
             }
@@ -803,11 +807,14 @@ public final class BluetoothLeAudioBridge {
         boolean enabled;
         boolean connected;
         Boolean coexist;
+        int mediaProfile;
         synchronized (writeLock) {
             supported = acquireProxyBlocking() != null;
             enabled = supported && Boolean.TRUE.equals(readLeAudioEnabledForGame(mac));
             connected = supported && isLeAudioConnectedNow(mac);
             coexist = readLeaCoexistSupportedForGame(mac);
+            mediaProfile = Boolean.TRUE.equals(coexist)
+                    ? readMediaProfile(mac, connected) : LeAudioIpc.MEDIA_PROFILE_UNKNOWN;
         }
         Intent reply = new Intent(LeAudioIpc.ACTION_LE_AUDIO_STATE);
         reply.setPackage(LeAudioIpc.MELODY_PKG);
@@ -816,7 +823,8 @@ public final class BluetoothLeAudioBridge {
         reply.putExtra(LeAudioIpc.EXTRA_SUPPORTED, supported);
         reply.putExtra(LeAudioIpc.EXTRA_ENABLED, enabled);
         reply.putExtra(LeAudioIpc.EXTRA_CONNECTED, connected);
-        reply.putExtra(LeAudioIpc.EXTRA_LEA_COEXIST, Boolean.TRUE.equals(coexist));
+        if (coexist != null) reply.putExtra(LeAudioIpc.EXTRA_LEA_COEXIST, coexist.booleanValue());
+        reply.putExtra(LeAudioIpc.EXTRA_MEDIA_PROFILE, mediaProfile);
         reply.putExtra(LeAudioIpc.EXTRA_OK, ok);
         try {
             if (!TrustedBroadcasts.send(context, reply)) {
@@ -827,10 +835,95 @@ public final class BluetoothLeAudioBridge {
                     "enabled", enabled,
                     "connected", connected,
                     "coexist", Boolean.TRUE.equals(coexist),
+                    "mediaProfile", mediaProfile,
                     "ok", ok);
         } catch (Throwable t) {
             MLog.w("le.bt.reply send failed", t);
         }
+    }
+
+    /** Read the selected media output, scoped to this earphone's official BR/LE mapping. */
+    private int readMediaProfile(String mac, boolean leConnected) {
+        BluetoothDevice requested = resolveDevice(mac);
+        if (requested == null) return LeAudioIpc.MEDIA_PROFILE_UNKNOWN;
+        BluetoothDevice br = resolveBrDevice(requested);
+        List<String> classicAddresses = new ArrayList<>();
+        classicAddresses.add(requested.getAddress());
+        classicAddresses.add(br.getAddress());
+        List<String> leAddresses = new ArrayList<>();
+        leAddresses.add(requested.getAddress());
+        for (BluetoothDevice member : resolveLeAudioDevices(requested)) {
+            leAddresses.add(member.getAddress());
+        }
+        try {
+            AudioManager audio = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+            Method query = audio == null ? null : findMethod(
+                    audio.getClass(), "getDevicesForAttributes", AudioAttributes.class);
+            if (query != null) {
+                query.setAccessible(true);
+                Object outputs = query.invoke(audio, new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build());
+                if (outputs instanceof Iterable<?>) {
+                    int selected = LeAudioIpc.MEDIA_PROFILE_OTHER;
+                    boolean found = false;
+                    for (Object output : (Iterable<?>) outputs) {
+                        if (output == null) continue;
+                        found = true;
+                        Object type = output.getClass().getMethod("getType").invoke(output);
+                        Object address = output.getClass().getMethod("getAddress").invoke(output);
+                        int profile = mediaProfileForOutput(
+                                type instanceof Integer ? (Integer) type : 0,
+                                address instanceof String ? (String) address : null,
+                                classicAddresses, leAddresses);
+                        if (profile == LeAudioIpc.MEDIA_PROFILE_A2DP
+                                || profile == LeAudioIpc.MEDIA_PROFILE_LE_AUDIO) {
+                            if (selected > 0 && selected != profile) {
+                                return LeAudioIpc.MEDIA_PROFILE_UNKNOWN;
+                            }
+                            selected = profile;
+                        } else if (profile == LeAudioIpc.MEDIA_PROFILE_UNKNOWN && selected <= 0) {
+                            selected = profile;
+                        }
+                    }
+                    if (found && selected != LeAudioIpc.MEDIA_PROFILE_UNKNOWN) return selected;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Older ROMs may not expose the routing query to the bluetooth UID.
+        }
+        Object classicProxy = acquireA2dpProxyBlocking();
+        Object state = invokeObject(classicProxy, "getConnectionState",
+                new Class[]{BluetoothDevice.class}, new Object[]{br});
+        int classicState = state instanceof Integer ? (Integer) state : -1;
+        Boolean classicConnected = classicState == BluetoothProfile.STATE_CONNECTED ? Boolean.TRUE
+                : classicState == BluetoothProfile.STATE_DISCONNECTED ? Boolean.FALSE : null;
+        return mediaProfileFromConnections(leConnected, classicConnected);
+    }
+
+    static int mediaProfileForOutput(int type, String address,
+            Collection<String> classicAddresses, Collection<String> leAddresses) {
+        boolean classic = type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP;
+        boolean le = type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                || type == AudioDeviceInfo.TYPE_BLE_SPEAKER;
+        if (!classic && !le) return LeAudioIpc.MEDIA_PROFILE_OTHER;
+        if (address == null || address.isEmpty()) return LeAudioIpc.MEDIA_PROFILE_UNKNOWN;
+        for (String candidate : classic ? classicAddresses : leAddresses) {
+            if (address.equalsIgnoreCase(candidate)) {
+                return classic ? LeAudioIpc.MEDIA_PROFILE_A2DP : LeAudioIpc.MEDIA_PROFILE_LE_AUDIO;
+            }
+        }
+        return LeAudioIpc.MEDIA_PROFILE_OTHER;
+    }
+
+    static int mediaProfileFromConnections(boolean leConnected, Boolean classicConnected) {
+        if (!leConnected && Boolean.TRUE.equals(classicConnected)) {
+            return LeAudioIpc.MEDIA_PROFILE_A2DP;
+        }
+        if (leConnected && Boolean.FALSE.equals(classicConnected)) {
+            return LeAudioIpc.MEDIA_PROFILE_LE_AUDIO;
+        }
+        return LeAudioIpc.MEDIA_PROFILE_UNKNOWN;
     }
 
     private static boolean isLeAudioEnabled(Object proxy, String mac) {
