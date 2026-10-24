@@ -663,6 +663,9 @@ public final class SystemHookInstaller {
             payload.put("kind", kind == null ? "state" : kind);
             payload.put("mac", redactMac(mac));
             payload.put("streaming", NativeLhdcMemoryPatch.isGovernorStreaming());
+            payload.put("governorInstalled", NativeLhdcMemoryPatch.isGovernorInstalled());
+            payload.put("governorInstallResult",
+                    NativeLhdcMemoryPatch.lastGovernorInstallResult());
             payload.put("actualBitrateKbps",
                     NativeLhdcMemoryPatch.currentGovernorBitrateKbps());
             payload.put("requestedBitrateKbps",
@@ -1074,6 +1077,12 @@ public final class SystemHookInstaller {
         String mac = normalizeMac(snapshot.mac);
         if (mac == null) return;
         if (CodecLabelTable.isLhdc(snapshot.activeCodecType)) {
+            // The vendor loader rewrites its dlsym table on each encoder load. Check the hook
+            // on every confirmed LHDC config so a replaced wrapper is restored before the
+            // next stream starts.
+            if (NativeLhdcMemoryPatch.isQualityPolicySelected()) {
+                NativeLhdcMemoryPatch.installGovernor();
+            }
             // A stack-confirmed LHDC config is the strongest capability signal. Always cache it
             // per MAC; the native ceiling is only rewritten when this MAC is (or becomes) active.
             syncPeerCeilingFromSnapshot(mac, snapshot, "codec_confirmed");
@@ -1309,6 +1318,12 @@ public final class SystemHookInstaller {
             MLog.event("lhdc.link.bqr_ignored", "mac", redactMac(mac), "reason", "not_active");
             return;
         }
+        // Self-heal the native encoder capture before judging whether the stream is visible.
+        // A vendor codec reload can replace the wrappers installed for the previous stream,
+        // leaving streaming=false and queue=-1 for the rest of this session.
+        if (NativeLhdcMemoryPatch.isQualityPolicySelected()) {
+            NativeLhdcMemoryPatch.installGovernor();
+        }
         linkHealthController.setQualityPolicyActive(
                 NativeLhdcMemoryPatch.shouldSampleQueue(), capturedAtMs);
         if (!mac.equals(activeLhdcMac)) {
@@ -1352,6 +1367,10 @@ public final class SystemHookInstaller {
                 "requestedBitrateKbps", requestedBitrateKbps,
                 "bitrateVerification", bitrateVerification,
                 "healthyWindows", snapshot.healthyBqrWindows,
+                "governorInstalled", NativeLhdcMemoryPatch.isGovernorInstalled(),
+                "governorInstallResult", NativeLhdcMemoryPatch.lastGovernorInstallResult(),
+                "bqrFallbackCapKbps", snapshot.bqrFallbackCapKbps,
+                "leakyFallbackCapKbps", snapshot.leakyFallbackCapKbps,
                 "ceilingKbps", snapshot.ceilingKbps,
                 "effectiveCeilingKbps", snapshot.ceilingKbps,
                 "peerCeilingKbps", snapshot.peerCeilingKbps,

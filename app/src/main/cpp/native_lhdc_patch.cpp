@@ -930,6 +930,46 @@ int hook_existing_encoder_pointer() {
 #if !defined(__aarch64__)
     return -2;
 #else
+    // ColorOS 17's A2DP_VendorLoadEncoderLhdcV5 repopulates its dlsym table on every
+    // encoder load. A hook installed for an earlier stream can therefore be silently
+    // replaced by the original pointers. Reapply the wrappers to the slots recorded by
+    // the previous install before falling back to a fresh scan.
+    const uintptr_t known_encode_slot = g_encode_slot.load(std::memory_order_acquire);
+    const uintptr_t known_free_slot = g_free_slot.load(std::memory_order_acquire);
+    const int writable = PROT_READ | PROT_WRITE;
+    if (known_encode_slot != 0 && known_free_slot != 0
+            && mapping_protection(known_encode_slot) == writable
+            && mapping_protection(known_free_slot) == writable) {
+        auto** encode_slot = reinterpret_cast<void**>(known_encode_slot);
+        auto** free_slot = reinterpret_cast<void**>(known_free_slot);
+        void* const encode_original = reinterpret_cast<void*>(
+                g_encode.load(std::memory_order_acquire));
+        void* const free_original = reinterpret_cast<void*>(
+                g_free_handle.load(std::memory_order_acquire));
+        void* const encode_current = __atomic_load_n(encode_slot, __ATOMIC_ACQUIRE);
+        void* const free_current = __atomic_load_n(free_slot, __ATOMIC_ACQUIRE);
+        if (encode_current == reinterpret_cast<void*>(&melody_lhdc_encode)
+                && free_current == reinterpret_cast<void*>(&melody_lhdc_free_handle)) {
+            return 3;
+        }
+        if (encode_original != nullptr && free_original != nullptr
+                && encode_current == encode_original && free_current == free_original
+                && replace_writable_pointer(encode_slot, encode_original,
+                        reinterpret_cast<void*>(&melody_lhdc_encode))) {
+            if (replace_writable_pointer(free_slot, free_original,
+                    reinterpret_cast<void*>(&melody_lhdc_free_handle))) {
+                __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                        "evt=encoder.rehook result=4 encode=%p free=%p",
+                        encode_slot, free_slot);
+                return 4;
+            }
+            replace_writable_pointer(encode_slot,
+                    reinterpret_cast<void*>(&melody_lhdc_encode), encode_original);
+        }
+        // Slots were invalidated or now point at an unknown owner: fail closed and rescan.
+        g_encode_slot.store(0, std::memory_order_release);
+        g_free_slot.store(0, std::memory_order_release);
+    }
     LoadedImage encoder;
     if (!find_loaded_image(kEncoderLibrary, &encoder)) return -3;
     void* encode = resolve_elf64_export(encoder, kEncodeSymbol);
