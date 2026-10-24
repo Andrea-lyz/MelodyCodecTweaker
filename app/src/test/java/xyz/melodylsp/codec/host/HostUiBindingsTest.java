@@ -33,6 +33,27 @@ public final class HostUiBindingsTest {
     }
 
     @Test
+    public void hostWrapperOverridesPositiveActionAndIsPreferredToLibraryBase() {
+        assertEquals(HostDialogWrapper.class.getName(), HostUiBindings.selectDialogWrapper(
+                RenamedDialogBuilder.class.getName(), Arrays.asList(
+                        AnotherBuilder.class.getName(), HostDialogWrapper.class.getName()),
+                getClass().getClassLoader()));
+        assertNull(HostUiBindings.selectDialogWrapper(RenamedDialogBuilder.class.getName(),
+                Collections.singletonList(AnotherBuilder.class.getName()),
+                getClass().getClassLoader()));
+    }
+
+    @Test
+    public void wrapperAmbiguityAndUnrelatedBuildersAreRejected() {
+        assertNull(HostUiBindings.selectDialogWrapper(RenamedDialogBuilder.class.getName(),
+                Arrays.asList(HostDialogWrapper.class.getName(), OtherDialogWrapper.class.getName()),
+                getClass().getClassLoader()));
+        assertNull(HostUiBindings.selectDialogWrapper(AnotherBuilder.class.getName(),
+                Collections.singletonList(HostDialogWrapper.class.getName()),
+                getClass().getClassLoader()));
+    }
+
+    @Test
     public void selectedAndEnabledRolesDoNotDependOnAlphabeticalFieldOrder() throws Exception {
         Field[] fields = HostUiBindings.itemFields(
                 RenamedItem.class, RenamedItem.class.getField("aEnabled"));
@@ -60,6 +81,18 @@ public final class HostUiBindingsTest {
 
     public static class AnotherBuilder extends RenamedDialogBuilder {
         public AnotherBuilder(Context context) { super(context); }
+    }
+
+    public static class HostDialogWrapper extends RenamedDialogBuilder {
+        public HostDialogWrapper(Context context) { super(context); }
+        @Override
+        public void setPositiveButton(CharSequence text, DialogInterface.OnClickListener action) {}
+    }
+
+    public static class OtherDialogWrapper extends RenamedDialogBuilder {
+        public OtherDialogWrapper(Context context) { super(context); }
+        @Override
+        public void setPositiveButton(CharSequence text, DialogInterface.OnClickListener action) {}
     }
 
     public static class IncompleteBuilder {

@@ -753,6 +753,14 @@ public final class CodecController {
                 () -> requestLeAudioToggle(sub, enable))) {
             return;
         }
+        showFrameworkConfirmDialog(activity, title, message, positive, negative,
+                () -> requestLeAudioToggle(sub, enable));
+    }
+
+    private static void showFrameworkConfirmDialog(
+            Activity activity, String title, String message, String positive, String negative,
+            ConfirmAction action) {
+        if (activity.isFinishing() || activity.isDestroyed()) return;
         MLog.event("le.melody.dialog", "builder", "framework");
         boolean night = (activity.getResources().getConfiguration().uiMode
                 & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
@@ -764,7 +772,7 @@ public final class CodecController {
                 .setMessage(message)
                 .setPositiveButton(positive, (d, w) -> {
                     d.dismiss();
-                    requestLeAudioToggle(sub, enable);
+                    action.run();
                 })
                 .setNegativeButton(negative, (d, w) -> d.dismiss())
                 .setCancelable(true)
@@ -837,7 +845,9 @@ public final class CodecController {
                         && !isHostCouiDialogBuilderClass(builderCls)) continue;
                 Object builder = newMelodyDialogBuilder(activity, builderCls);
                 if (builder == null) continue;
-                configureAndShowDialog(builder, title, message, positive, negative, action);
+                configureAndShowDialog(builder, title, message, positive, negative, action,
+                        () -> showFrameworkConfirmDialog(
+                                activity, title, message, positive, negative, action));
                 MLog.event("le.melody.dialog", "builder", name);
                 return true;
             } catch (ClassNotFoundException ignored) {
@@ -897,15 +907,11 @@ public final class CodecController {
 
     private static Object newMelodyDialogBuilder(Activity activity, Class<?> builderCls) {
         try {
-            try {
-                return builderCls.getConstructor(Context.class).newInstance(activity);
-            } catch (NoSuchMethodException ignored) {
-            } catch (Throwable ignored) {
-            }
+            // Resource table entries keep dots even though generated R fields use underscores.
+            // Prefer the host's bottom warning theme explicitly, including on wrapper classes.
             String[] styles = {
+                    "COUIAlertDialog.BottomWarning",
                     "COUIAlertDialog_BottomWarning",
-                    "COUIAlertDialog_Center",
-                    "COUIAlertDialog_Bottom"
             };
             for (String name : styles) {
                 int style = activity.getResources().getIdentifier(
@@ -918,10 +924,10 @@ public final class CodecController {
                 } catch (Throwable ignored) {
                 }
             }
+            return builderCls.getConstructor(Context.class).newInstance(activity);
         } catch (Throwable t) {
             return null;
         }
-        return null;
     }
 
 
@@ -931,7 +937,8 @@ public final class CodecController {
             String message,
             String positive,
             String negative,
-            ConfirmAction action) throws Exception {
+            ConfirmAction action,
+            Runnable fallback) throws Exception {
         invokeDialogBuilder(builder, "setTitle",
                 new Class[]{CharSequence.class}, new Object[]{title});
         invokeDialogBuilder(builder, "setMessage",
@@ -964,10 +971,32 @@ public final class CodecController {
         Object shown = show.invoke(builder);
         if (!(shown instanceof Dialog)) throw new IllegalStateException("not_a_dialog");
         Dialog dialog = (Dialog) shown;
-        if (!hasDialogActions(dialog, positive, negative)) {
-            dialog.dismiss();
-            throw new IllegalStateException("dialog_actions_missing");
-        }
+        View decor = dialog.getWindow().getDecorView();
+        // COUI finishes its button bar and entrance layout after show() returns. Checking
+        // isShown() synchronously rejected valid dialogs and forced the system fallback.
+        decor.getViewTreeObserver().addOnPreDrawListener(
+                new android.view.ViewTreeObserver.OnPreDrawListener() {
+                    @Override
+                    public boolean onPreDraw() {
+                        decor.getViewTreeObserver().removeOnPreDrawListener(this);
+                        if (!dialog.isShowing()) return true;
+                        if (hasDialogActions(dialog, positive, negative)) {
+                            MLog.event("le.melody.dialog.validated",
+                                    "builder", builder.getClass().getName(),
+                                    "gravity", dialog.getWindow().getAttributes().gravity);
+                            return true;
+                        }
+                        // Change windows outside traversal; never let a broken first frame draw.
+                        decor.post(() -> {
+                            if (!dialog.isShowing()) return;
+                            MLog.event("le.melody.dialog.actions_missing",
+                                    "builder", builder.getClass().getName());
+                            dialog.dismiss();
+                            fallback.run();
+                        });
+                        return false;
+                    }
+                });
     }
 
     private static boolean hasDialogActions(Dialog dialog, String positive, String negative) {
@@ -976,7 +1005,7 @@ public final class CodecController {
         return ok instanceof TextView && cancel instanceof TextView
                 && positive.contentEquals(((TextView) ok).getText())
                 && negative.contentEquals(((TextView) cancel).getText())
-                && ok.isShown() && cancel.isShown();
+                && ok.getVisibility() == View.VISIBLE && cancel.getVisibility() == View.VISIBLE;
     }
 
     private static void invokeDialogBuilder(

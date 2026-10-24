@@ -32,8 +32,13 @@ final class HostUiBindings {
     static HostUiBindings resolve(DexKitHostResolver dexKit, ClassLoader loader) {
         // These library-owned log tags survive R8 package/class renaming. Search the entire
         // APK, including secondary DEX files, then require an unambiguous UI contract.
-        String dialog = selectDialogBuilder(dexKit.findClassesUsingStrings(
+        String dialogBase = selectDialogBuilder(dexKit.findClassesUsingStrings(
                 "ui.dialog", "", "COUIAlertDialogBuilder"), loader);
+        // Melody's subclass enables background blur and promotes the positive button.
+        // The COUI library base alone has the same method shape but different appearance.
+        String wrapper = selectDialogWrapper(dialogBase,
+                dexKit.findDirectSubclasses("ui.dialog.wrapper", dialogBase), loader);
+        String dialog = wrapper != null ? wrapper : dialogBase;
         List<String[]> popups = new ArrayList<>();
         for (String name : dexKit.findClassesUsingStrings(
                 "ui.popup", "", "COUIPopupListWindow")) {
@@ -54,6 +59,7 @@ final class HostUiBindings {
         String[] popup = popups.size() == 1 ? popups.get(0) : null;
         MLog.event("ui.bindings.resolved", "source", "dexkit",
                 "dialog", dialog != null ? dialog : "unresolved",
+                "dialogBase", dialogBase != null ? dialogBase : "unresolved",
                 "popup", popup != null ? popup[0] : "unresolved",
                 "item", popup != null ? popup[1] : "unresolved",
                 "popupCandidates", popups.size());
@@ -76,6 +82,26 @@ final class HostUiBindings {
                 cls.getMethod("setNegativeButton", CharSequence.class,
                         DialogInterface.OnClickListener.class);
                 valid.add(name);
+            } catch (ReflectiveOperationException | LinkageError ignored) {
+            }
+        }
+        return valid.size() == 1 ? valid.iterator().next() : null;
+    }
+
+    static String selectDialogWrapper(String parent, List<String> names, ClassLoader loader) {
+        if (parent == null) return null;
+        Set<String> valid = new LinkedHashSet<>();
+        for (String name : names) {
+            try {
+                Class<?> cls = Class.forName(name, false, loader);
+                if (cls.getSuperclass() == null
+                        || !parent.equals(cls.getSuperclass().getName())
+                        || selectDialogBuilder(java.util.Collections.singletonList(name), loader)
+                        == null) continue;
+                Method positive = cls.getDeclaredMethod("setPositiveButton", CharSequence.class,
+                        DialogInterface.OnClickListener.class);
+                if (Modifier.isPublic(positive.getModifiers())
+                        && !Modifier.isStatic(positive.getModifiers())) valid.add(name);
             } catch (ReflectiveOperationException | LinkageError ignored) {
             }
         }

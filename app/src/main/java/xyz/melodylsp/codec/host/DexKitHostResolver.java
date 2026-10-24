@@ -74,6 +74,26 @@ final class DexKitHostResolver implements AutoCloseable {
         }
     }
 
+    /** Finds the host's wrapper around an already anchored COUI class, across all DEX files. */
+    List<String> findDirectSubclasses(String label, String parent) {
+        if (parent == null || parent.isEmpty() || !ensureBridge()) {
+            return java.util.Collections.emptyList();
+        }
+        try {
+            Object findClass = create("org.luckypray.dexkit.query.FindClass");
+            Object matcher = create("org.luckypray.dexkit.query.matchers.ClassMatcher");
+            matcher = keepIfReturned(invoke(matcher, "superClass", parent), matcher);
+            findClass = keepIfReturned(invoke(findClass, "matcher", matcher), findClass);
+            List<String> names = classNames(invoke(bridge, "findClass", findClass));
+            MLog.event("dexkit.find.subclasses", "label", label, "parent", parent,
+                    "count", names.size(), "classes", join(names, 6));
+            return names;
+        } catch (Throwable t) {
+            MLog.w("DexKit subclass lookup failed label=" + label, t);
+            return java.util.Collections.emptyList();
+        }
+    }
+
     /** Follows a framework override through R8 delegate methods, without guessing field names. */
     Field findBooleanReadBy(Method entry, Class<?> fieldOwner, ClassLoader loader) {
         if (entry == null || fieldOwner == null || !ensureBridge()) return null;
