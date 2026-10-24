@@ -532,6 +532,8 @@ final class LhdcLinkHealthController {
     private final Map<String, Boolean> choppyCapabilityObservedByMac = new HashMap<>();
     private final Listener listener;
     private String activeMac;
+    /** Matches native's QUALITY-only sampling gate; startup is observe-only (ADAPTIVE). */
+    private boolean qualityPolicyActive;
     /**
      * Experimental governor switch (default ON for the unit-test semantics; the bluetooth
      * process overrides it from module prefs at startup, where the default is OFF). When
@@ -542,6 +544,32 @@ final class LhdcLinkHealthController {
 
     LhdcLinkHealthController(Listener listener) {
         this.listener = listener;
+    }
+
+    /**
+     * Mirrors whether native can govern the current playback policy, independently of the
+     * experimental switch. Policy changes discard control evidence and pending transactions;
+     * peer capability and lifetime choppy support remain available for diagnostics.
+     */
+    synchronized void setQualityPolicyActive(boolean active, long nowMs) {
+        if (qualityPolicyActive == active) return;
+        qualityPolicyActive = active;
+        for (DeviceState state : devices.values()) {
+            clearBoundary(state.to900);
+            clearBoundary(state.to1000);
+            state.bqrFallbackCapKbps = 0;
+            state.bqrFallbackBadWindows = 0;
+            state.bqrFallbackHealthyWindows = 0;
+            state.bqrFallbackSinceMs = 0L;
+            resetSessionEvidence(state, nowMs);
+            state.streamSessionId = 0L;
+            state.lastPublishedCeiling = -1;
+        }
+        DeviceState state = devices.get(activeMac);
+        if (state != null && listener != null) {
+            listener.onProbeStateChanged(activeMac, effectiveCeiling(state),
+                    active ? "quality_policy_active" : "quality_policy_observe_only");
+        }
     }
 
     /** Makes a device active. Repeating this for the same BQR callback is strictly idempotent. */
@@ -613,6 +641,7 @@ final class LhdcLinkHealthController {
         if (state.streamSessionId == sessionId) return;
         state.streamSessionId = sessionId;
         resetSessionEvidence(state, nowMs);
+        if (!qualityPolicyActive) return;
         if (mac.equals(activeMac)) {
             state.lastPublishedCeiling = -1;
             publishCeiling(mac, state, "stream_session", nowMs);
@@ -751,6 +780,7 @@ final class LhdcLinkHealthController {
                     && state.retransmissionsPerSecond <= MAX_RETRANSMISSIONS_PER_SECOND
                     && state.noRxPerSecond <= MAX_NO_RX_PER_SECOND;
             state.healthyBqrWindows = strictlyHealthy ? state.healthyBqrWindows + 1 : 0;
+            if (!qualityPolicyActive) return;
             if (governorEnabled) {
                 evaluateBqrFallback(mac, state, nowMs, streaming, legalWindow);
                 recordBqrSnapshot(state, nowMs);
@@ -866,6 +896,7 @@ final class LhdcLinkHealthController {
         state.streaming = true;
         state.currentQueueLength = length;
         state.queueCapacity = capacity;
+        if (!qualityPolicyActive) return;
         long occupancy = (long) length * 100L;
         if (occupancy <= (long) capacity * 25L) {
             if (state.lowQueueSinceMs == 0L) state.lowQueueSinceMs = nowMs;
@@ -918,7 +949,7 @@ final class LhdcLinkHealthController {
     }
 
     synchronized void onCongestion(String mac, long nowMs) {
-        if (mac == null) return;
+        if (mac == null || !qualityPolicyActive) return;
         DeviceState state = stateFor(mac);
         noteCongestion(state, nowMs);
         if (cancelRecoveryProbe(state, nowMs, false)) {
@@ -943,6 +974,7 @@ final class LhdcLinkHealthController {
             state.remoteChoppyCount = 0;
         }
         state.remoteChoppyCount++;
+        if (!qualityPolicyActive) return;
         if (nowMs < state.startGuardUntilMs || nowMs < state.postSwitchGuardUntilMs) {
             // Phase N-2 guards: choppy during stream warm-up (START_GUARD) or right after a
             // Target_Cap switch (POST_SWITCH_GUARD) is recorded but not integrated, so a
@@ -967,7 +999,7 @@ final class LhdcLinkHealthController {
 
     synchronized void onGovernorEvent(
             String mac, int event, int fromKbps, int toKbps, long detailMs, long nowMs) {
-        if (mac == null) return;
+        if (mac == null || !qualityPolicyActive) return;
         DeviceState state = stateFor(mac);
         BoundaryState boundary = boundaryFor(state, fromKbps, toKbps);
         if (boundary == null) return;
@@ -1035,7 +1067,7 @@ final class LhdcLinkHealthController {
      */
     synchronized void onTargetCapIssued(
             String mac, int targetKbps, int requestId, long nowMs) {
-        if (mac == null || requestId <= 0 || targetKbps <= 0) return;
+        if (mac == null || !qualityPolicyActive || requestId <= 0 || targetKbps <= 0) return;
         DeviceState state = stateFor(mac);
         state.pendingTargetKbps = targetKbps;
         state.pendingRequestId = requestId;
@@ -1048,7 +1080,7 @@ final class LhdcLinkHealthController {
      */
     synchronized void onTransitionConfirmed(
             String mac, int toKbps, int requestId, long nowMs) {
-        if (mac == null || requestId <= 0) return;
+        if (mac == null || !qualityPolicyActive || requestId <= 0) return;
         DeviceState state = devices.get(mac);
         if (state == null || state.pendingRequestId != requestId) return;
         state.currentConfirmedKbps = toKbps;
@@ -1063,6 +1095,7 @@ final class LhdcLinkHealthController {
      * confirmation, so the caller can fall back to the getter for the real bitrate.
      */
     synchronized PendingTransaction tickSwitchTransactions(String mac, long nowMs) {
+        if (!qualityPolicyActive) return null;
         DeviceState state = devices.get(mac);
         if (state == null || state.pendingRequestId == 0) return null;
         if (nowMs - state.pendingSinceMs < SWITCH_CONFIRM_TIMEOUT_MS) return null;
@@ -1186,6 +1219,7 @@ final class LhdcLinkHealthController {
     }
 
     private void maybeOpenRecoveryProbe(String mac, DeviceState state, long nowMs) {
+        if (!qualityPolicyActive) return;
         BoundaryState boundary = firstBlockedBoundary(state);
         if (boundary == null || !state.streaming) return;
         long quietMs = quietMsForTier(boundary.evidenceTier);
@@ -1250,7 +1284,7 @@ final class LhdcLinkHealthController {
     }
 
     private void publishCeiling(String mac, DeviceState state, String reason, long nowMs) {
-        if (!mac.equals(activeMac)) return;
+        if (!qualityPolicyActive || !mac.equals(activeMac)) return;
         int ceiling = effectiveCeiling(state);
         if (state.lastPublishedCeiling == ceiling) {
             if (listener != null) listener.onProbeStateChanged(mac, ceiling, reason);

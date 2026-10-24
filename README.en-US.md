@@ -18,6 +18,12 @@
 
 The module primarily targets `com.oplus.melody` on ColorOS / OPlus devices, working alongside the `com.android.bluetooth` and `com.oplus.wirelesssettings` scopes for more stable state reading and writing.
 
+## 2.5.4 Update Highlights
+
+- Fixes a policy-gating issue where the experimental LHDC link governor could still publish bitrate-control targets in Adaptive and Connection Priority modes. These modes now collect link diagnostics without applying bitrate governance.
+- Clears stale governor state on policy changes and prevents late control events received outside Quality Priority from triggering governance.
+- See the [complete bilingual 2.5.4 release notes](docs/releases/2.5.4.md). Playback on the affected headset still needs to be checked after upgrading; this release confirms the module-side policy correction.
+
 ## 2.5.3 Update Highlights
 
 - Adds an independent Game Low Latency master switch for AAC/SBC headsets without an official Game Mode entry. When disabled, the compatibility path rejects SBC low-latency entry requests while preserving normal codec choices and exit requests.

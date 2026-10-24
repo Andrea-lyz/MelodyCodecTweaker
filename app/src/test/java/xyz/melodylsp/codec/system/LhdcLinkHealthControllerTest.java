@@ -15,10 +15,179 @@ public final class LhdcLinkHealthControllerTest {
 
     private static final String MAC = "AA:BB:CC:DD:EE:01";
 
+    private static LhdcLinkHealthController qualityController(
+            LhdcLinkHealthController.Listener listener) {
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(listener);
+        controller.setQualityPolicyActive(true, 0L);
+        return controller;
+    }
+
+    @Test
+    public void observeOnlyPolicyRecordsDiagnosticsWithoutPublishingTargets() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+        controller.onStreamSessionChanged(MAC, 1L, 300L);
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);
+        for (int i = 0; i < 5; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L + i * 6_000L);
+        }
+        controller.onQueueSample(MAC, 45, 45, 59_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 60_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 61_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 62_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 63_000L);
+        controller.onTargetCapIssued(MAC, 500, 7, 63_000L);
+
+        LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 63_000L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertEquals(900, snapshot.peerCeilingKbps);
+        assertEquals(200.0 / 6, snapshot.retransmissionsPerSecond, 0.01);
+        assertEquals(160.0 / 6, snapshot.noRxPerSecond, 0.01);
+        assertEquals(45, snapshot.currentQueueLength);
+        assertEquals(1, snapshot.lastRemoteChoppyLevel);
+        assertEquals(2, snapshot.remoteChoppyCount5s);
+        assertEquals(LhdcLinkHealthController.CHOPPY_CAPABILITY_OBSERVED,
+                snapshot.choppyCapabilityState);
+        assertEquals(0, snapshot.bqrFallbackCapKbps);
+        assertEquals(0, snapshot.leakyFallbackCapKbps);
+        assertEquals("stable", snapshot.probePhase);
+        assertFalse(snapshot.boundary500To900Locked);
+        assertNull(controller.tickSwitchTransactions(MAC, 70_000L));
+        assertTrue(recorder.events.isEmpty());
+        assertTrue(recorder.fallbackEvents.isEmpty());
+        assertTrue(recorder.shadowEvents.isEmpty());
+        assertTrue(recorder.shadowTriggers.isEmpty());
+    }
+
+    @Test
+    public void policyExitClearsControlStateAndIgnoresLateNativeEvents() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = qualityController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 1_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 2_000L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
+        controller.onTargetCapIssued(MAC, 500, 7, 10_000L);
+        assertTrue(controller.snapshot(MAC, 10_000L).boundary500To900Locked);
+        int writesBeforeExit = recorder.events.size();
+
+        controller.setQualityPolicyActive(false, 20_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 21_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                500, 900, 22_000L);
+        controller.onTransitionConfirmed(MAC, 500, 7, 22_100L);
+        LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 22_100L);
+        assertEquals(900, snapshot.ceilingKbps);
+        assertEquals(900, snapshot.peerCeilingKbps);
+        assertEquals(0, snapshot.bqrFallbackCapKbps);
+        assertEquals(0, snapshot.leakyFallbackCapKbps);
+        assertFalse(snapshot.boundary500To900Locked);
+        assertFalse(snapshot.boundary900To1000Locked);
+        assertEquals(0L, snapshot.nativeBackoffRemainingMs);
+        assertNull(controller.tickSwitchTransactions(MAC, 30_000L));
+        assertEquals(writesBeforeExit, recorder.events.size());
+    }
+
+    @Test
+    public void policyExitClearsLeakyCapBeforeNextQualitySession() {
+        LhdcLinkHealthController controller = qualityController(null);
+        controller.activate(MAC, 100L);
+        controller.onRemoteChoppyReport(MAC, 1, 20_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 21_000L);
+        assertEquals(900, controller.snapshot(MAC, 21_000L).leakyFallbackCapKbps);
+
+        controller.setQualityPolicyActive(false, 30_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 60_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 61_000L);
+        assertEquals(0, controller.snapshot(MAC, 61_000L).leakyFallbackCapKbps);
+
+        controller.setQualityPolicyActive(true, 100_000L);
+        // Wait past the existing 15 s stream-start guard before testing a fresh bucket.
+        controller.onRemoteChoppyReport(MAC, 1, 120_000L);
+        assertEquals(1000, controller.snapshot(MAC, 120_000L).ceilingKbps);
+        controller.onRemoteChoppyReport(MAC, 1, 121_000L);
+        assertEquals(900, controller.snapshot(MAC, 121_000L).ceilingKbps);
+    }
+
+    @Test
+    public void observeOnlyEvidenceDoesNotCarryIntoQualityPolicy() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);
+        for (int i = 0; i < 5; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 16_000L + i * 6_000L);
+        }
+        controller.onRemoteChoppyReport(MAC, 1, 60_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 61_000L);
+        assertTrue(recorder.events.isEmpty());
+
+        controller.setQualityPolicyActive(true, 100_000L);
+        controller.onBqrSample(MAC, bqrFallbackBad(), 110_000L);
+        for (int i = 0; i < 3; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 116_000L + i * 6_000L);
+        }
+        assertEquals(1000, controller.snapshot(MAC, 128_000L).ceilingKbps);
+        controller.onBqrSample(MAC, bqrFallbackBad(), 134_000L);
+        assertEquals(900, controller.snapshot(MAC, 134_000L).ceilingKbps);
+        assertTrue(recorder.events.contains("900:bqr_fallback_triggered"));
+    }
+
+    @Test
+    public void repeatedQualityPolicySyncPreservesLearningAndTransactions() {
+        LhdcLinkHealthController controller = qualityController(null);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
+        controller.onBqrSample(MAC, healthyBqr(), 20_000L);
+        for (int i = 0; i < 3; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 26_000L + i * 6_000L);
+        }
+        controller.onTargetCapIssued(MAC, 900, 17, 40_000L);
+        controller.setQualityPolicyActive(true, 40_100L);
+        assertEquals(900, controller.snapshot(MAC, 40_100L).ceilingKbps);
+        assertEquals(3, controller.snapshot(MAC, 40_100L).bqrFallbackHealthyWindows);
+        LhdcLinkHealthController.PendingTransaction pending =
+                controller.tickSwitchTransactions(MAC, 50_000L);
+        assertNotNull(pending);
+        assertEquals(17, pending.requestId);
+    }
+
+    @Test
+    public void experimentalSwitchCannotOverrideObserveOnlyPolicy() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setGovernorEnabled(false, 200L);
+        controller.setGovernorEnabled(true, 300L);
+        controller.onRemoteChoppyReport(MAC, 1, 20_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 21_000L);
+        assertEquals(1000, controller.snapshot(MAC, 21_000L).ceilingKbps);
+        assertTrue(recorder.events.isEmpty());
+
+        controller.setGovernorEnabled(false, 30_000L);
+        controller.setQualityPolicyActive(true, 40_000L);
+        controller.onBqrSample(MAC, bqrFallbackBad(), 50_000L);
+        for (int i = 0; i < 5; i++) {
+            controller.onBqrSample(MAC, bqrFallbackBad(), 56_000L + i * 6_000L);
+        }
+        controller.onRemoteChoppyReport(MAC, 1, 90_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 91_000L);
+        assertEquals(1000, controller.snapshot(MAC, 91_000L).ceilingKbps);
+        assertTrue(recorder.fallbackEvents.isEmpty());
+    }
+
     @Test
     public void twoQuickFailuresLockOnlyTheirBoundaryUntilHealthEvidenceReturns() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
@@ -39,7 +208,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void failuresAreIndependentAcrossUpgradeBoundaries() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
         controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
                 500, 900, 1_000L);
@@ -394,7 +563,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void boundaryStateChangeIsPublishedWhenEffectiveCeilingIsUnchanged() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
                 500, 900, 1_000L);
@@ -417,7 +586,7 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     private static LhdcLinkHealthController lockedTo500(Recorder recorder) {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
                 500, 900, 1_000L);
@@ -429,7 +598,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void peerCeiling900CapsCeilingAndNeverProbesTo1000() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -451,7 +620,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackRequiresFourSustainedBadWindowsBeforeClampingTo500() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -471,7 +640,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackStepsDownOneRungAtATimeOnADevice() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         // A device: peer ceiling stays at the default 1000.
 
@@ -497,7 +666,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void downgradeDeadZoneFreezesRecoveryEvidence() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -525,7 +694,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void fastRecoveryTierMoves400To500() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 400, 10_000L);
         assertEquals(400, controller.snapshot(MAC, 10_000L).ceilingKbps);
@@ -542,7 +711,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void fastRecoveryTierCountsMidBandWindows() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 400, 10_000L);
 
@@ -558,7 +727,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackFloorRetriggerIsIdempotent() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -579,7 +748,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void strictTierCountsMidBandWindows() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
         assertEquals(900, controller.snapshot(MAC, 10_000L).ceilingKbps);
@@ -604,7 +773,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void strictTierKeepsStreakAcrossOneSidedHotWindows() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
         assertEquals(900, controller.snapshot(MAC, 10_000L).ceilingKbps);
@@ -635,7 +804,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void strictTierEscalatesHoldAfterQuickReTrigger() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         // First trigger at 34s: 1000 -> 900, level 0 -> 120s strict hold.
@@ -675,7 +844,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void snapshotExposesRecoveryProgressForCountdownUi() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
 
@@ -698,7 +867,7 @@ public final class LhdcLinkHealthControllerTest {
         assertEquals(0L, mid.leakyFallbackHoldRemainingMs);
 
         // Leaky path exposes its own progress fields.
-        LhdcLinkHealthController leaky = new LhdcLinkHealthController(new Recorder());
+        LhdcLinkHealthController leaky = qualityController(new Recorder());
         leaky.activate(MAC, 100L);
         leaky.onRemoteChoppyReport(MAC, 1, 16_000L);
         leaky.onRemoteChoppyReport(MAC, 1, 24_000L);  // leaky -> 900
@@ -714,7 +883,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void governorDisabledSkipsDowngradeEvaluation() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setGovernorEnabled(false, 200L);
 
@@ -737,7 +906,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void governorDisableClearsActiveCapAndResetsEvidence() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
         assertEquals(900, controller.snapshot(MAC, 10_000L).ceilingKbps);
@@ -760,7 +929,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void governorDisableDropsHalfRecoveredStreak() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
 
@@ -781,7 +950,7 @@ public final class LhdcLinkHealthControllerTest {
         // Real downgrade path (publish happened), then disable: the restore goes through
         // the publish channel and arms the post-switch guard, unlike the test-hook case.
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
@@ -825,7 +994,7 @@ public final class LhdcLinkHealthControllerTest {
         // the <25 gate, so the device took 2m12s to recover. Decision 47 (<28) makes them
         // count: the replay recovers at the first window past the 60s hold.
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
 
@@ -850,7 +1019,7 @@ public final class LhdcLinkHealthControllerTest {
         // hot (retx 38.3/noRx 23.5) — decision 45 neutrality kept the streak and the
         // 120s hold expired exactly then.
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
 
@@ -876,7 +1045,7 @@ public final class LhdcLinkHealthControllerTest {
         // Feedback 003454: true bad windows interleaved (31/26, 36.7/26.8, 37.7/35) kept
         // resetting the strict streak — one-sided neutrality must NOT bypass the bad gate.
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
 
@@ -908,7 +1077,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrPauseFreezesRecoveryStreak() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
 
@@ -931,7 +1100,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void streamPauseFreezesRecoveryStreak() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
 
@@ -957,7 +1126,7 @@ public final class LhdcLinkHealthControllerTest {
         // integrate, so a choppy pair cannot interrupt the recovery (feedback 030818:
         // choppy kept reporting during the 900-tier recovery and it still completed).
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 900, 10_000L);
 
@@ -985,7 +1154,7 @@ public final class LhdcLinkHealthControllerTest {
         // Full 030818 cycle: leaky 1000->900, BQR step 900->500, then both recoveries
         // (decisions 44/45/46/47), ending back at 1000 with no escalation.
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         // Leaky trigger (choppy pair) at 24s.
@@ -1026,7 +1195,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void midTierCountsNonBadWindowsButKeepsOneSidedHotGates() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setBqrFallbackCapKbpsForTest(MAC, 500, 10_000L);
         assertEquals(500, controller.snapshot(MAC, 10_000L).ceilingKbps);
@@ -1086,7 +1255,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackSingleBadWindowDoesNotClamp() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1099,7 +1268,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackDoesNotClampWhenPeerCeilingAtOrBelowCap() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 500, 200L, "codec_confirmed");
 
@@ -1114,7 +1283,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackRecoversOnlyAfterHealthyWindowsAndMinimumHold() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
         controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
@@ -1140,7 +1309,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackEscalatesHoldAfterQuickReTrigger() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1180,7 +1349,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackResetsEscalationAfterLongSuccessfulPhase() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1219,7 +1388,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackQueueFastFailTriggersWithinProbeWindow() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1235,7 +1404,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackQueueFastFailIgnoredOutsideProbeWindow() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1251,7 +1420,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackQueueFastFailRequiresSustainedHighQueue() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1271,7 +1440,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrFallbackCodecWriteClearsCapAndReArmsFastFailWindow() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1295,7 +1464,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void peerCeilingArrivesBeforeActivationPublishes900OnFirstActivation() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.setPeerCeilingKbps(MAC, 900, 100L, "codec_confirmed");
 
         controller.activate(MAC, 200L);
@@ -1305,7 +1474,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void unsupportedBoundaryIsNotReportedAsLearnedLock() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1319,7 +1488,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void switchingDevicesDoesNotLeakPeerCeiling() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1338,7 +1507,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void unknownPeerCapabilityDoesNotMeanSupported() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         LhdcLinkHealthController.Snapshot snapshot = controller.snapshot(MAC, 100L);
@@ -1349,7 +1518,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void remoteChoppyReportsAreTrackedInSnapshotWindow() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 200L);
@@ -1373,7 +1542,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void peerCeiling1000RestoresDefaultProbing() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
         controller.setPeerCeilingKbps(MAC, 1000, 300L, "codec_confirmed");
@@ -1382,7 +1551,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void repeatedPeerCeiling1000DoesNotClearLearnedBoundaryLock() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
         controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
                 900, 1000, 1_000L);
@@ -1400,7 +1569,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void peerCeiling900SurvivesStreamSessionButResetsWithDevice() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
         controller.onStreamSessionChanged(MAC, 7L, 300L);
@@ -1416,7 +1585,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void shadowBqrNeedsTwoContinuousWindowsAndNeverChangesCeiling() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.setPeerCeilingKbps(MAC, 900, 50L, "codec_confirmed");
         controller.activate(MAC, 100L);
 
@@ -1441,7 +1610,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void shadowContinuityResetsOnHealthyInvalidIdleAndSessionChange() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.onStreamSessionChanged(MAC, 1L, 200L);
 
@@ -1466,7 +1635,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void shadowCandidateIsMacIsolatedAndRateLimited() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.onBqrSample(MAC, unstableBqr(), 10_000L);
         controller.onBqrSample(MAC, unstableBqr(), 16_000L);
@@ -1507,7 +1676,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void choppyCapabilityIsObservedPerMacAcrossReconnectOnlyWithinProcess() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
         assertEquals(LhdcLinkHealthController.CHOPPY_CAPABILITY_UNKNOWN,
                 controller.snapshot(MAC, 100L).choppyCapabilityState);
@@ -1527,14 +1696,14 @@ public final class LhdcLinkHealthControllerTest {
                 controller.snapshot("AA:BB:CC:DD:EE:02", 300L).choppyCapabilityState);
 
         LhdcLinkHealthController newProcessController =
-                new LhdcLinkHealthController(null);
+                qualityController(null);
         assertEquals(LhdcLinkHealthController.CHOPPY_CAPABILITY_UNKNOWN,
                 newProcessController.snapshot(MAC, 400L).choppyCapabilityState);
     }
 
     @Test
     public void issuedTargetCapTimesOutAndReturnsPendingTransactionOnce() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
@@ -1552,7 +1721,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void zeroRequestIdIssueIsIgnoredWithoutTransaction() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         // Same-rung or governor-unavailable writes return requestId 0; they must not open
@@ -1563,7 +1732,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void matchingTransitionConfirmationClosesTransactionBeforeTimeout() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
@@ -1573,7 +1742,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void staleTransitionConfirmationIsIgnoredAndTransactionStillTimesOut() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
@@ -1586,7 +1755,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void sessionResetClearsPendingTransaction() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
@@ -1597,7 +1766,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void startGuardSuppressesBadWindowAccumulation() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1619,7 +1788,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void illegalBqrFieldsAreSkippedAndDoNotCount() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1639,7 +1808,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void postSwitchGuardSuppressesChoppyCongestion() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
         controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);  // baseline
@@ -1661,7 +1830,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void resumeReArmsStartGuard() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1683,7 +1852,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void suspectCombinationIsLoggedButNeverDecides() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
         controller.onQueueSample(MAC, 5, 45, 9_500L);  // low queue
@@ -1698,7 +1867,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void startGuardSuppressesChoppyCongestion() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         // START_GUARD runs until 15.1 s: choppy inside it is recorded but not integrated.
@@ -1711,7 +1880,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void startGuardDoesNotBlockHealthyWindowCounting() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);  // baseline, interval 0
@@ -1721,7 +1890,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void queueResumeEdgeReArmsStartGuard() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1743,7 +1912,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void suspectWindowDoesNotResetBadStreak() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1763,7 +1932,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void suspectCombinationIsLoggedEvenWhenPeerCeilingAtOrBelowCap() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 500, 200L, "codec_confirmed");
         controller.onQueueSample(MAC, 5, 45, 9_500L);
@@ -1777,7 +1946,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyBucketFillsAndDowngradesOneRung() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         // Two deduped choppy events 8 s apart: 10 -> (10 - 4) + 10 = 16 >= 15 -> 1000 -> 900.
@@ -1790,7 +1959,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void leakyBucketDecaysBelowThresholdWithoutTrigger() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);  // +10
@@ -1801,7 +1970,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyBucketOnPeerCappedDeviceTargets500() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -1814,7 +1983,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyBucketRecoversAfterHealthyWindowsAndHold() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -1839,7 +2008,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leap8sShadowFiresButKeepsCeiling() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);   // baseline
@@ -1857,7 +2026,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void disasterNoRxShadowFiresWithSnapshotButKeepsCeiling() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);       // baseline
@@ -1874,7 +2043,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void disasterRetxShadowFiresWhenNoRxLow() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
@@ -1888,7 +2057,7 @@ public final class LhdcLinkHealthControllerTest {
 
     @Test
     public void resetDeviceClearsPendingTransaction() {
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(null);
+        LhdcLinkHealthController controller = qualityController(null);
         controller.activate(MAC, 100L);
         controller.onTargetCapIssued(MAC, 500, 7, 1_000L);
         controller.resetDevice(MAC, 2_000L, "policy_adaptive");
@@ -1898,7 +2067,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void suspendedPseudoHighWindowDoesNotTriggerDisasterShadow() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         // Decision 37 anchor sample: retx 111.8/s with streaming=false (suspended
@@ -1915,7 +2084,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void congestionEventsDoNotResetCriticalQueueTimer() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
@@ -1931,7 +2100,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyBucketDoesNotIntegrateDuringStartGuard() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         // Two choppy events inside the 15 s guard would fill 20 >= 15 if integrated.
@@ -1945,7 +2114,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyBucketDoesNotIntegrateWhileAnyCapActive() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -1968,7 +2137,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void disasterSnapshotRingRollsPastFourWindows() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);  // baseline
@@ -1990,7 +2159,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leapDoesNotFireWhenChoppyOutside8sWindow() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);   // baseline
@@ -2006,7 +2175,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leapDoesNotFireWhenQueueDrained() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, bqrFallbackBad(), 10_000L);
@@ -2023,7 +2192,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void disasterShadowRespectsCooldownAndPeerCap() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onBqrSample(MAC, healthyBqr(), 10_000L);
@@ -2036,7 +2205,7 @@ public final class LhdcLinkHealthControllerTest {
 
         // A peer-capped device never sees the 1000-tier disaster candidate.
         Recorder cappedRecorder = new Recorder();
-        LhdcLinkHealthController capped = new LhdcLinkHealthController(cappedRecorder);
+        LhdcLinkHealthController capped = qualityController(cappedRecorder);
         capped.activate(MAC, 100L);
         capped.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
         capped.onBqrSample(MAC, healthyBqr(), 10_000L);
@@ -2049,7 +2218,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void codecWriteClearsLeakyCapAndBucket() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2069,7 +2238,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyBucketRecoversDespiteHighAfhUsage() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2088,7 +2257,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyRecoveryRequiresStreamingAndLegalWindows() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2110,7 +2279,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyRecoveryIgnoresIllegalWindows() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2131,7 +2300,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyRecoveryCountsMidBandWindows() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2151,7 +2320,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyRecoveryBadThresholdBoundaryStrictlyBelow() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2174,7 +2343,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyRetriggerBlockedWithinDeadZoneAfterRecovery() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2203,7 +2372,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyRecoverySingleSidedHotWindowResetsStreak() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
@@ -2225,7 +2394,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void bqrRecoveryBoundaryWindowsStrictlyBelowThresholds() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
         controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
 
@@ -2253,7 +2422,7 @@ public final class LhdcLinkHealthControllerTest {
     @Test
     public void leakyRecoveryKeepsBqrCapWhenPresent() {
         Recorder recorder = new Recorder();
-        LhdcLinkHealthController controller = new LhdcLinkHealthController(recorder);
+        LhdcLinkHealthController controller = qualityController(recorder);
         controller.activate(MAC, 100L);
 
         controller.onRemoteChoppyReport(MAC, 1, 16_000L);
