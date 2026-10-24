@@ -555,13 +555,15 @@ public final class SystemHookInstaller {
     }
 
     private void handleProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
+        // The policy may have changed since the controller callback was queued. Native only
+        // consumes targets in QUALITY; never label an observe-only cache update as applied.
+        if (!NativeLhdcMemoryPatch.shouldSampleQueue()) return;
         int requestId = NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
         // Phase N-1 requestId transaction: register the issued Target_Cap so native
         // confirmations with the same requestId close the switch and timeouts fall back
         // to the getter. requestId == 0 means nothing was written (governor unavailable or the
-        // same rung already applied): no transaction, no phantom timeout. When the queue/event
-        // loop is not sampling (ADAPTIVE policy), no confirmation can ever arrive, so the
-        // transaction is not registered either (Phase N-1 review P1-4).
+        // same rung already applied): no transaction, no phantom timeout. Observe-only policies
+        // are excluded above because their queue/event loop cannot confirm a target write.
         if (requestId > 0 && NativeLhdcMemoryPatch.shouldSampleQueue()) {
             linkHealthController.onTargetCapIssued(
                     mac, NativeLhdcMemoryPatch.currentDesiredGovernorProbeCeilingKbps(),
@@ -1054,6 +1056,8 @@ public final class SystemHookInstaller {
         String normalizedMac = normalizeMac(mac);
         if (normalizedMac == null) return;
         mainHandler.post(() -> {
+            linkHealthController.setQualityPolicyActive(
+                    NativeLhdcMemoryPatch.shouldSampleQueue(), SystemClock.elapsedRealtime());
             if (ceilingKbps > 0) {
                 rememberPeerCeiling(normalizedMac, ceilingKbps, "policy_broadcast");
             }
@@ -1170,10 +1174,10 @@ public final class SystemHookInstaller {
         boolean controllerWasActive = linkHealthController.resetDevice(
                 key, SystemClock.elapsedRealtime(), reason);
         if (nativeSessionActive) activeLhdcMac = null;
-        if (nativeSessionActive && !controllerWasActive) {
-            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(1000);
-        }
         if (nativeSessionActive || controllerWasActive) {
+            // Observe-only policies suppress controller target publications. Clear native's
+            // cached cap explicitly so a later QUALITY session cannot inherit the old cap.
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(1000);
             MLog.event("lhdc.link.session_reset",
                     "mac", redactMac(key),
                     "reason", reason,
@@ -1305,6 +1309,8 @@ public final class SystemHookInstaller {
             MLog.event("lhdc.link.bqr_ignored", "mac", redactMac(mac), "reason", "not_active");
             return;
         }
+        linkHealthController.setQualityPolicyActive(
+                NativeLhdcMemoryPatch.shouldSampleQueue(), capturedAtMs);
         if (!mac.equals(activeLhdcMac)) {
             activeLhdcMac = mac;
             // Restore the confirmed peer ceiling before activation so the first publish is
@@ -1462,6 +1468,8 @@ public final class SystemHookInstaller {
                             NativeLhdcMemoryPatch.reportRemoteChoppy(level);
                             if (attribution.reliable && attribution.mac != null) {
                                 mainHandler.post(() -> {
+                                    linkHealthController.setQualityPolicyActive(
+                                            NativeLhdcMemoryPatch.shouldSampleQueue(), nowMs);
                                     linkHealthController.onRemoteChoppyReport(
                                             attribution.mac, level, nowMs);
                                     LhdcLinkHealthController.Snapshot snapshot =
@@ -1675,8 +1683,10 @@ public final class SystemHookInstaller {
                 Object value = method.invoke(instance);
                 if (value instanceof Integer) {
                     int length = (Integer) value;
-                    NativeLhdcMemoryPatch.reportQueueLength(length);
                     long nowMs = SystemClock.elapsedRealtime();
+                    linkHealthController.setQualityPolicyActive(
+                            NativeLhdcMemoryPatch.shouldSampleQueue(), nowMs);
+                    NativeLhdcMemoryPatch.reportQueueLength(length);
                     String mac = activeLhdcMac;
                     long streamSessionId = NativeLhdcMemoryPatch.currentGovernorSessionEpoch();
                     // Keep the single-slot native event pending until it can be bound to a known

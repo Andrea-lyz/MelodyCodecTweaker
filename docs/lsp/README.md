@@ -18,6 +18,15 @@
 - 在官方耳机主面板和 OneSpace 快捷面板中使用同一套控制。
 - 出现问题时可一键生成反馈包，方便适配不同机型和系统版本。
 
+## 2.5.4 更新 / Updates
+
+- LHDC 自适应与连接优先策略现在只记录链路诊断，不再执行实验性码率治理；切换策略时会清理旧的控制状态。
+- In LHDC Adaptive and Connection Priority modes, the experimental governor now records diagnostics without applying bitrate controls. Policy changes clear stale governor state.
+- 反馈设备的实际播放结果仍需升级后复测；本次确认的是模块侧策略门控修正。
+- Playback on the affected headset still needs to be checked after upgrading; this release confirms the module-side policy correction.
+
+[完整中英文说明 / Full bilingual release notes](https://github.com/Andrea-lyz/MelodyCodecTweaker/blob/main/docs/releases/2.5.4.md)
+
 ## 2.5.3 更新 / Updates
 
 - 无官方「游戏模式」入口的耳机也会显示模块「游戏低延迟」总开关；关闭后阻止 SBC 低延迟入场，帮助保持已选择的 AAC。
