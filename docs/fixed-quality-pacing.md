@@ -40,3 +40,27 @@ starting media encoder timer with interval 10ms
 重复安装时结果为 1。以系统 timer 日志确认实际周期，以编码器回读确认仍为 1000 kbps。复现相同位置、Wi-Fi 环境、歌曲与采样率，比较 TX 满队列次数和 remote choppy 次数，再结合试听判断。若持续满队列，说明仍需继续区分调度延迟与无线容量限制，不能把本次节奏优化宣称为已消除卡顿。
 
 实现：`app/src/main/cpp/lhdc_fixed_pacing.h`、`native_lhdc_patch.cpp`。主机测试：`app/src/test/cpp/lhdc_fixed_pacing_test.cpp`。Android 隔离探针：`app/src/test/cpp/lhdc_fixed_pacing_probe.cpp`。
+
+## 实际起流验证（2026-10-25）
+
+PJZ110 / ColorOS 17.0.0.103，已加载测试提交 `3961659` 的手机，由用户操作播放，
+通过真实蓝牙进程 PID 11519 记录。以下时间为设备日志时间：
+
+- 00:37:05 记忆回放发送 `policy=9 reason=remember_replay`，随后系统实际起流为
+  20 ms。这次处于自适应，不能作为音质优先的 10 ms 验证。
+- 00:42:38 手动选择音质优先，宿主发送 `policy=8 reason=codec_write ceilingKbps=1000`。
+- 00:42:47.863 模块记录 `pacing.session stock_ms=20 interval_ms=10 first_batch_ms=20`，
+  同时系统 `btif_a2dp_source_audio_tx_start_event` 记录
+  `starting media encoder timer with interval 10ms`。
+- 00:42:49–00:44:13 的编码器回读记录均为 `actualBitrateKbps=1000`、
+  `bitrateVerification=getter_confirmed`；对应 `streamSessionId=2`。
+  捕获后读取模块偏好，`governor_experimental_enabled=false`。
+
+因此已补齐真实起流使用 10 ms 且保留固定 1000 kbps 的证据；没有因此证明相对
+20 ms 的听感改善幅度，也没有证明高负载 Wi-Fi 传输时能消除卡顿。本轮不再调整
+发送节奏、码率、队列容量或丢包策略。
+
+原始记录位于工作区 `.tmp/pacing-confirm-20261025/logcat.txt`：第 144347 行为策略
+写入，第 151589 行为模块周期，第 151591 行为系统 timer，第 152523 / 195509 行
+为后续码率回读。完整复核见工作区 `feedback/analysis-20261025-000715-000950.md`
+的追加验证。

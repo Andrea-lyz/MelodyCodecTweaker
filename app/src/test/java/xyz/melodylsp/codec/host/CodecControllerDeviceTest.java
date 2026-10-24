@@ -7,8 +7,11 @@ import static org.junit.Assert.assertTrue;
 import org.junit.Test;
 
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
+import xyz.melodylsp.codec.label.CodecLabelTable;
+import xyz.melodylsp.codec.storage.PreferenceStore;
 
 public final class CodecControllerDeviceTest {
+    private static final int ROM_LHDC_V5 = 19;
 
     @Test
     public void deviceMatchNormalizesCaseAndWhitespace() {
@@ -34,5 +37,29 @@ public final class CodecControllerDeviceTest {
                 "连接优先", LhdcQualityPolicy.CONNECTION, 500));
         assertEquals("音质优先", CodecController.lhdcQualitySummary(
                 "音质优先", LhdcQualityPolicy.QUALITY, 0));
+    }
+
+    @Test
+    public void rememberedQualityRecognizesLegacyAndCeilingValues() {
+        assertTrue(CodecController.isRememberedQualityPriority(
+                new PreferenceStore.RememberedValue(-1, 0x8008L, 8),
+                ROM_LHDC_V5));
+        assertTrue(CodecController.isRememberedQualityPriority(
+                new PreferenceStore.RememberedValue(ROM_LHDC_V5, 0x8007L, 8),
+                ROM_LHDC_V5));
+        assertTrue(CodecController.isRememberedQualityPriority(
+                new PreferenceStore.RememberedValue(CodecLabelTable.CODEC_LDAC,
+                        CodecLabelTable.LDAC_QUALITY_HIGH, 8), CodecLabelTable.CODEC_LDAC));
+    }
+
+    @Test
+    public void adaptiveOrDifferentCodecMemoryDoesNotTriggerUpgradeNotice() {
+        assertFalse(CodecController.isRememberedQualityPriority(null, ROM_LHDC_V5));
+        assertFalse(CodecController.isRememberedQualityPriority(
+                new PreferenceStore.RememberedValue(ROM_LHDC_V5, 0x8009L, 8),
+                ROM_LHDC_V5));
+        assertFalse(CodecController.isRememberedQualityPriority(
+                new PreferenceStore.RememberedValue(CodecLabelTable.CODEC_LDAC,
+                        CodecLabelTable.LDAC_QUALITY_HIGH, 8), ROM_LHDC_V5));
     }
 }

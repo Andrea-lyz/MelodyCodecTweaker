@@ -100,6 +100,7 @@ public final class CodecController {
     private final ConnectionStateReplayer replayer;
     private final SurfaceRescanRequester surfaceRescanRequester;
     private final HostUiBindings uiBindings;
+    private final QualityNoticeStore qualityNoticeStore;
     private final Map<Object, Subscription> subscriptions = new HashMap<>();
     /** Latest A2DP state is device-scoped; a single global value can write earphone A to B. */
     private final Map<String, CodecSnapshot> lastSnapshotsByMac = new HashMap<>();
@@ -145,6 +146,8 @@ public final class CodecController {
             HostUiBindings uiBindings) {
         this.context = context.getApplicationContext();
         this.uiBindings = uiBindings;
+        this.qualityNoticeStore = new QualityNoticeStore(
+                new java.io.File(this.context.getFilesDir(), "codec_quality_notices"));
         this.reflect = reflect;
         this.bridge = bridge;
         this.prefs = prefs;
@@ -687,6 +690,7 @@ public final class CodecController {
         Subscription sub = new Subscription(mac, pref, fragment);
         sub.hostActivity = new java.lang.ref.WeakReference<>(activityFromFragment(fragment));
         subscriptions.put(fragment, sub);
+        sub.watchWindowFocus();
 
         wireClickListeners(sub);
         wireRememberToggle(sub);
@@ -760,7 +764,16 @@ public final class CodecController {
     private static void showFrameworkConfirmDialog(
             Activity activity, String title, String message, String positive, String negative,
             ConfirmAction action) {
-        if (activity.isFinishing() || activity.isDestroyed()) return;
+        showFrameworkConfirmDialog(activity, title, message, positive, negative, action, null, null);
+    }
+
+    private static void showFrameworkConfirmDialog(
+            Activity activity, String title, String message, String positive, String negative,
+            ConfirmAction action, Runnable onShown, Runnable onDismiss) {
+        if (activity.isFinishing() || activity.isDestroyed()) {
+            if (onDismiss != null) onDismiss.run();
+            return;
+        }
         MLog.event("le.melody.dialog", "builder", "framework");
         boolean night = (activity.getResources().getConfiguration().uiMode
                 & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
@@ -778,6 +791,19 @@ public final class CodecController {
                 .setCancelable(true)
                 .create();
         dialog.show();
+        if (onDismiss != null) dialog.setOnDismissListener(d -> onDismiss.run());
+        if (onShown != null) {
+            View decor = dialog.getWindow().getDecorView();
+            decor.getViewTreeObserver().addOnPreDrawListener(
+                    new android.view.ViewTreeObserver.OnPreDrawListener() {
+                        @Override
+                        public boolean onPreDraw() {
+                            decor.getViewTreeObserver().removeOnPreDrawListener(this);
+                            if (dialog.isShowing()) onShown.run();
+                            return true;
+                        }
+                    });
+        }
     }
 
     private void requestLeAudioToggle(Subscription sub, boolean enable) {
@@ -819,6 +845,13 @@ public final class CodecController {
             String positive,
             String negative,
             ConfirmAction action) {
+        return showMelodyAlertDialog(activity, title, message, positive, negative,
+                action, null, null);
+    }
+
+    private boolean showMelodyAlertDialog(
+            Activity activity, String title, String message, String positive, String negative,
+            ConfirmAction action, Runnable onShown, Runnable onDismiss) {
         String[] builders = {
                 "R7.b",
                 "D2.e",
@@ -847,7 +880,8 @@ public final class CodecController {
                 if (builder == null) continue;
                 configureAndShowDialog(builder, title, message, positive, negative, action,
                         () -> showFrameworkConfirmDialog(
-                                activity, title, message, positive, negative, action));
+                                activity, title, message, positive, negative, action,
+                                onShown, onDismiss), onShown, onDismiss);
                 MLog.event("le.melody.dialog", "builder", name);
                 return true;
             } catch (ClassNotFoundException ignored) {
@@ -938,7 +972,9 @@ public final class CodecController {
             String positive,
             String negative,
             ConfirmAction action,
-            Runnable fallback) throws Exception {
+            Runnable fallback,
+            Runnable onShown,
+            Runnable onDismiss) throws Exception {
         invokeDialogBuilder(builder, "setTitle",
                 new Class[]{CharSequence.class}, new Object[]{title});
         invokeDialogBuilder(builder, "setMessage",
@@ -971,6 +1007,7 @@ public final class CodecController {
         Object shown = show.invoke(builder);
         if (!(shown instanceof Dialog)) throw new IllegalStateException("not_a_dialog");
         Dialog dialog = (Dialog) shown;
+        if (onDismiss != null) dialog.setOnDismissListener(d -> onDismiss.run());
         View decor = dialog.getWindow().getDecorView();
         // COUI finishes its button bar and entrance layout after show() returns. Checking
         // isShown() synchronously rejected valid dialogs and forced the system fallback.
@@ -984,6 +1021,7 @@ public final class CodecController {
                             MLog.event("le.melody.dialog.validated",
                                     "builder", builder.getClass().getName(),
                                     "gravity", dialog.getWindow().getAttributes().gravity);
+                            if (onShown != null) onShown.run();
                             return true;
                         }
                         // Change windows outside traversal; never let a broken first frame draw.
@@ -991,6 +1029,8 @@ public final class CodecController {
                             if (!dialog.isShowing()) return;
                             MLog.event("le.melody.dialog.actions_missing",
                                     "builder", builder.getClass().getName());
+                            // The fallback window owns this same receipt reservation.
+                            dialog.setOnDismissListener(null);
                             dialog.dismiss();
                             fallback.run();
                         });
@@ -1574,79 +1614,176 @@ public final class CodecController {
                 checked = i;
             }
         }
-        long[] finalOptions = options;
         Context dialogContext = resolveLiveDialogContext(sub);
         if (dialogContext == null) {
             MLog.w("showQualityPicker skipped: no live activity context");
             return;
         }
-        boolean finalPreserveLhdcHighBits = preserveLhdcHighBits;
         try {
-            showChoicePopup(sub, sourcePref, entries, checked, which -> {
-                long picked = finalOptions[which];
-                if (finalPreserveLhdcHighBits) {
-                    int previousPolicy = selectedLhdcPolicy(sub.mac, snapshot);
-                    int pickedPolicy = LhdcQualityPolicy.normalize((int) (picked & 0xFFL));
-                    lhdcPoliciesByMac.put(sub.mac, pickedPolicy);
-                    picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
-                    if (pickedPolicy == LhdcQualityPolicy.QUALITY) {
-                        PreferenceStore.LhdcCeiling ceiling = prefs.readLhdcCeiling(sub.mac);
-                        if (ceiling != null
-                                && ceiling.lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900
-                                && ceiling.matches(
-                                        snapshot.activeCodecType,
-                                        snapshot.activeCodecSpecific3)) {
-                            picked = (picked & ~0xFFL)
-                                    | CodecLabelTable.LHDC_QUALITY_FIXED_900;
-                            MLog.event("write.lhdc.ceiling.remembered",
-                                    "mac", redactedMac(sub),
-                                    "lowByte", CodecLabelTable.LHDC_QUALITY_FIXED_900);
-                        }
-                    }
-                    long expectedTransport = LhdcQualityPolicy.transportSpecific1(
-                            picked, pickedPolicy);
-                    boolean transportAlreadyMatches =
-                            (snapshot.activeCodecSpecific1 & 0xFFL)
-                                    == (expectedTransport & 0xFFL);
-                    if (pickedPolicy == previousPolicy && transportAlreadyMatches) {
-                        int ceilingKbps = lhdcCeilingKbpsForActive(sub, snapshot);
-                        LhdcQualityPolicy.send(
-                                context, sub.mac, pickedPolicy,
-                                "quality_picker_reaffirm", ceilingKbps);
-                        refreshSnapshot(sub);
-                        return;
-                    }
-                }
-                if (finalPreserveLhdcHighBits) {
-                    String advisory = NativePatchAdvisory.selectionToast(picked & 0xFFL);
-                    if (advisory != null) showPatchAdvisory(advisory, "picker");
-                }
-                CodecRequest.Builder builder = CodecRequest.fromActive(snapshot)
-                        .withSpecific1(picked);
-                builder.withSampleRate(linkedSampleRateForQuality(snapshot, picked));
-                CodecRequest req = builder.build();
-                if (finalPreserveLhdcHighBits) {
-                    int previousPolicy = selectedPolicy;
-                    applyWrite(sub, req, (result, error) -> {
-                        if (shouldProbeLhdcCeiling(sub, req, result)) {
-                            MLog.event("write.lhdc.ceiling.probe",
-                                    "mac", redactedMac(sub),
-                                    "request", req);
-                            retryLhdcQualityWithCeiling900(sub, req, previousPolicy);
-                            return true;
-                        }
-                        lhdcPoliciesByMac.put(sub.mac, previousPolicy);
-                        LhdcQualityPolicy.send(
-                                context, sub.mac, previousPolicy, "quality_picker_rollback");
-                        return false;
-                    });
-                } else {
-                    applyWrite(sub, req);
-                }
-            });
+            showChoicePopup(sub, sourcePref, entries, checked,
+                    which -> requestQualitySelection(sub, snapshot.activeCodecType, options[which]));
         } catch (Throwable t) {
             MLog.e("showQualityPicker dialog.show failed", t);
             Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void requestQualitySelection(Subscription sub, int codecType, long picked) {
+        if (!isSubscriptionActive(sub)) return;
+        ConfirmAction action = () -> applyQualitySelection(sub, codecType, picked);
+        if (!isQualityPriorityChoice(codecType, picked)) {
+            action.run();
+            return;
+        }
+        showQualityWarning(sub, false, action);
+    }
+
+    static boolean isQualityPriorityChoice(int codecType, long specific1) {
+        return CodecLabelTable.isLhdc(codecType)
+                ? isLhdcHighQuality(specific1 & 0xFFL)
+                : codecType == CodecLabelTable.CODEC_LDAC
+                        && specific1 == CodecLabelTable.LDAC_QUALITY_HIGH;
+    }
+
+    static boolean isRememberedQualityPriority(
+            PreferenceStore.RememberedValue value, int liveCodecType) {
+        if (value == null) return false;
+        int codecType = value.codecType < 0 ? liveCodecType : value.codecType;
+        return sameCodecFamily(codecType, liveCodecType)
+                && isQualityPriorityChoice(codecType, value.codecSpecific1);
+    }
+
+    private void maybeShowRememberedQualityNotice(Subscription sub) {
+        if (!isSubscriptionActive(sub) || sub.renderedLeAudioActive
+                || Boolean.FALSE.equals(sub.connected) || isClassicRestorePending(sub.mac)
+                || sub.prefs.qualityOption == null || !PrefRef.isVisible(sub.prefs.qualityOption)) {
+            return;
+        }
+        Activity activity = resolveLiveActivity(sub);
+        View root = fragmentRootView(sub.fragment);
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()
+                || !activity.hasWindowFocus() || root == null || !root.isShown()
+                || !root.isAttachedToWindow()) return;
+        CodecSnapshot snapshot = snapshotFor(sub);
+        if (snapshot == null || !isA2dpReadyOrUnknown(sub)
+                || !isRememberedQualityPriority(prefs.readSnapshot(sub.mac), snapshot.activeCodecType)) {
+            return;
+        }
+        long quality = CodecLabelTable.isLhdc(snapshot.activeCodecType)
+                ? LhdcQualityPolicy.logicalSpecific1(snapshot.activeCodecSpecific1,
+                        selectedLhdcPolicy(sub.mac, snapshot))
+                : snapshot.activeCodecSpecific1;
+        if (!isQualityPriorityChoice(snapshot.activeCodecType, quality)) return;
+        // Existing playback has already been restored. This is informational; neither button
+        // changes the codec, sample rate or remembered selection.
+        showQualityWarning(sub, true, () -> {});
+    }
+
+    private void showQualityWarning(Subscription sub, boolean reminder, ConfirmAction action) {
+        Activity activity = resolveLiveActivity(sub);
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
+        QualityNoticeStore.Reservation receipt = null;
+        try {
+            receipt = qualityNoticeStore.reserve(sub.mac);
+        } catch (java.io.IOException e) {
+            MLog.w("quality notice receipt unavailable", e);
+            // Manual confirmation must still work if private receipt storage is unavailable.
+        }
+        if (reminder && receipt == null) return;
+        QualityNoticeStore.Reservation reservation = receipt;
+        Runnable dismissed = () -> closeQualityNoticeReceipt(reservation);
+        Runnable shown = () -> {
+            if (reservation != null) {
+                try {
+                    reservation.markShown();
+                } catch (java.io.IOException e) {
+                    MLog.w("quality notice receipt write failed", e);
+                }
+            }
+            MLog.event("quality.warning.shown", "mac", redactedMac(sub),
+                    "kind", reminder ? "remembered" : "manual");
+        };
+        String title = reminder ? Strings.QUALITY_NOTICE_TITLE : Strings.QUALITY_CONFIRM_TITLE;
+        try {
+            if (!showMelodyAlertDialog(activity, title, Strings.QUALITY_CONFIRM_MESSAGE,
+                    Strings.CONFIRM, Strings.CANCEL, action, shown, dismissed)) {
+                showFrameworkConfirmDialog(activity, title, Strings.QUALITY_CONFIRM_MESSAGE,
+                        Strings.CONFIRM, Strings.CANCEL, action, shown, dismissed);
+            }
+        } catch (Throwable t) {
+            dismissed.run();
+            MLog.e("showQualityWarning failed", t);
+        }
+    }
+
+    private static void closeQualityNoticeReceipt(QualityNoticeStore.Reservation reservation) {
+        if (reservation == null) return;
+        try {
+            reservation.close();
+        } catch (java.io.IOException e) {
+            MLog.w("quality notice receipt close failed", e);
+        }
+    }
+
+    private void applyQualitySelection(Subscription sub, int codecType, long picked) {
+        if (!isSubscriptionActive(sub) || renderLeAudioIfNeeded(sub)
+                || !ensureA2dpReadyForUser(sub)) return;
+        // The headset or codec may have changed while the confirmation was open.
+        CodecSnapshot snapshot = snapshotFor(sub);
+        if (snapshot == null || snapshot.activeCodecType != codecType) {
+            refreshSnapshot(sub);
+            return;
+        }
+        boolean preserveLhdcHighBits = CodecLabelTable.isLhdc(codecType);
+        int previousPolicy = preserveLhdcHighBits
+                ? selectedLhdcPolicy(sub.mac, snapshot) : -1;
+        if (preserveLhdcHighBits) {
+            int pickedPolicy = LhdcQualityPolicy.normalize((int) (picked & 0xFFL));
+            lhdcPoliciesByMac.put(sub.mac, pickedPolicy);
+            picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
+            if (pickedPolicy == LhdcQualityPolicy.QUALITY) {
+                PreferenceStore.LhdcCeiling ceiling = prefs.readLhdcCeiling(sub.mac);
+                if (ceiling != null
+                        && ceiling.lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900
+                        && ceiling.matches(snapshot.activeCodecType, snapshot.activeCodecSpecific3)) {
+                    picked = (picked & ~0xFFL) | CodecLabelTable.LHDC_QUALITY_FIXED_900;
+                    MLog.event("write.lhdc.ceiling.remembered",
+                            "mac", redactedMac(sub),
+                            "lowByte", CodecLabelTable.LHDC_QUALITY_FIXED_900);
+                }
+            }
+            long expectedTransport = LhdcQualityPolicy.transportSpecific1(picked, pickedPolicy);
+            boolean transportAlreadyMatches = (snapshot.activeCodecSpecific1 & 0xFFL)
+                    == (expectedTransport & 0xFFL);
+            if (pickedPolicy == previousPolicy && transportAlreadyMatches) {
+                int ceilingKbps = lhdcCeilingKbpsForActive(sub, snapshot);
+                LhdcQualityPolicy.send(context, sub.mac, pickedPolicy,
+                        "quality_picker_reaffirm", ceilingKbps);
+                refreshSnapshot(sub);
+                return;
+            }
+            String advisory = NativePatchAdvisory.selectionToast(picked & 0xFFL);
+            if (advisory != null) showPatchAdvisory(advisory, "picker");
+        }
+        CodecRequest req = CodecRequest.fromActive(snapshot)
+                .withSpecific1(picked)
+                .withSampleRate(linkedSampleRateForQuality(snapshot, picked))
+                .build();
+        if (preserveLhdcHighBits) {
+            applyWrite(sub, req, (result, error) -> {
+                if (shouldProbeLhdcCeiling(sub, req, result)) {
+                    MLog.event("write.lhdc.ceiling.probe",
+                            "mac", redactedMac(sub), "request", req);
+                    retryLhdcQualityWithCeiling900(sub, req, previousPolicy);
+                    return true;
+                }
+                lhdcPoliciesByMac.put(sub.mac, previousPolicy);
+                LhdcQualityPolicy.send(
+                        context, sub.mac, previousPolicy, "quality_picker_rollback");
+                return false;
+            });
+        } else {
+            applyWrite(sub, req);
         }
     }
 
@@ -3274,6 +3411,7 @@ public final class CodecController {
         }
         PrefRef.setSummary(q, summary);
         PrefRef.setVisible(q, true);
+        maybeShowRememberedQualityNotice(sub);
     }
 
     static String lhdcQualitySummary(String policyLabel, int policy, int bitrateKbps) {
@@ -3634,6 +3772,8 @@ public final class CodecController {
         boolean gameAnchorHostDisabled;
         boolean gameAnchorHostEnabled = true;
         java.lang.ref.WeakReference<Activity> hostActivity;
+        View noticeDecor;
+        android.view.ViewTreeObserver.OnWindowFocusChangeListener noticeFocusListener;
         volatile boolean active = true;
         private long refreshGeneration;
 
@@ -3641,6 +3781,17 @@ public final class CodecController {
             this.mac = mac;
             this.prefs = prefs;
             this.fragment = fragment;
+        }
+
+        void watchWindowFocus() {
+            Activity activity = hostActivity != null ? hostActivity.get() : null;
+            if (activity == null || activity.getWindow() == null) return;
+            noticeDecor = activity.getWindow().getDecorView();
+            noticeFocusListener = hasFocus -> {
+                if (hasFocus) mainHandler.post(
+                        () -> maybeShowRememberedQualityNotice(Subscription.this));
+            };
+            noticeDecor.getViewTreeObserver().addOnWindowFocusChangeListener(noticeFocusListener);
         }
 
         void registerReceiver() {
@@ -3742,6 +3893,11 @@ public final class CodecController {
             active = false;
             invalidateRefreshes();
             unregisterReceiver();
+            if (noticeDecor != null && noticeDecor.getViewTreeObserver().isAlive()) {
+                noticeDecor.getViewTreeObserver().removeOnWindowFocusChangeListener(noticeFocusListener);
+            }
+            noticeDecor = null;
+            noticeFocusListener = null;
         }
     }
 }

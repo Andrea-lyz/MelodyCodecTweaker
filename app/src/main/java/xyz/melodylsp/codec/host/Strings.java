@@ -13,6 +13,12 @@ public final class Strings {
 
     public static final String CODEC_MODE_OPTION_TITLE = "编解码器";
     public static final String QUALITY_OPTION_TITLE = "播放质量";
+    public static final String QUALITY_CONFIRM_TITLE = "开启音质优先？";
+    public static final String QUALITY_NOTICE_TITLE = "音质优先使用提醒";
+    public static final String QUALITY_CONFIRM_MESSAGE =
+            "高码率更易受无线环境影响，距离较远、信号干扰或 Wi-Fi 大量传输时可能卡顿。播放不稳时，请降低播放质量。";
+    public static final String CONFIRM = "确定";
+    public static final String CANCEL = "取消";
     public static final String SAMPLE_RATE_OPTION_TITLE = "采样率";
     public static final String REMEMBER_TOGGLE_TITLE = "记住此耳机的选择";
     public static final String REMEMBER_TOGGLE_SUMMARY =
