@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "lhdc_fixed_pacing.h"
+
 namespace {
 
 enum PatchResultCode : jint {
@@ -181,6 +183,8 @@ std::atomic<int> g_free_slot_segment{0};
 std::atomic<void*> g_active_encoder_handle{nullptr};
 std::atomic<uint64_t> g_last_encode_ms{0};
 std::atomic<int> g_policy{kPolicyAdaptive};
+// Fail closed until Java has read the persisted experimental-governor preference.
+std::atomic<bool> g_governor_experimental_enabled{true};
 std::atomic<uint32_t> g_policy_epoch{1};
 std::atomic<uint64_t> g_choppy_sequence{0};
 std::atomic<int> g_choppy_level{0};
@@ -1094,6 +1098,150 @@ int hook_existing_encoder_pointer() {
 #endif
 }
 
+#if defined(__aarch64__)
+using EncoderIntervalFn = uint64_t (*)();
+using SendFramesFn = void (*)(uint64_t);
+std::atomic<EncoderIntervalFn> g_original_interval{nullptr};
+std::atomic<SendFramesFn> g_original_send_frames{nullptr};
+std::atomic<uint64_t*> g_pacing_last_frame_us{nullptr};
+melody::pacing::Session g_pacing_session;
+std::mutex g_pacing_install_mutex;
+bool g_pacing_installed = false;
+int g_pacing_terminal_result = 0;
+std::atomic<int> g_last_pacing_install_result{0};
+
+extern "C" uint64_t melody_lhdc_encoder_interval() {
+    EncoderIntervalFn original = g_original_interval.load(std::memory_order_acquire);
+    const uint64_t stock_ms = original != nullptr ? original() : 20;
+    const uint64_t selected_ms = g_pacing_session.interval(
+            stock_ms, g_policy.load(std::memory_order_acquire) == kPolicyQuality,
+            g_governor_experimental_enabled.load(std::memory_order_acquire));
+    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+            "evt=pacing.session stock_ms=%llu interval_ms=%llu first_batch_ms=%llu",
+            static_cast<unsigned long long>(stock_ms),
+            static_cast<unsigned long long>(selected_ms),
+            static_cast<unsigned long long>(stock_ms));
+    return selected_ms;
+}
+
+extern "C" void melody_lhdc_send_frames(uint64_t timestamp_us) {
+    SendFramesFn original = g_original_send_frames.load(std::memory_order_acquire);
+    uint64_t* last_frame_us = g_pacing_last_frame_us.load(std::memory_order_acquire);
+    const bool first_batch = last_frame_us != nullptr
+            && __atomic_load_n(last_frame_us, __ATOMIC_ACQUIRE) == 0;
+    // Interval queries also occur during codec configuration. Never skip an active
+    // packetizer tick just because its interval was queried again.
+    if (original != nullptr && g_pacing_session.forward(first_batch)) original(timestamp_us);
+}
+
+bool readonly_library_range(uintptr_t start, uintptr_t end, const char* library_path) {
+    FILE* maps = fopen("/proc/self/maps", "re");
+    if (maps == nullptr) return false;
+    char line[512];
+    bool valid = false;
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        unsigned long long low = 0, high = 0;
+        char perms[5] = {}, path[384] = {};
+        if (sscanf(line, "%llx-%llx %4s %*s %*s %*s %383s",
+                &low, &high, perms, path) != 4) continue;
+        if (start >= low && end <= high && start < end
+                && strcmp(perms, "r--p") == 0 && strcmp(path, library_path) == 0) {
+            valid = true;
+            break;
+        }
+    }
+    fclose(maps);
+    return valid;
+}
+
+int install_fixed_quality_pacing() {
+    std::lock_guard<std::mutex> lock(g_pacing_install_mutex);
+    if (g_pacing_installed) return 1;
+    if (g_pacing_terminal_result != 0) return g_pacing_terminal_result;
+    LoadedImage bluetooth;
+    if (!find_loaded_image(kBluetoothLibrary, &bluetooth)) return -3;
+    int fd = open(bluetooth.path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -4;
+    struct stat status {};
+    if (fstat(fd, &status) != 0 || status.st_size <= 0
+            || status.st_size > 64 * 1024 * 1024) {
+        close(fd);
+        return -4;
+    }
+    const size_t size = static_cast<size_t>(status.st_size);
+    void* mapped = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return -4;
+    const auto binding = melody::pacing::find_binding(static_cast<const uint8_t*>(mapped), size);
+    munmap(mapped, size);
+    if (binding.candidates != 1) {
+        // The library's on-disk layout cannot change during this process. Do not rescan
+        // unsupported 18 MB images on every BQR callback while music is playing.
+        g_pacing_terminal_result = binding.candidates == 0 ? -5 : -6;
+        return g_pacing_terminal_result;
+    }
+    if (binding.table > UINTPTR_MAX - bluetooth.base - 64) return -7;
+    const uintptr_t table = bluetooth.base + binding.table;
+    if (!readonly_library_range(table, table + 64, bluetooth.path)) return -7;
+    if (binding.last_frame_us > UINTPTR_MAX - bluetooth.base
+            || mapping_protection(bluetooth.base + binding.last_frame_us)
+                    != (PROT_READ | PROT_WRITE)) return -7;
+    auto** callbacks = reinterpret_cast<void**>(table);
+    // Verify the entire real interface after relocation, not just the two slots to wrap.
+    for (size_t i = 0; i < 8; ++i) {
+        if (binding.callbacks[i] > UINTPTR_MAX - bluetooth.base) return -7;
+        const uintptr_t expected = bluetooth.base + binding.callbacks[i];
+        if (reinterpret_cast<uintptr_t>(__atomic_load_n(callbacks + i, __ATOMIC_ACQUIRE))
+                        != expected
+                || !is_executable_library_address(expected, bluetooth.path)) return -7;
+    }
+    const long page_size_value = sysconf(_SC_PAGESIZE);
+    if (page_size_value <= 0) return -8;
+    const uintptr_t page_size = static_cast<uintptr_t>(page_size_value);
+    const uintptr_t page = table & ~(page_size - 1U);
+    if ((table + 63) / page_size != table / page_size) return -8;
+    void* const interval = __atomic_load_n(callbacks + 4, __ATOMIC_ACQUIRE);
+    void* const send = __atomic_load_n(callbacks + 6, __ATOMIC_ACQUIRE);
+    g_original_interval.store(reinterpret_cast<EncoderIntervalFn>(interval),
+            std::memory_order_release);
+    g_original_send_frames.store(reinterpret_cast<SendFramesFn>(send),
+            std::memory_order_release);
+    g_pacing_last_frame_us.store(
+            reinterpret_cast<uint64_t*>(bluetooth.base + binding.last_frame_us),
+            std::memory_order_release);
+    if (mprotect(reinterpret_cast<void*>(page), page_size, PROT_READ | PROT_WRITE) != 0) {
+        return -8;
+    }
+    // Wrap send_frames first, so a shortened timer can never run without startup protection.
+    void* expected = send;
+    const bool send_ok = __atomic_compare_exchange_n(callbacks + 6, &expected,
+            reinterpret_cast<void*>(&melody_lhdc_send_frames), false,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    expected = interval;
+    const bool interval_ok = send_ok && __atomic_compare_exchange_n(callbacks + 4, &expected,
+            reinterpret_cast<void*>(&melody_lhdc_encoder_interval), false,
+            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    if (!interval_ok && send_ok) {
+        expected = reinterpret_cast<void*>(&melody_lhdc_send_frames);
+        __atomic_compare_exchange_n(callbacks + 6, &expected, send, false,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    }
+    if (mprotect(reinterpret_cast<void*>(page), page_size, PROT_READ) != 0) {
+        // Restore only our own pointers; never overwrite a concurrently changed owner.
+        expected = reinterpret_cast<void*>(&melody_lhdc_encoder_interval);
+        __atomic_compare_exchange_n(callbacks + 4, &expected, interval, false,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        expected = reinterpret_cast<void*>(&melody_lhdc_send_frames);
+        __atomic_compare_exchange_n(callbacks + 6, &expected, send, false,
+                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+        mprotect(reinterpret_cast<void*>(page), page_size, PROT_READ);
+        return -9;
+    }
+    g_pacing_installed = interval_ok;
+    return interval_ok ? 2 : -10;
+}
+#endif
+
 // Observe-only dynamic adapter probe (MELODY_DYN_OBSERVE, debug builds only): scans the
 // writable owner of lhdcv5BT_adjust_bitrate inside libbluetooth_jni and records its slot
 // structure relationship to the encode/free slots. Never writes a pointer. This is the
@@ -1258,9 +1406,34 @@ extern "C" JNIEXPORT jint JNICALL
 Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeInstallGovernor(
         JNIEnv*, jclass) {
     const int result = hook_existing_encoder_pointer();
+#if defined(__aarch64__)
+    const int pacing_result = install_fixed_quality_pacing();
+    if (pacing_result != g_last_pacing_install_result.exchange(
+            pacing_result, std::memory_order_acq_rel)) {
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=pacing.install result=%d interval_ms=10 quality_only=true governor_off_only=true",
+                pacing_result);
+    }
+#endif
     __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
             "evt=hook.install mode=fixed_encode result=%d", result);
     return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeGetFixedQualityPacingInstallResult(
+        JNIEnv*, jclass) {
+#if defined(__aarch64__)
+    return g_last_pacing_install_result.load(std::memory_order_acquire);
+#else
+    return -2;
+#endif
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetGovernorExperimentalEnabled(
+        JNIEnv*, jclass, jboolean enabled) {
+    g_governor_experimental_enabled.store(enabled == JNI_TRUE, std::memory_order_release);
 }
 
 extern "C" JNIEXPORT jint JNICALL

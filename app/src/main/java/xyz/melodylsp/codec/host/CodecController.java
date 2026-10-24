@@ -3,6 +3,7 @@ package xyz.melodylsp.codec.host;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.Application;
+import android.app.Dialog;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
@@ -32,7 +33,6 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.Proxy;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Enumeration;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -41,7 +41,6 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
-import dalvik.system.DexFile;
 
 import xyz.melodylsp.codec.bridge.CodecIpc;
 import xyz.melodylsp.codec.bridge.CodecRequest;
@@ -91,8 +90,6 @@ public final class CodecController {
     private static final long NATIVE_PATCH_STATE_LOG_INTERVAL_MS = 5_000L;
     private static final String STATE_RESTORING_CLASSIC =
             "\u6b63\u5728\u6062\u590d\u7ecf\u5178\u84dd\u7259\u97f3\u9891...";
-    private static volatile boolean couiPopupDiscoveryAttempted;
-    private static volatile String[] discoveredCouiPopupBinding;
 
     private final Context context;
     private final BluetoothCodecReflect reflect;
@@ -102,6 +99,8 @@ public final class CodecController {
     private final A2dpRouteReadiness routeReadiness;
     private final ConnectionStateReplayer replayer;
     private final SurfaceRescanRequester surfaceRescanRequester;
+    private final HostUiBindings uiBindings;
+    private final QualityNoticeStore qualityNoticeStore;
     private final Map<Object, Subscription> subscriptions = new HashMap<>();
     /** Latest A2DP state is device-scoped; a single global value can write earphone A to B. */
     private final Map<String, CodecSnapshot> lastSnapshotsByMac = new HashMap<>();
@@ -135,7 +134,20 @@ public final class CodecController {
             CodecBridgeClient bridge,
             PreferenceStore prefs,
             SurfaceRescanRequester surfaceRescanRequester) {
+        this(context, reflect, bridge, prefs, surfaceRescanRequester, HostUiBindings.EMPTY);
+    }
+
+    CodecController(
+            Context context,
+            BluetoothCodecReflect reflect,
+            CodecBridgeClient bridge,
+            PreferenceStore prefs,
+            SurfaceRescanRequester surfaceRescanRequester,
+            HostUiBindings uiBindings) {
         this.context = context.getApplicationContext();
+        this.uiBindings = uiBindings;
+        this.qualityNoticeStore = new QualityNoticeStore(
+                new java.io.File(this.context.getFilesDir(), "codec_quality_notices"));
         this.reflect = reflect;
         this.bridge = bridge;
         this.prefs = prefs;
@@ -678,6 +690,7 @@ public final class CodecController {
         Subscription sub = new Subscription(mac, pref, fragment);
         sub.hostActivity = new java.lang.ref.WeakReference<>(activityFromFragment(fragment));
         subscriptions.put(fragment, sub);
+        sub.watchWindowFocus();
 
         wireClickListeners(sub);
         wireRememberToggle(sub);
@@ -744,23 +757,53 @@ public final class CodecController {
                 () -> requestLeAudioToggle(sub, enable))) {
             return;
         }
-        if (showStyledAppCompatDialog(activity, title, message, positive, negative,
-                () -> requestLeAudioToggle(sub, enable))) {
+        showFrameworkConfirmDialog(activity, title, message, positive, negative,
+                () -> requestLeAudioToggle(sub, enable));
+    }
+
+    private static void showFrameworkConfirmDialog(
+            Activity activity, String title, String message, String positive, String negative,
+            ConfirmAction action) {
+        showFrameworkConfirmDialog(activity, title, message, positive, negative, action, null, null);
+    }
+
+    private static void showFrameworkConfirmDialog(
+            Activity activity, String title, String message, String positive, String negative,
+            ConfirmAction action, Runnable onShown, Runnable onDismiss) {
+        if (activity.isFinishing() || activity.isDestroyed()) {
+            if (onDismiss != null) onDismiss.run();
             return;
         }
-
         MLog.event("le.melody.dialog", "builder", "framework");
-        AlertDialog dialog = new android.app.AlertDialog.Builder(activity)
+        boolean night = (activity.getResources().getConfiguration().uiMode
+                & android.content.res.Configuration.UI_MODE_NIGHT_MASK)
+                == android.content.res.Configuration.UI_MODE_NIGHT_YES;
+        int fallbackTheme = night ? android.R.style.Theme_DeviceDefault_Dialog_Alert
+                : android.R.style.Theme_DeviceDefault_Light_Dialog_Alert;
+        AlertDialog dialog = new android.app.AlertDialog.Builder(activity, fallbackTheme)
                 .setTitle(title)
                 .setMessage(message)
                 .setPositiveButton(positive, (d, w) -> {
                     d.dismiss();
-                    requestLeAudioToggle(sub, enable);
+                    action.run();
                 })
                 .setNegativeButton(negative, (d, w) -> d.dismiss())
                 .setCancelable(true)
                 .create();
         dialog.show();
+        if (onDismiss != null) dialog.setOnDismissListener(d -> onDismiss.run());
+        if (onShown != null) {
+            View decor = dialog.getWindow().getDecorView();
+            decor.getViewTreeObserver().addOnPreDrawListener(
+                    new android.view.ViewTreeObserver.OnPreDrawListener() {
+                        @Override
+                        public boolean onPreDraw() {
+                            decor.getViewTreeObserver().removeOnPreDrawListener(this);
+                            if (dialog.isShowing()) onShown.run();
+                            return true;
+                        }
+                    });
+        }
     }
 
     private void requestLeAudioToggle(Subscription sub, boolean enable) {
@@ -795,13 +838,20 @@ public final class CodecController {
         void run();
     }
 
-    private static boolean showMelodyAlertDialog(
+    private boolean showMelodyAlertDialog(
             Activity activity,
             String title,
             String message,
             String positive,
             String negative,
             ConfirmAction action) {
+        return showMelodyAlertDialog(activity, title, message, positive, negative,
+                action, null, null);
+    }
+
+    private boolean showMelodyAlertDialog(
+            Activity activity, String title, String message, String positive, String negative,
+            ConfirmAction action, Runnable onShown, Runnable onDismiss) {
         String[] builders = {
                 "R7.b",
                 "D2.e",
@@ -815,17 +865,23 @@ public final class CodecController {
                 "B2.e"
         };
         Set<String> builderNames = new LinkedHashSet<>();
+        if (uiBindings.dialogBuilder != null) builderNames.add(uiBindings.dialogBuilder);
         for (String name : builders) {
             builderNames.add(name);
         }
-        discoverMelodyDialogBuilders(activity, builderNames);
+        // DexKit has already searched the current APK once at host startup. The legacy
+        // candidates below are only for hosts where those stable library anchors disappeared.
         for (String name : builderNames) {
             try {
                 Class<?> builderCls = Class.forName(name, false, activity.getClassLoader());
-                if (!isHostCouiDialogBuilderClass(builderCls)) continue;
+                if (!name.equals(uiBindings.dialogBuilder)
+                        && !isHostCouiDialogBuilderClass(builderCls)) continue;
                 Object builder = newMelodyDialogBuilder(activity, builderCls);
                 if (builder == null) continue;
-                configureAndShowDialog(builder, title, message, positive, negative, action);
+                configureAndShowDialog(builder, title, message, positive, negative, action,
+                        () -> showFrameworkConfirmDialog(
+                                activity, title, message, positive, negative, action,
+                                onShown, onDismiss), onShown, onDismiss);
                 MLog.event("le.melody.dialog", "builder", name);
                 return true;
             } catch (ClassNotFoundException ignored) {
@@ -838,94 +894,6 @@ public final class CodecController {
         return false;
     }
 
-    private static boolean showStyledAppCompatDialog(
-            Activity activity,
-            String title,
-            String message,
-            String positive,
-            String negative,
-            ConfirmAction action) {
-        try {
-            String[] builderNames = {
-                    "androidx.appcompat.app.g$a",
-                    "androidx.appcompat.app.AlertDialog$Builder",
-                    "androidx.appcompat.app.AlertDialog$a"
-            };
-            for (String builderName : builderNames) {
-                Class<?> builderCls;
-                try {
-                    builderCls = Class.forName(builderName, false, activity.getClassLoader());
-                } catch (Throwable ignored) {
-                    continue;
-                }
-                Object builder = newHostStyledBuilder(activity, builderCls);
-                if (builder == null) continue;
-                configureAndShowDialog(builder, title, message, positive, negative, action);
-                MLog.event("le.melody.dialog", "builder", "appcompat+coui-style",
-                        "class", builderName);
-                return true;
-            }
-            return false;
-        } catch (Throwable t) {
-            MLog.w("LE Audio styled AppCompat dialog failed", t);
-            return false;
-        }
-    }
-
-    private static void discoverMelodyDialogBuilders(Activity activity, Set<String> out) {
-        DexFile dex = null;
-        try {
-            String sourceDir = activity.getApplicationInfo() != null
-                    ? activity.getApplicationInfo().sourceDir : null;
-            if (sourceDir == null) return;
-            dex = new DexFile(sourceDir);
-            Enumeration<String> entries = dex.entries();
-            int inspected = 0;
-            int added = 0;
-            while (entries.hasMoreElements() && inspected < 2000) {
-                String name = entries.nextElement();
-                if (!maybeHostDialogBuilderName(name)) continue;
-                inspected++;
-                try {
-                    Class<?> cls = Class.forName(name, false, activity.getClassLoader());
-                    if (isHostCouiDialogBuilderClass(cls)) {
-                        out.add(name);
-                        added++;
-                    }
-                } catch (Throwable ignored) {
-                }
-            }
-            if (added > 0) {
-                MLog.event("le.melody.dialog.discovered", "count", added);
-            }
-        } catch (Throwable t) {
-            MLog.w("LE Audio dialog dex scan failed", t);
-        } finally {
-            if (dex != null) {
-                try {
-                    dex.close();
-                } catch (Throwable ignored) {
-                }
-            }
-        }
-    }
-
-    private static boolean maybeHostDialogBuilderName(String name) {
-        if (name == null) return false;
-        if (name.startsWith("android.")
-                || name.startsWith("androidx.")
-                || name.startsWith("java.")
-                || name.startsWith("kotlin.")
-                || name.startsWith("kotlinx.")) {
-            return false;
-        }
-        if (name.contains("AlertDialog") || name.contains("DialogBuilder")) return true;
-        int dot = name.indexOf('.');
-        if (dot <= 0 || dot != name.lastIndexOf('.')) return false;
-        String pkg = name.substring(0, dot);
-        String simple = name.substring(dot + 1);
-        return pkg.length() <= 3 && simple.length() <= 3;
-    }
 
     private static boolean isHostCouiDialogBuilderClass(Class<?> cls) {
         if (!isDialogBuilderShape(cls)) return false;
@@ -973,15 +941,11 @@ public final class CodecController {
 
     private static Object newMelodyDialogBuilder(Activity activity, Class<?> builderCls) {
         try {
-            try {
-                return builderCls.getConstructor(Context.class).newInstance(activity);
-            } catch (NoSuchMethodException ignored) {
-            } catch (Throwable ignored) {
-            }
+            // Resource table entries keep dots even though generated R fields use underscores.
+            // Prefer the host's bottom warning theme explicitly, including on wrapper classes.
             String[] styles = {
+                    "COUIAlertDialog.BottomWarning",
                     "COUIAlertDialog_BottomWarning",
-                    "COUIAlertDialog_Center",
-                    "COUIAlertDialog_Bottom"
             };
             for (String name : styles) {
                 int style = activity.getResources().getIdentifier(
@@ -994,35 +958,12 @@ public final class CodecController {
                 } catch (Throwable ignored) {
                 }
             }
+            return builderCls.getConstructor(Context.class).newInstance(activity);
         } catch (Throwable t) {
             return null;
         }
-        return null;
     }
 
-    private static Object newHostStyledBuilder(Activity activity, Class<?> builderCls) {
-        String[] styles = {
-                "COUIAlertDialog_BottomWarning",
-                "COUIAlertDialog_Bottom",
-                "COUIAlertDialog_Center"
-        };
-        for (String name : styles) {
-            int style = activity.getResources().getIdentifier(
-                    name, "style", activity.getPackageName());
-            if (style == 0) continue;
-            try {
-                return builderCls.getConstructor(Context.class, int.class)
-                        .newInstance(activity, style);
-            } catch (NoSuchMethodException ignored) {
-            } catch (Throwable ignored) {
-            }
-        }
-        try {
-            return builderCls.getConstructor(Context.class).newInstance(activity);
-        } catch (Throwable ignored) {
-            return null;
-        }
-    }
 
     private static void configureAndShowDialog(
             Object builder,
@@ -1030,7 +971,10 @@ public final class CodecController {
             String message,
             String positive,
             String negative,
-            ConfirmAction action) throws Exception {
+            ConfirmAction action,
+            Runnable fallback,
+            Runnable onShown,
+            Runnable onDismiss) throws Exception {
         invokeDialogBuilder(builder, "setTitle",
                 new Class[]{CharSequence.class}, new Object[]{title});
         invokeDialogBuilder(builder, "setMessage",
@@ -1060,7 +1004,48 @@ public final class CodecController {
             throw new NoSuchMethodException("show");
         }
         show.setAccessible(true);
-        show.invoke(builder);
+        Object shown = show.invoke(builder);
+        if (!(shown instanceof Dialog)) throw new IllegalStateException("not_a_dialog");
+        Dialog dialog = (Dialog) shown;
+        if (onDismiss != null) dialog.setOnDismissListener(d -> onDismiss.run());
+        View decor = dialog.getWindow().getDecorView();
+        // COUI finishes its button bar and entrance layout after show() returns. Checking
+        // isShown() synchronously rejected valid dialogs and forced the system fallback.
+        decor.getViewTreeObserver().addOnPreDrawListener(
+                new android.view.ViewTreeObserver.OnPreDrawListener() {
+                    @Override
+                    public boolean onPreDraw() {
+                        decor.getViewTreeObserver().removeOnPreDrawListener(this);
+                        if (!dialog.isShowing()) return true;
+                        if (hasDialogActions(dialog, positive, negative)) {
+                            MLog.event("le.melody.dialog.validated",
+                                    "builder", builder.getClass().getName(),
+                                    "gravity", dialog.getWindow().getAttributes().gravity);
+                            if (onShown != null) onShown.run();
+                            return true;
+                        }
+                        // Change windows outside traversal; never let a broken first frame draw.
+                        decor.post(() -> {
+                            if (!dialog.isShowing()) return;
+                            MLog.event("le.melody.dialog.actions_missing",
+                                    "builder", builder.getClass().getName());
+                            // The fallback window owns this same receipt reservation.
+                            dialog.setOnDismissListener(null);
+                            dialog.dismiss();
+                            fallback.run();
+                        });
+                        return false;
+                    }
+                });
+    }
+
+    private static boolean hasDialogActions(Dialog dialog, String positive, String negative) {
+        View ok = dialog.findViewById(android.R.id.button1);
+        View cancel = dialog.findViewById(android.R.id.button2);
+        return ok instanceof TextView && cancel instanceof TextView
+                && positive.contentEquals(((TextView) ok).getText())
+                && negative.contentEquals(((TextView) cancel).getText())
+                && ok.getVisibility() == View.VISIBLE && cancel.getVisibility() == View.VISIBLE;
     }
 
     private static void invokeDialogBuilder(
@@ -1629,79 +1614,176 @@ public final class CodecController {
                 checked = i;
             }
         }
-        long[] finalOptions = options;
         Context dialogContext = resolveLiveDialogContext(sub);
         if (dialogContext == null) {
             MLog.w("showQualityPicker skipped: no live activity context");
             return;
         }
-        boolean finalPreserveLhdcHighBits = preserveLhdcHighBits;
         try {
-            showChoicePopup(sub, sourcePref, entries, checked, which -> {
-                long picked = finalOptions[which];
-                if (finalPreserveLhdcHighBits) {
-                    int previousPolicy = selectedLhdcPolicy(sub.mac, snapshot);
-                    int pickedPolicy = LhdcQualityPolicy.normalize((int) (picked & 0xFFL));
-                    lhdcPoliciesByMac.put(sub.mac, pickedPolicy);
-                    picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
-                    if (pickedPolicy == LhdcQualityPolicy.QUALITY) {
-                        PreferenceStore.LhdcCeiling ceiling = prefs.readLhdcCeiling(sub.mac);
-                        if (ceiling != null
-                                && ceiling.lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900
-                                && ceiling.matches(
-                                        snapshot.activeCodecType,
-                                        snapshot.activeCodecSpecific3)) {
-                            picked = (picked & ~0xFFL)
-                                    | CodecLabelTable.LHDC_QUALITY_FIXED_900;
-                            MLog.event("write.lhdc.ceiling.remembered",
-                                    "mac", redactedMac(sub),
-                                    "lowByte", CodecLabelTable.LHDC_QUALITY_FIXED_900);
-                        }
-                    }
-                    long expectedTransport = LhdcQualityPolicy.transportSpecific1(
-                            picked, pickedPolicy);
-                    boolean transportAlreadyMatches =
-                            (snapshot.activeCodecSpecific1 & 0xFFL)
-                                    == (expectedTransport & 0xFFL);
-                    if (pickedPolicy == previousPolicy && transportAlreadyMatches) {
-                        int ceilingKbps = lhdcCeilingKbpsForActive(sub, snapshot);
-                        LhdcQualityPolicy.send(
-                                context, sub.mac, pickedPolicy,
-                                "quality_picker_reaffirm", ceilingKbps);
-                        refreshSnapshot(sub);
-                        return;
-                    }
-                }
-                if (finalPreserveLhdcHighBits) {
-                    String advisory = NativePatchAdvisory.selectionToast(picked & 0xFFL);
-                    if (advisory != null) showPatchAdvisory(advisory, "picker");
-                }
-                CodecRequest.Builder builder = CodecRequest.fromActive(snapshot)
-                        .withSpecific1(picked);
-                builder.withSampleRate(linkedSampleRateForQuality(snapshot, picked));
-                CodecRequest req = builder.build();
-                if (finalPreserveLhdcHighBits) {
-                    int previousPolicy = selectedPolicy;
-                    applyWrite(sub, req, (result, error) -> {
-                        if (shouldProbeLhdcCeiling(sub, req, result)) {
-                            MLog.event("write.lhdc.ceiling.probe",
-                                    "mac", redactedMac(sub),
-                                    "request", req);
-                            retryLhdcQualityWithCeiling900(sub, req, previousPolicy);
-                            return true;
-                        }
-                        lhdcPoliciesByMac.put(sub.mac, previousPolicy);
-                        LhdcQualityPolicy.send(
-                                context, sub.mac, previousPolicy, "quality_picker_rollback");
-                        return false;
-                    });
-                } else {
-                    applyWrite(sub, req);
-                }
-            });
+            showChoicePopup(sub, sourcePref, entries, checked,
+                    which -> requestQualitySelection(sub, snapshot.activeCodecType, options[which]));
         } catch (Throwable t) {
             MLog.e("showQualityPicker dialog.show failed", t);
             Toast.makeText(context, Strings.TOAST_APPLY_FAILED, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void requestQualitySelection(Subscription sub, int codecType, long picked) {
+        if (!isSubscriptionActive(sub)) return;
+        ConfirmAction action = () -> applyQualitySelection(sub, codecType, picked);
+        if (!isQualityPriorityChoice(codecType, picked)) {
+            action.run();
+            return;
+        }
+        showQualityWarning(sub, false, action);
+    }
+
+    static boolean isQualityPriorityChoice(int codecType, long specific1) {
+        return CodecLabelTable.isLhdc(codecType)
+                ? isLhdcHighQuality(specific1 & 0xFFL)
+                : codecType == CodecLabelTable.CODEC_LDAC
+                        && specific1 == CodecLabelTable.LDAC_QUALITY_HIGH;
+    }
+
+    static boolean isRememberedQualityPriority(
+            PreferenceStore.RememberedValue value, int liveCodecType) {
+        if (value == null) return false;
+        int codecType = value.codecType < 0 ? liveCodecType : value.codecType;
+        return sameCodecFamily(codecType, liveCodecType)
+                && isQualityPriorityChoice(codecType, value.codecSpecific1);
+    }
+
+    private void maybeShowRememberedQualityNotice(Subscription sub) {
+        if (!isSubscriptionActive(sub) || sub.renderedLeAudioActive
+                || Boolean.FALSE.equals(sub.connected) || isClassicRestorePending(sub.mac)
+                || sub.prefs.qualityOption == null || !PrefRef.isVisible(sub.prefs.qualityOption)) {
+            return;
+        }
+        Activity activity = resolveLiveActivity(sub);
+        View root = fragmentRootView(sub.fragment);
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()
+                || !activity.hasWindowFocus() || root == null || !root.isShown()
+                || !root.isAttachedToWindow()) return;
+        CodecSnapshot snapshot = snapshotFor(sub);
+        if (snapshot == null || !isA2dpReadyOrUnknown(sub)
+                || !isRememberedQualityPriority(prefs.readSnapshot(sub.mac), snapshot.activeCodecType)) {
+            return;
+        }
+        long quality = CodecLabelTable.isLhdc(snapshot.activeCodecType)
+                ? LhdcQualityPolicy.logicalSpecific1(snapshot.activeCodecSpecific1,
+                        selectedLhdcPolicy(sub.mac, snapshot))
+                : snapshot.activeCodecSpecific1;
+        if (!isQualityPriorityChoice(snapshot.activeCodecType, quality)) return;
+        // Existing playback has already been restored. This is informational; neither button
+        // changes the codec, sample rate or remembered selection.
+        showQualityWarning(sub, true, () -> {});
+    }
+
+    private void showQualityWarning(Subscription sub, boolean reminder, ConfirmAction action) {
+        Activity activity = resolveLiveActivity(sub);
+        if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
+        QualityNoticeStore.Reservation receipt = null;
+        try {
+            receipt = qualityNoticeStore.reserve(sub.mac);
+        } catch (java.io.IOException e) {
+            MLog.w("quality notice receipt unavailable", e);
+            // Manual confirmation must still work if private receipt storage is unavailable.
+        }
+        if (reminder && receipt == null) return;
+        QualityNoticeStore.Reservation reservation = receipt;
+        Runnable dismissed = () -> closeQualityNoticeReceipt(reservation);
+        Runnable shown = () -> {
+            if (reservation != null) {
+                try {
+                    reservation.markShown();
+                } catch (java.io.IOException e) {
+                    MLog.w("quality notice receipt write failed", e);
+                }
+            }
+            MLog.event("quality.warning.shown", "mac", redactedMac(sub),
+                    "kind", reminder ? "remembered" : "manual");
+        };
+        String title = reminder ? Strings.QUALITY_NOTICE_TITLE : Strings.QUALITY_CONFIRM_TITLE;
+        try {
+            if (!showMelodyAlertDialog(activity, title, Strings.QUALITY_CONFIRM_MESSAGE,
+                    Strings.CONFIRM, Strings.CANCEL, action, shown, dismissed)) {
+                showFrameworkConfirmDialog(activity, title, Strings.QUALITY_CONFIRM_MESSAGE,
+                        Strings.CONFIRM, Strings.CANCEL, action, shown, dismissed);
+            }
+        } catch (Throwable t) {
+            dismissed.run();
+            MLog.e("showQualityWarning failed", t);
+        }
+    }
+
+    private static void closeQualityNoticeReceipt(QualityNoticeStore.Reservation reservation) {
+        if (reservation == null) return;
+        try {
+            reservation.close();
+        } catch (java.io.IOException e) {
+            MLog.w("quality notice receipt close failed", e);
+        }
+    }
+
+    private void applyQualitySelection(Subscription sub, int codecType, long picked) {
+        if (!isSubscriptionActive(sub) || renderLeAudioIfNeeded(sub)
+                || !ensureA2dpReadyForUser(sub)) return;
+        // The headset or codec may have changed while the confirmation was open.
+        CodecSnapshot snapshot = snapshotFor(sub);
+        if (snapshot == null || snapshot.activeCodecType != codecType) {
+            refreshSnapshot(sub);
+            return;
+        }
+        boolean preserveLhdcHighBits = CodecLabelTable.isLhdc(codecType);
+        int previousPolicy = preserveLhdcHighBits
+                ? selectedLhdcPolicy(sub.mac, snapshot) : -1;
+        if (preserveLhdcHighBits) {
+            int pickedPolicy = LhdcQualityPolicy.normalize((int) (picked & 0xFFL));
+            lhdcPoliciesByMac.put(sub.mac, pickedPolicy);
+            picked = (snapshot.activeCodecSpecific1 & ~0xFFL) | (picked & 0xFFL);
+            if (pickedPolicy == LhdcQualityPolicy.QUALITY) {
+                PreferenceStore.LhdcCeiling ceiling = prefs.readLhdcCeiling(sub.mac);
+                if (ceiling != null
+                        && ceiling.lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900
+                        && ceiling.matches(snapshot.activeCodecType, snapshot.activeCodecSpecific3)) {
+                    picked = (picked & ~0xFFL) | CodecLabelTable.LHDC_QUALITY_FIXED_900;
+                    MLog.event("write.lhdc.ceiling.remembered",
+                            "mac", redactedMac(sub),
+                            "lowByte", CodecLabelTable.LHDC_QUALITY_FIXED_900);
+                }
+            }
+            long expectedTransport = LhdcQualityPolicy.transportSpecific1(picked, pickedPolicy);
+            boolean transportAlreadyMatches = (snapshot.activeCodecSpecific1 & 0xFFL)
+                    == (expectedTransport & 0xFFL);
+            if (pickedPolicy == previousPolicy && transportAlreadyMatches) {
+                int ceilingKbps = lhdcCeilingKbpsForActive(sub, snapshot);
+                LhdcQualityPolicy.send(context, sub.mac, pickedPolicy,
+                        "quality_picker_reaffirm", ceilingKbps);
+                refreshSnapshot(sub);
+                return;
+            }
+            String advisory = NativePatchAdvisory.selectionToast(picked & 0xFFL);
+            if (advisory != null) showPatchAdvisory(advisory, "picker");
+        }
+        CodecRequest req = CodecRequest.fromActive(snapshot)
+                .withSpecific1(picked)
+                .withSampleRate(linkedSampleRateForQuality(snapshot, picked))
+                .build();
+        if (preserveLhdcHighBits) {
+            applyWrite(sub, req, (result, error) -> {
+                if (shouldProbeLhdcCeiling(sub, req, result)) {
+                    MLog.event("write.lhdc.ceiling.probe",
+                            "mac", redactedMac(sub), "request", req);
+                    retryLhdcQualityWithCeiling900(sub, req, previousPolicy);
+                    return true;
+                }
+                lhdcPoliciesByMac.put(sub.mac, previousPolicy);
+                LhdcQualityPolicy.send(
+                        context, sub.mac, previousPolicy, "quality_picker_rollback");
+                return false;
+            });
+        } else {
+            applyWrite(sub, req);
         }
     }
 
@@ -1895,7 +1977,7 @@ public final class CodecController {
         void onChoice(int which);
     }
 
-    private static void showChoicePopup(
+    private void showChoicePopup(
             Subscription sub,
             Object sourcePref,
             CharSequence[] entries,
@@ -1941,12 +2023,14 @@ public final class CodecController {
         }
     }
 
-    private static boolean showCouiChoicePopup(
+    private boolean showCouiChoicePopup(
             Context context,
             View anchor,
             CharSequence[] entries,
             int checked,
             ChoiceCallback callback) {
+        if (uiBindings.popup != null && tryShowCouiChoicePopup(
+                context, anchor, entries, checked, callback, uiBindings.popup)) return true;
         String[][] bindings = {
                 {
                         "L2.e", "L2.o", "g", "i", "j", "v"
@@ -1968,12 +2052,6 @@ public final class CodecController {
                     context, anchor, entries, checked, callback, binding)) return true;
         }
 
-        String[] discovered = discoverCouiPopupBinding(context);
-        if (discovered != null
-                && tryShowCouiChoicePopup(
-                        context, anchor, entries, checked, callback, discovered)) {
-            return true;
-        }
         MLog.event("ui.choice.popup", "impl", "framework_fallback", "count", entries.length);
         return false;
     }
@@ -2014,7 +2092,9 @@ public final class CodecController {
                 popup.dismiss();
                 callback.onChoice(position);
             };
-            setField(popupObject, binding[5], listener);
+            Method listenerSetter = findCouiListenerSetter(popupClass);
+            if (listenerSetter != null) listenerSetter.invoke(popupObject, listener);
+            else setField(popupObject, binding[5], listener);
 
             Method show = findCouiPopupShowMethod(popupClass);
             if (show == null) throw new NoSuchMethodException(binding[0] + " show");
@@ -2030,6 +2110,7 @@ public final class CodecController {
             } else {
                 show.invoke(popupObject, anchorX, anchorY, anchor);
             }
+            if (!popup.isShowing()) throw new IllegalStateException("popup_not_showing");
             MLog.event("ui.choice.popup", "impl", binding[0], "count", entries.length);
             return true;
         } catch (Throwable t) {
@@ -2041,19 +2122,23 @@ public final class CodecController {
         }
     }
 
-    private static Method findCouiSetItemsMethod(Class<?> popupClass) {
+    static Method findCouiSetItemsMethod(Class<?> popupClass) {
+        Method found = null;
         for (Method method : popupClass.getMethods()) {
             Class<?>[] params = method.getParameterTypes();
             if (params.length == 1
                     && List.class.isAssignableFrom(params[0])
-                    && method.getReturnType() == void.class) {
-                return method;
+                    && method.getReturnType() == void.class
+                    && !Modifier.isStatic(method.getModifiers())) {
+                if (found != null) return null;
+                found = method;
             }
         }
-        return null;
+        return found;
     }
 
-    private static Method findCouiPopupShowMethod(Class<?> popupClass) {
+    static Method findCouiPopupShowMethod(Class<?> popupClass) {
+        Method found = null;
         for (Method method : popupClass.getMethods()) {
             if (method.getDeclaringClass() != popupClass
                     || method.getReturnType() != void.class
@@ -2064,145 +2149,33 @@ public final class CodecController {
                     && params[1] == int.class && params[2] == int.class;
             boolean viewLast = params[0] == int.class && params[1] == int.class
                     && View.class.isAssignableFrom(params[2]);
-            if (viewFirst || viewLast) return method;
-        }
-        return null;
-    }
-
-    private static String[] discoverCouiPopupBinding(Context context) {
-        if (couiPopupDiscoveryAttempted) return discoveredCouiPopupBinding;
-        synchronized (CodecController.class) {
-            if (couiPopupDiscoveryAttempted) return discoveredCouiPopupBinding;
-            discoveredCouiPopupBinding = scanCouiPopupBinding(context);
-            couiPopupDiscoveryAttempted = true;
-            return discoveredCouiPopupBinding;
-        }
-    }
-
-    private static String[] scanCouiPopupBinding(Context context) {
-        DexFile dex = null;
-        try {
-            String sourceDir = context.getApplicationInfo() != null
-                    ? context.getApplicationInfo().sourceDir : null;
-            if (sourceDir == null) return null;
-            dex = new DexFile(sourceDir);
-            Enumeration<String> entries = dex.entries();
-            ArrayList<String> compactClasses = new ArrayList<>();
-            while (entries.hasMoreElements()) {
-                String name = entries.nextElement();
-                if (isCompactObfuscatedClass(name)) compactClasses.add(name);
-            }
-
-            ClassLoader loader = context.getClassLoader();
-            for (String popupName : compactClasses) {
-                Class<?> popupClass;
-                try {
-                    popupClass = Class.forName(popupName, false, loader);
-                } catch (Throwable ignored) {
-                    continue;
-                }
-                Class<?> parent = popupClass.getSuperclass();
-                if (parent == null
-                        || !isCouiPopupBaseClass(parent)
-                        || !PopupWindow.class.isAssignableFrom(popupClass)
-                        || findCouiSetItemsMethod(popupClass) == null
-                        || findCouiPopupShowMethod(popupClass) == null) {
-                    continue;
-                }
-                try {
-                    popupClass.getConstructor(Context.class);
-                } catch (Throwable ignored) {
-                    continue;
-                }
-
-                Field listener = firstFieldOfType(
-                        popupClass, AdapterView.OnItemClickListener.class);
-                if (listener == null) continue;
-                String packageName = popupClass.getPackage() != null
-                        ? popupClass.getPackage().getName() : "";
-                for (String itemName : compactClasses) {
-                    if (!itemName.startsWith(packageName + ".")) continue;
-                    Class<?> itemClass;
-                    try {
-                        itemClass = Class.forName(itemName, false, loader);
-                        itemClass.getDeclaredConstructor();
-                    } catch (Throwable ignored) {
-                        continue;
-                    }
-                    Field[] itemFields = popupItemFields(itemClass);
-                    if (itemFields == null) continue;
-                    String[] binding = {
-                            popupClass.getName(),
-                            itemClass.getName(),
-                            itemFields[0].getName(),
-                            itemFields[1].getName(),
-                            itemFields[2].getName(),
-                            listener.getName()
-                    };
-                    MLog.event("ui.choice.popup.discovered",
-                            "impl", binding[0], "item", binding[1]);
-                    return binding;
-                }
-                String[] viaMethods = findItemBindingViaMethodReturns(
-                        popupClass, listener.getName());
-                if (viaMethods != null) {
-                    MLog.event("ui.choice.popup.discovered",
-                            "impl", viaMethods[0], "item", viaMethods[1]);
-                    return viaMethods;
-                }
-            }
-        } catch (Throwable t) {
-            MLog.event("ui.choice.popup.discovery_failed",
-                    "error", t.getClass().getSimpleName());
-        } finally {
-            if (dex != null) {
-                try {
-                    dex.close();
-                } catch (Throwable ignored) {
-                }
+            if (viewFirst || viewLast) {
+                if (found != null) return null;
+                found = method;
             }
         }
-        return null;
+        return found;
     }
 
-    private static boolean isCompactObfuscatedClass(String name) {
-        if (name == null || name.indexOf('$') >= 0) return false;
-        int dot = name.indexOf('.');
-        if (dot <= 0 || dot != name.lastIndexOf('.')) return false;
-        String packageName = name.substring(0, dot);
-        return packageName.length() <= 3;
-    }
-
-    /**
-     * COUI popup base classes move between host releases: older builds anchor popups on
-     * {@code com.coui.appcompat.poplist.a}, while ColorOS 17 renamed that class to the
-     * popup animation controller and moved the window base to {@code poplist.b} /
-     * {@code poplist.d}. Accept any ancestor inside the bundled COUI poplist package so
-     * discovery does not depend on a single obfuscated class name.
-     */
-    private static boolean isCouiPopupBaseClass(Class<?> parent) {
-        Class<?> cls = parent;
-        while (cls != null && cls != Object.class) {
-            if (cls.getName().startsWith("com.coui.appcompat.poplist.")) return true;
-            cls = cls.getSuperclass();
-        }
-        return false;
-    }
-
-    private static Field firstFieldOfType(Class<?> cls, Class<?> fieldType) {
-        ArrayList<Field> matches = new ArrayList<>();
-        for (Field field : cls.getDeclaredFields()) {
-            if (!Modifier.isStatic(field.getModifiers()) && field.getType() == fieldType) {
-                matches.add(field);
+    static Method findCouiListenerSetter(Class<?> popupClass) {
+        Method found = null;
+        for (Method method : popupClass.getDeclaredMethods()) {
+            if (!Modifier.isPublic(method.getModifiers())
+                    || Modifier.isStatic(method.getModifiers())
+                    || method.getReturnType() != void.class
+                    || method.getParameterCount() != 1
+                    || method.getParameterTypes()[0] != AdapterView.OnItemClickListener.class) {
+                continue;
             }
+            if (found != null) return null;
+            found = method;
         }
-        if (matches.isEmpty()) return null;
-        matches.sort((left, right) -> left.getName().compareTo(right.getName()));
-        return matches.get(0);
+        return found;
     }
+
 
     /** Returns text, selected and enabled fields for the bundled PopupListItem model. */
-    private static Field[] popupItemFields(Class<?> itemClass) {
+    static Field[] popupItemFields(Class<?> itemClass) {
         if (itemClass.getSuperclass() != Object.class
                 || !Modifier.isFinal(itemClass.getModifiers())) return null;
         Field text = null;
@@ -2229,41 +2202,6 @@ public final class CodecController {
         return new Field[]{text, booleans.get(0), booleans.get(1)};
     }
 
-    /**
-     * ColorOS 17 moved the item model (e.g. {@code d3.r}) out of the popup package and
-     * stripped generic signatures, so the same-package scan cannot find it. Fall back to
-     * the popup's own accessors: COUIPopupListWindow exposes {@code o(int)} / {@code p(int)}
-     * methods returning the bundled item type.
-     */
-    private static String[] findItemBindingViaMethodReturns(
-            Class<?> popupClass, String listenerField) {
-        LinkedHashSet<Class<?>> candidates = new LinkedHashSet<>();
-        for (Method method : popupClass.getMethods()) {
-            if (method.getParameterCount() != 1) continue;
-            if (method.getParameterTypes()[0] != int.class) continue;
-            Class<?> ret = method.getReturnType();
-            if (ret == null || ret.isPrimitive() || ret.isArray()) continue;
-            candidates.add(ret);
-        }
-        for (Class<?> itemClass : candidates) {
-            try {
-                itemClass.getDeclaredConstructor();
-            } catch (Throwable ignored) {
-                continue;
-            }
-            Field[] itemFields = popupItemFields(itemClass);
-            if (itemFields == null) continue;
-            return new String[]{
-                    popupClass.getName(),
-                    itemClass.getName(),
-                    itemFields[0].getName(),
-                    itemFields[1].getName(),
-                    itemFields[2].getName(),
-                    listenerField
-            };
-        }
-        return null;
-    }
 
     private static void setField(Object target, String name, Object value) throws Exception {
         Field field;
@@ -3473,6 +3411,7 @@ public final class CodecController {
         }
         PrefRef.setSummary(q, summary);
         PrefRef.setVisible(q, true);
+        maybeShowRememberedQualityNotice(sub);
     }
 
     static String lhdcQualitySummary(String policyLabel, int policy, int bitrateKbps) {
@@ -3833,6 +3772,8 @@ public final class CodecController {
         boolean gameAnchorHostDisabled;
         boolean gameAnchorHostEnabled = true;
         java.lang.ref.WeakReference<Activity> hostActivity;
+        View noticeDecor;
+        android.view.ViewTreeObserver.OnWindowFocusChangeListener noticeFocusListener;
         volatile boolean active = true;
         private long refreshGeneration;
 
@@ -3840,6 +3781,17 @@ public final class CodecController {
             this.mac = mac;
             this.prefs = prefs;
             this.fragment = fragment;
+        }
+
+        void watchWindowFocus() {
+            Activity activity = hostActivity != null ? hostActivity.get() : null;
+            if (activity == null || activity.getWindow() == null) return;
+            noticeDecor = activity.getWindow().getDecorView();
+            noticeFocusListener = hasFocus -> {
+                if (hasFocus) mainHandler.post(
+                        () -> maybeShowRememberedQualityNotice(Subscription.this));
+            };
+            noticeDecor.getViewTreeObserver().addOnWindowFocusChangeListener(noticeFocusListener);
         }
 
         void registerReceiver() {
@@ -3941,6 +3893,11 @@ public final class CodecController {
             active = false;
             invalidateRefreshes();
             unregisterReceiver();
+            if (noticeDecor != null && noticeDecor.getViewTreeObserver().isAlive()) {
+                noticeDecor.getViewTreeObserver().removeOnWindowFocusChangeListener(noticeFocusListener);
+            }
+            noticeDecor = null;
+            noticeFocusListener = null;
         }
     }
 }

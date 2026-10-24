@@ -1,0 +1,66 @@
+# 关闭治理器时的 LHDC V5 固定音质优先发送节奏
+
+本地待发布改动。目标是维持用户选择的 **1000 kbps 和采样率**，减少每次编码任务集中入队的包数；改善程度需要实际试听确认。
+
+## 证据与边界
+
+反馈 `OPlusHeadsetAudioHelper-feedback-20261024-214534.zip`：PJZ110，ColorOS 17.0.0.103，模块 2.5.5，192 kHz / 24 bit / 1000 kbps，治理器关闭。21:43:36.026、21:44:21.986 的发送队列均为 45/45，随后约 100 ms 上报 remote choppy。协商 MTU 为 667，`peer_supports_3mbps=false`。
+
+这证明了积压与卡顿的时间关联；不能仅凭日志断定是周期性突发还是持续无线容量不足。缩短编码周期能减小瞬时批次，无法增加链路带宽，也无法保证固定 1000 kbps 在强干扰环境下始终连续。
+
+## 实现
+
+- 在系统选择音频流编码周期时，仅当 LHDC V5、音质优先、治理器关闭、OEM 原周期为 20 ms，才返回 10 ms。
+- 包化器保留原有按实际时间差计算 PCM 数量的逻辑；不修改码率、采样率、PCM、队列容量或系统丢包策略。线程继续由系统调度。
+- OEM 首次调用会索取 20 ms PCM，因此第一个 10 ms 唤醒只等待，第二个唤醒处理原有完整首批。后续按实际时间差处理较小批次。通过原生 `last_frame_us == 0` 识别首批，配置期间重复查询周期不会跳过正在播放的批次。
+- 原生低延迟模式已经是 10 ms 时不额外等待；自适应、连接优先以及开启治理器时沿用 OEM 周期。周期在系统下次启动音频流时选定，切换策略或治理器开关不会强行重启当前流。
+- 10 ms 会增加编码任务唤醒次数，需要实测功耗与调度表现；平均编码数据量保持不变。
+
+只读解析实际系统 ELF 的 `.data.rel.ro`，以完整 20/10 ms getter 契约、LHDC V5 字符串交叉引用、时间戳与 PCM 缩放指令契约、八个不同且可执行的接口回调共同定位。必须唯一命中，并核对全部运行时重定位指针。只暂时写入两个接口指针并恢复只读权限；未知布局或歧义保留系统行为。布局不兼容结果在进程内缓存，避免播放期间重复扫描整库。
+
+当前 C17 样本 SHA-256：`f98f8d9f6a4114dd6ba2131fa27eb01ae7db43c8cfdedc5ec337c82db692c3e3`。离线解析结果：接口 `0x10675b0`，周期 getter `0x72d814`，send_frames `0x72d994`，last_frame_us `0x10970a8`。这些地址仅作证据记录，运行时代码不写死这些地址。
+
+## 已完成验证
+
+- 生产解析器与会话逻辑的 C++ 测试：48/96/192 kHz、正常及有抖动的时间戳均保持 PCM 总量；覆盖首批等待、活动流查询、原生 10 ms、治理器开关、策略切换、重开流、契约漂移、接口歧义和无效 ELF。
+- 仓库 9 份蓝牙库样本：7 份唯一命中；PLC110 16.0.8.300 与 RMX6688 不符合契约，保持 OEM 行为。
+- PJZ110 隔离原生探针执行生产安装函数：`install=2`、`protection=1`（只读），核对两个替换回调、首次等待、10/20 ms 选择、重复安装。探针仅私有映射反馈库，未触碰真实蓝牙进程。
+- 238 项 JVM 单测通过，Release APK 构建通过。隔离探针成功不等于实际蓝牙发送或听感验收。
+
+## 实机验收
+
+使用包含该改动的 release 构建，按模块更新流程重载蓝牙作用域。保持治理器关闭，选择音质优先与原有采样率，暂停后重新播放，让系统重新选择周期。通过日志确认：
+
+```text
+evt=lhdc.pacing.install ok=true result=2
+evt=pacing.session stock_ms=20 interval_ms=10 first_batch_ms=20
+starting media encoder timer with interval 10ms
+```
+
+重复安装时结果为 1。以系统 timer 日志确认实际周期，以编码器回读确认仍为 1000 kbps。复现相同位置、Wi-Fi 环境、歌曲与采样率，比较 TX 满队列次数和 remote choppy 次数，再结合试听判断。若持续满队列，说明仍需继续区分调度延迟与无线容量限制，不能把本次节奏优化宣称为已消除卡顿。
+
+实现：`app/src/main/cpp/lhdc_fixed_pacing.h`、`native_lhdc_patch.cpp`。主机测试：`app/src/test/cpp/lhdc_fixed_pacing_test.cpp`。Android 隔离探针：`app/src/test/cpp/lhdc_fixed_pacing_probe.cpp`。
+
+## 实际起流验证（2026-10-25）
+
+PJZ110 / ColorOS 17.0.0.103，已加载测试提交 `3961659` 的手机，由用户操作播放，
+通过真实蓝牙进程 PID 11519 记录。以下时间为设备日志时间：
+
+- 00:37:05 记忆回放发送 `policy=9 reason=remember_replay`，随后系统实际起流为
+  20 ms。这次处于自适应，不能作为音质优先的 10 ms 验证。
+- 00:42:38 手动选择音质优先，宿主发送 `policy=8 reason=codec_write ceilingKbps=1000`。
+- 00:42:47.863 模块记录 `pacing.session stock_ms=20 interval_ms=10 first_batch_ms=20`，
+  同时系统 `btif_a2dp_source_audio_tx_start_event` 记录
+  `starting media encoder timer with interval 10ms`。
+- 00:42:49–00:44:13 的编码器回读记录均为 `actualBitrateKbps=1000`、
+  `bitrateVerification=getter_confirmed`；对应 `streamSessionId=2`。
+  捕获后读取模块偏好，`governor_experimental_enabled=false`。
+
+因此已补齐真实起流使用 10 ms 且保留固定 1000 kbps 的证据；没有因此证明相对
+20 ms 的听感改善幅度，也没有证明高负载 Wi-Fi 传输时能消除卡顿。本轮不再调整
+发送节奏、码率、队列容量或丢包策略。
+
+原始记录位于工作区 `.tmp/pacing-confirm-20261025/logcat.txt`：第 144347 行为策略
+写入，第 151589 行为模块周期，第 151591 行为系统 timer，第 152523 / 195509 行
+为后续码率回读。完整复核见工作区 `feedback/analysis-20261025-000715-000950.md`
+的追加验证。

@@ -18,6 +18,19 @@
 - 在官方耳机主面板和 OneSpace 快捷面板中使用同一套控制。
 - 出现问题时可一键生成反馈包，方便适配不同机型和系统版本。
 
+## 2.5.6 更新 / Updates
+
+- 治理器关闭时，支持的 LHDC V5 音质优先流改用 10 ms 发送节奏，保持所选码率和采样率；实机记录确认码率仍为 1000 kbps。高负载无线环境下仍可能卡顿。
+- Supported LHDC V5 Quality Priority streams use 10 ms pacing with the governor disabled, while preserving bitrate and sample rate; device logs confirmed 1000 kbps. Stutter may still occur under heavy wireless load.
+- 改进耳机页面弹窗与菜单定位，LE Audio 确认框继续使用原生 COUI 底部样式。
+- Improves headset dialog and menu resolution; the LE Audio confirmation dialog keeps its native COUI bottom-sheet style.
+- 手动选择音质优先前会提示风险；已有相关记忆的用户升级后首次进入对应耳机页面会收到一次提醒，现有设置不变。
+- A warning appears before manual Quality Priority switches. Users with a saved choice see a one-time reminder on that headset page after upgrading, with their current settings preserved.
+- 新增提示与弹窗已通过本地测试和 APK 构建；实际显示与交互仍需在设备上复核。
+- The new notices and dialogs passed local tests and APK build checks; their rendered appearance and interaction still need on-device verification.
+
+[完整中英文说明 / Full bilingual release notes](https://github.com/Andrea-lyz/MelodyCodecTweaker/blob/main/docs/releases/2.5.6.md)
+
 ## 2.5.5 更新 / Updates
 
 - 修复 ColorOS 17 每次加载 LHDC 编码器时重写函数表、覆盖模块 Hook，导致链路状态显示 `streaming=false`、实时码率为 0，码率保护无法生效的问题。

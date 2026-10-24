@@ -18,6 +18,13 @@
 
 The module primarily targets `com.oplus.melody` on ColorOS / OPlus devices, working alongside the `com.android.bluetooth` and `com.oplus.wirelesssettings` scopes for more stable state reading and writing.
 
+## 2.5.6 Update Highlights
+
+- With the governor disabled, supported LHDC V5 Quality Priority streams use 10 ms encoder pacing while preserving the selected bitrate and sample rate. Device logs confirmed the bitrate remained at 1000 kbps; stutter may still occur under heavy wireless load.
+- Improves runtime resolution of Wireless Headphones dialogs and menus, and restores the native COUI bottom-sheet style for the LE Audio confirmation dialog.
+- Adds a warning before manual Quality Priority switches and a one-time post-upgrade reminder for users with a saved Quality Priority choice. The reminder leaves the restored settings unchanged.
+- See the [complete bilingual 2.5.6 release notes](docs/releases/2.5.6.md). The new dialogs still need on-device verification.
+
 ## 2.5.5 Update Highlights
 
 - Fixes ColorOS 17 replacing the LHDC dlsym table on every encoder load. The module previously installed its encode/free hook only once, so the replacement left `streaming=false`, `actualBitrateKbps=0`, and `queue=-1`, and bitrate protection could not reach the encoder.
