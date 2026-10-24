@@ -124,6 +124,7 @@ public final class HostHookInstaller {
     private final Map<String, Set<Integer>> pendingGameModeTypes = new HashMap<>();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private CodecController controller;
+    private HostUiBindings uiBindings = HostUiBindings.EMPTY;
     private boolean activityScanRegistered;
 
     public HostHookInstaller(
@@ -148,6 +149,11 @@ public final class HostHookInstaller {
 
     public void install() {
         try {
+            try {
+                uiBindings = HostUiBindings.resolve(dexKit, classLoader);
+            } catch (Throwable t) {
+                MLog.w("DexKit UI bindings unavailable; retaining compatibility fallback", t);
+            }
             hookApplicationOnCreate();
             hookHighAudio();
             hookBasePreferenceFragment();
@@ -195,7 +201,8 @@ public final class HostHookInstaller {
         BluetoothCodecReflect reflect = new BluetoothCodecReflect(app);
         SettingsGlobalFallback fallback = new SettingsGlobalFallback(app);
         CodecBridgeClient bridge = new CodecBridgeClient(app, reflect, fallback);
-        controller = new CodecController(app, reflect, bridge, prefs, this::requestSurfaceRescan);
+        controller = new CodecController(
+                app, reflect, bridge, prefs, this::requestSurfaceRescan, uiBindings);
         flushPendingOfficialGameModeStates();
         registerActivityScanCallbacks(app);
 

@@ -415,6 +415,7 @@ public final class MLog {
                 || "activity.scan.registered".equals(name)
                 || "bt.a2dp.resolved".equals(name)
                 || "codec.updated.hooks".equals(name)
+                || "ui.bindings.resolved".equals(name)
                 || "cdm.hooks".equals(name)
                 || "lhdc.memory_patch".equals(name)
                 || "lhdc.link.stage_d".equals(name)

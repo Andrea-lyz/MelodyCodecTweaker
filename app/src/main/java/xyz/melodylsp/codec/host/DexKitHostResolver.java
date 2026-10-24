@@ -1,6 +1,7 @@
 package xyz.melodylsp.codec.host;
 
 import java.io.File;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -40,18 +41,21 @@ final class DexKitHostResolver implements AutoCloseable {
             String label,
             String searchPackage,
             String... strings) {
-        if (searchPackage == null || searchPackage.isEmpty()
-                || strings == null || strings.length == 0) {
+        if (searchPackage == null || strings == null || strings.length == 0) {
             return java.util.Collections.emptyList();
         }
         if (!ensureBridge()) return java.util.Collections.emptyList();
         try {
             Object findClass = create("org.luckypray.dexkit.query.FindClass");
             Object matcher = create("org.luckypray.dexkit.query.matchers.ClassMatcher");
-            findClass = keepIfReturned(
-                    invokeVararg(findClass, "searchPackages", String[].class,
-                            new String[]{searchPackage}),
-                    findClass);
+            // COUI implementation classes can be moved into arbitrary R8 packages. An empty
+            // package deliberately searches all DEX files; callers still validate the shape.
+            if (!searchPackage.isEmpty()) {
+                findClass = keepIfReturned(
+                        invokeVararg(findClass, "searchPackages", String[].class,
+                                new String[]{searchPackage}),
+                        findClass);
+            }
             matcher = keepIfReturned(invokeVararg(matcher, "usingStrings", String[].class, strings),
                     matcher);
             findClass = keepIfReturned(invoke(findClass, "matcher", matcher), findClass);
@@ -67,6 +71,52 @@ final class DexKitHostResolver implements AutoCloseable {
         } catch (Throwable t) {
             MLog.w("DexKit class lookup failed label=" + label, t);
             return java.util.Collections.emptyList();
+        }
+    }
+
+    /** Follows a framework override through R8 delegate methods, without guessing field names. */
+    Field findBooleanReadBy(Method entry, Class<?> fieldOwner, ClassLoader loader) {
+        if (entry == null || fieldOwner == null || !ensureBridge()) return null;
+        try {
+            Object methodData = invoke(bridge, "getMethodData", entry);
+            Set<Field> fields = new LinkedHashSet<>();
+            collectBooleanReads(methodData, fieldOwner, loader, 2,
+                    new LinkedHashSet<>(), fields);
+            return fields.size() == 1 ? fields.iterator().next() : null;
+        } catch (Throwable t) {
+            MLog.w("DexKit UI field lookup failed", t);
+            return null;
+        }
+    }
+
+    private static void collectBooleanReads(
+            Object data, Class<?> owner, ClassLoader loader, int depth,
+            Set<String> visited, Set<Field> out) throws Exception {
+        if (data == null || !visited.add(String.valueOf(data))) return;
+        Object uses = tryNoArg(data, "getUsingFields");
+        if (uses instanceof Iterable<?>) {
+            for (Object use : (Iterable<?>) uses) {
+                if (!"Read".equals(String.valueOf(tryNoArg(use, "getUsingType")))) continue;
+                Object fieldData = tryNoArg(use, "getField");
+                if (fieldData == null
+                        || !owner.getName().equals(stringNoArg(fieldData, "getDeclaredClassName"))) {
+                    continue;
+                }
+                Object field = invoke(fieldData, "getFieldInstance", loader);
+                if (field instanceof Field && ((Field) field).getType() == boolean.class) {
+                    out.add((Field) field);
+                }
+            }
+        }
+        Object calls = depth > 0 ? tryNoArg(data, "getInvokes") : null;
+        if (calls instanceof Iterable<?>) {
+            for (Object call : (Iterable<?>) calls) {
+                // Follow only delegates on the same adapter, not arbitrary framework code.
+                if (java.util.Objects.equals(stringNoArg(data, "getDeclaredClassName"),
+                        stringNoArg(call, "getDeclaredClassName"))) {
+                    collectBooleanReads(call, owner, loader, depth - 1, visited, out);
+                }
+            }
         }
     }
 
