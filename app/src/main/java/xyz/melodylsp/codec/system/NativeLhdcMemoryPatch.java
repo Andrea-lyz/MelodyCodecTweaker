@@ -176,6 +176,7 @@ public final class NativeLhdcMemoryPatch {
     private static volatile String appliedQualitySwitchSpecName;
     private static volatile boolean governorInstalled;
     private static volatile int governorPolicy = LhdcQualityPolicy.ADAPTIVE;
+    private static volatile int lastGovernorInstallResult;
     /**
      * Java-side replay cache for the native probe ceiling. Updated before any install attempt so
      * an early 900 kbps capability broadcast survives a late or failed governor install.
@@ -360,9 +361,16 @@ public final class NativeLhdcMemoryPatch {
         return lastQualitySwitchResult;
     }
 
-    /** Installs the fixed-bitrate encoder capture. Safe to call repeatedly. */
+    /**
+     * Installs the fixed-bitrate encoder capture. Safe to call repeatedly.
+     *
+     * <p>ColorOS 17's {@code A2DP_VendorLoadEncoderLhdcV5} rebuilds its dlsym function table on
+     * every encoder load, which can overwrite the wrappers installed for an earlier stream. The
+     * native side treats an active hook as a no-op (result 3) and reapplies the wrappers to the
+     * recorded slots after a vendor reload (result 4), so callers may invoke this on each stream
+     * observation instead of trusting the first-install flag forever.</p>
+     */
     static synchronized boolean installGovernor() {
-        if (governorInstalled) return true;
         if (!ensureNativeLoaded()) {
             MLog.event("lhdc.governor.install",
                     "ok", false,
@@ -377,10 +385,31 @@ public final class NativeLhdcMemoryPatch {
             MLog.w("lhdc governor native install failed", t);
             return false;
         }
+        boolean wasInstalled = governorInstalled;
         governorInstalled = result > 0;
-        MLog.event("lhdc.governor.install", "ok", governorInstalled, "result", result);
-        if (governorInstalled) replayGovernorProbeCeiling();
+        lastGovernorInstallResult = result;
+        if (!wasInstalled || result != 3) {
+            MLog.event("lhdc.governor.install",
+                    "ok", governorInstalled,
+                    "result", result,
+                    "previous", wasInstalled);
+        }
+        if (governorInstalled && (!wasInstalled || result == 4)) {
+            replayGovernorProbeCeiling();
+        }
         return governorInstalled;
+    }
+
+    static boolean isQualityPolicySelected() {
+        return governorPolicy == LhdcQualityPolicy.QUALITY;
+    }
+
+    static boolean isGovernorInstalled() {
+        return governorInstalled;
+    }
+
+    static int lastGovernorInstallResult() {
+        return lastGovernorInstallResult;
     }
 
     static synchronized boolean setGovernorPolicy(int policy) {

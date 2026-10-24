@@ -16,6 +16,12 @@
 
 模块主要服务于 ColorOS / OPlus 系设备上的 `com.oplus.melody`，同时配合 `com.android.bluetooth` 和 `com.oplus.wirelesssettings` 作用域完成更稳定的状态读取和写入。
 
+## 2.5.5 更新重点
+
+- 修复 ColorOS 17 在每次加载 LHDC 编码器时重写 dlsym 函数表，导致模块只安装一次的编码器 Hook 被覆盖，进而出现 `streaming=false`、`actualBitrateKbps=0`、`queue=-1`，码率保护无法下发的问题。
+- 编码器 Hook 现在会在每次 LHDC 配置确认和 BQR 样本到达时自愈检查：仍有效时快速返回，被系统覆盖时重新写回。
+- 完整中英文发布说明见 [2.5.5 发布说明](docs/releases/2.5.5.md)；实际听感仍需升级后复测。
+
 ## 2.5.4 更新重点
 
 - 修复 LHDC 自适应与连接优先策略下，实验性链路治理器仍可能发布码率控制目标的问题；这两种策略现在只收集链路诊断，不执行码率治理。

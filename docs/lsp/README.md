@@ -18,6 +18,15 @@
 - 在官方耳机主面板和 OneSpace 快捷面板中使用同一套控制。
 - 出现问题时可一键生成反馈包，方便适配不同机型和系统版本。
 
+## 2.5.5 更新 / Updates
+
+- 修复 ColorOS 17 每次加载 LHDC 编码器时重写函数表、覆盖模块 Hook，导致链路状态显示 `streaming=false`、实时码率为 0，码率保护无法生效的问题。
+- Fixes ColorOS 17 replacing the LHDC function table on every encoder load, which left the link state at `streaming=false` with no real-time bitrate and prevented bitrate protection from taking effect.
+- Hook 现在会在 LHDC 配置确认和 BQR 样本到达时自动检查并恢复；诊断页新增安装结果与当前封顶字段。
+- The hook now verifies and restores itself on confirmed LHDC configs and BQR samples; diagnostics expose the install result and active caps.
+
+[完整中英文说明 / Full bilingual release notes](https://github.com/Andrea-lyz/MelodyCodecTweaker/blob/main/docs/releases/2.5.5.md)
+
 ## 2.5.4 更新 / Updates
 
 - LHDC 自适应与连接优先策略现在只记录链路诊断，不再执行实验性码率治理；切换策略时会清理旧的控制状态。

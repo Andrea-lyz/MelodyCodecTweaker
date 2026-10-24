@@ -18,6 +18,12 @@
 
 The module primarily targets `com.oplus.melody` on ColorOS / OPlus devices, working alongside the `com.android.bluetooth` and `com.oplus.wirelesssettings` scopes for more stable state reading and writing.
 
+## 2.5.5 Update Highlights
+
+- Fixes ColorOS 17 replacing the LHDC dlsym table on every encoder load. The module previously installed its encode/free hook only once, so the replacement left `streaming=false`, `actualBitrateKbps=0`, and `queue=-1`, and bitrate protection could not reach the encoder.
+- The encoder hook now self-heals on every confirmed LHDC config and BQR sample: it returns quickly while still active and reapplies the wrappers after the vendor reload.
+- See the [complete bilingual 2.5.5 release notes](docs/releases/2.5.5.md). Playback still needs verification after upgrading.
+
 ## 2.5.4 Update Highlights
 
 - Fixes a policy-gating issue where the experimental LHDC link governor could still publish bitrate-control targets in Adaptive and Connection Priority modes. These modes now collect link diagnostics without applying bitrate governance.
