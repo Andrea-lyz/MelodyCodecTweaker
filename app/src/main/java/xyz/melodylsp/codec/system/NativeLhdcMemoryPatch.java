@@ -177,6 +177,7 @@ public final class NativeLhdcMemoryPatch {
     private static volatile boolean governorInstalled;
     private static volatile int governorPolicy = LhdcQualityPolicy.ADAPTIVE;
     private static volatile int lastGovernorInstallResult;
+    private static volatile int lastPacingInstallResult;
     /**
      * Java-side replay cache for the native probe ceiling. Updated before any install attempt so
      * an early 900 kbps capability broadcast survives a late or failed governor install.
@@ -385,6 +386,16 @@ public final class NativeLhdcMemoryPatch {
             MLog.w("lhdc governor native install failed", t);
             return false;
         }
+        try {
+            int pacing = nativeGetFixedQualityPacingInstallResult();
+            if (pacing != lastPacingInstallResult) {
+                lastPacingInstallResult = pacing;
+                MLog.event("lhdc.pacing.install", "ok", pacing > 0, "result", pacing,
+                        "activation", "next_stream_quality_governor_off");
+            }
+        } catch (Throwable t) {
+            MLog.w("LHDC fixed-quality pacing status unavailable", t);
+        }
         boolean wasInstalled = governorInstalled;
         governorInstalled = result > 0;
         lastGovernorInstallResult = result;
@@ -402,6 +413,15 @@ public final class NativeLhdcMemoryPatch {
 
     static boolean isQualityPolicySelected() {
         return governorPolicy == LhdcQualityPolicy.QUALITY;
+    }
+
+    static synchronized void setGovernorExperimentalEnabled(boolean enabled) {
+        if (!ensureNativeLoaded()) return;
+        try {
+            nativeSetGovernorExperimentalEnabled(enabled);
+        } catch (Throwable t) {
+            MLog.w("LHDC fixed-quality pacing preference unavailable", t);
+        }
     }
 
     static boolean isGovernorInstalled() {
@@ -1465,6 +1485,10 @@ public final class NativeLhdcMemoryPatch {
             int originalProtection);
 
     private static native int nativeInstallGovernor();
+
+    private static native int nativeGetFixedQualityPacingInstallResult();
+
+    private static native void nativeSetGovernorExperimentalEnabled(boolean enabled);
 
     private static native void nativeSetGovernorPolicy(int policy);
 

@@ -398,6 +398,7 @@ public final class SystemHookInstaller {
                     // Experimental governor switch: mirror the module preference so the
                     // runtime flag matches the UI (default OFF in production builds).
                     boolean governorEnabled = readGovernorExperimentalEnabled(appContext);
+                    NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(governorEnabled);
                     linkHealthController.setGovernorEnabled(
                             governorEnabled, SystemClock.elapsedRealtime());
                     MLog.eventLogOnly(
@@ -456,6 +457,7 @@ public final class SystemHookInstaller {
                     boolean govEnabled = intent.getBooleanExtra(
                             CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, false);
                     persistGovernorExperimentalEnabled(appContext, govEnabled);
+                    NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(govEnabled);
                     linkHealthController.setGovernorEnabled(
                             govEnabled, SystemClock.elapsedRealtime());
                     MLog.eventLogOnly("lhdc.governor.experimental", "enabled", govEnabled);

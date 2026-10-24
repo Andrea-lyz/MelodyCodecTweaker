@@ -418,6 +418,7 @@ public final class MLog {
                 || "ui.bindings.resolved".equals(name)
                 || "cdm.hooks".equals(name)
                 || "lhdc.memory_patch".equals(name)
+                || "lhdc.pacing.install".equals(name)
                 || "lhdc.link.stage_d".equals(name)
                 || "lhdc.link.bqr_hooks".equals(name)
                 || "lhdc.governor.choppy_hooks".equals(name)

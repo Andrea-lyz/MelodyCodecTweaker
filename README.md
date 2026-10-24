@@ -310,6 +310,10 @@ LHDC 的策略切换仍然依赖厂商蓝牙栈。模块会直接写入目标播
 
 诊断页将补丁状态拆为「码率 branch 补丁 / 快切等价补丁」两行独立展示；宿主切换到「音质优先」时会按适配状态提示——补丁未适配时提示「未适配，请联系开发者反馈」，仅快切等价缺失时提示「未完整适配，强行使用可能出现异常卡顿」，记忆回放路径同样提醒（见下节）。
 
+### 固定音质优先发送节奏（待发布）
+
+关闭治理器时，支持的 LHDC V5 系统库可在下次启动音频流时使用 10 ms 编码周期，保留固定 1000 kbps 与用户采样率，减小集中入队批次。首批数据仍等待完整 20 ms；未知库布局保留系统行为。该优化不能增加无线链路带宽，实际卡顿改善仍需设备试听，详见 [实现与验证边界](docs/fixed-quality-pacing.md)。
+
 ### 编码器治理器（码率拥塞治理器）
 
 治理器会解析当前已加载的 `liblhdcv5BT_enc.so` 导出符号，并在 `libbluetooth_jni.so` 的可写数据段或紧邻匿名 `.bss` 中查找 `lhdcv5BT_encode` 与 `lhdcv5BT_free_handle` 的唯一回调 owner。只有两个 owner 都唯一命中时才用原子指针替换包裹 encode / free 调用，从真实 encode 路径捕获活动 handle，再调用 `lhdcv5BT_set_target_bitrate_inx` 调整码率、通过 `lhdcv5BT_get_bitrate` 回读。它不会修改 loader entry、relocation、GOT 或可执行页；候选为零或多于一个时直接停止安装。
