@@ -16,6 +16,13 @@
 
 模块主要服务于 ColorOS / OPlus 系设备上的 `com.oplus.melody`，同时配合 `com.android.bluetooth` 和 `com.oplus.wirelesssettings` 作用域完成更稳定的状态读取和写入。
 
+## 2.5.6 更新重点
+
+- 治理器关闭时，LHDC V5 音质优先在支持的系统上使用 10 ms 发送节奏，保持所选码率和采样率；实机起流记录确认 1000 kbps 未变。高负载无线环境下仍可能卡顿。
+- 改进「无线耳机」弹窗和菜单的动态定位，并恢复 LE Audio 原生 COUI 底部确认框样式。
+- 手动切换到音质优先前增加风险确认；已有音质优先记忆的用户升级后首次进入耳机页会收到一次提醒，不改动已恢复设置。
+- 完整中英文发布说明见 [2.5.6 发布说明](docs/releases/2.5.6.md)。新增弹窗仍需升级后实机复核。
+
 ## 2.5.5 更新重点
 
 - 修复 ColorOS 17 在每次加载 LHDC 编码器时重写 dlsym 函数表，导致模块只安装一次的编码器 Hook 被覆盖，进而出现 `streaming=false`、`actualBitrateKbps=0`、`queue=-1`，码率保护无法下发的问题。
