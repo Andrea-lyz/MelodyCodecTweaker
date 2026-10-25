@@ -426,6 +426,7 @@ public final class SystemHookInstaller {
                                 "governor", false,
                                 "pacing", false,
                                 "platformProtection", false,
+                                "fastSwitchPatch", false,
                                 "unlockPatch", true);
                     }
                     MLog.setDiagnosticContext(appContext, "bluetooth");

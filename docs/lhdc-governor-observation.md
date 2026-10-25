@@ -20,7 +20,7 @@
 
 ## 仅解锁诊断版（临时）
 
-`-PunlockOnlyDiagnostic=true` 构建会跳过 `installGovernor()`：不安装编码器捕获与 10 ms 节奏包装，不写 target cap；`schedulePlatformProtectionPoll()` 直接返回，900 兼容保护不运行；诊断页把治理器开关锁定为关闭。码率 branch 补丁与快切等价补丁照常应用，音质/采样率写入与耳机记忆保留，BQR、队列与耳机卡顿仍只读记录。
+`-PunlockOnlyDiagnostic=true` 构建会跳过 `installGovernor()`：不安装编码器捕获与 10 ms 节奏包装，不写 target cap；`schedulePlatformProtectionPoll()` 直接返回，900 兼容保护不运行；诊断页把治理器开关锁定为关闭。快切等价补丁整体跳过（不扫描、不写入），只保留码率 branch 补丁，音质/采样率写入与耳机记忆保留，BQR、队列与耳机卡顿仍只读记录。
 
 这个版本用于区分「模块治理介入导致的卡顿」与「解锁 192 kHz + 固定 1000 kbps 后链路本身不稳」，不代表正式功能，也不改变稳定版行为。
 

@@ -187,8 +187,9 @@ public final class NativeLhdcMemoryPatch {
     /**
      * Diagnostic build that keeps only the codec unlock (fixed 1000 / 192 kHz capability) and
      * drops every link-governance path: no encoder capture, no 10 ms pacing wrapper, no
-     * target-cap writes and no 900 kbps platform fallback. It exists to separate module
-     * influence from the raw link behaviour at the unlocked bitrate.
+     * target-cap writes, no 900 kbps platform fallback, and no fast-switch equality patch.
+     * It exists to separate module influence from the raw link behaviour at the unlocked
+     * bitrate.
      */
     static final boolean UNLOCK_ONLY_DIAGNOSTIC = BuildConfig.UNLOCK_ONLY_DIAGNOSTIC;
 
@@ -337,6 +338,14 @@ public final class NativeLhdcMemoryPatch {
     }
 
     static synchronized PatchResult applyQualitySwitchGuard() {
+        if (UNLOCK_ONLY_DIAGNOSTIC) {
+            // Keep the diagnostic build to the bitrate unlock only: the fast-switch equality
+            // patch is not scanned or written at all. ColorOS 17 already dispatches LHDC V5
+            // equality natively, and this build must not add any other memory write.
+            PatchResult skipped = PatchResult.notRequired("diagnostic_unlock_only");
+            lastQualitySwitchResult = skipped;
+            return skipped;
+        }
         if (BuildConfig.DEBUG && BuildConfig.TOAST_TEST_BLOCK_FAST_SWITCH) {
             PatchResult blocked = PatchResult.unsupported(0, 0);
             lastQualitySwitchResult = blocked;
