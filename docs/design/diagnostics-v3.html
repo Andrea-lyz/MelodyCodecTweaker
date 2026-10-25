@@ -1267,30 +1267,36 @@
       setKpi('bqr-choppy-capability', '未知', 'idle');
       byId('bqr-evidence').textContent =
         '等待有效 BQR 样本。';
-      byId('bqr-ceiling').textContent = '当前上限 —';
+      byId('bqr-ceiling').textContent = '治理目标 —';
       renderBoundary('boundary-500-900', 'unknown');
       renderBoundary('boundary-900-1000', 'unknown');
     } else {
       const age = Math.max(0, Date.now() - number(latest.time));
       const streaming = !!latest.streaming;
+      const monitorOnly = latest.encoderState === 'monitor_only';
+      const controlUnavailable = latest.encoderControlAvailable === false;
+      const platformPlaying = latest.platformPlayback === 'playing';
       setPill(activity,
-        age > 20000 ? 'warn' : (streaming ? 'ok' : 'idle'),
-        age > 20000 ? '等待新样本' : (streaming ? '活动' : '已暂停'),
+        age > 20000 || monitorOnly ? 'warn' : (streaming ? 'ok' : 'idle'),
+        age > 20000 ? '等待新样本' : monitorOnly ? '仅监测'
+          : streaming ? '活动' : platformPlaying ? '等待编码器'
+          : latest.platformPlayback === 'idle' ? '已暂停' : '播放状态未知',
         age <= 20000 && streaming);
       const retx = number(latest.retransmissionsPerSec, NaN);
       const norx = number(latest.noRxPerSec, NaN);
       const unused = number(latest.unusedAfh, 0);
       const usable = number(latest.usableAfh, 0);
-      const queue = Math.max(0, number(latest.queue, 0));
-      const queueCapacity = Math.max(1, number(latest.queueCapacity, 45));
+      const queue = number(latest.queue, -1);
+      const queueCapacity = number(latest.queueCapacity, 0);
+      const queueKnown = queue >= 0 && queueCapacity > 0 && !controlUnavailable;
       const choppyCapability = latest.choppyCapabilityState || 'UNKNOWN';
       setKpi('bqr-retx', fmtRate(retx), !Number.isFinite(retx) ? 'idle' : retx <= 30 ? 'good' : retx <= 60 ? 'warn' : 'bad');
       setKpi('bqr-norx', fmtRate(norx), !Number.isFinite(norx) ? 'idle' : norx <= 30 ? 'good' : norx <= 60 ? 'warn' : 'bad');
       setKpi('bqr-unused-afh', unused + ' / 79', unused <= 22 ? 'good' : unused <= 49 ? 'warn' : 'bad');
       setKpi('bqr-usable-afh', usable + ' / 79', usable >= 30 ? 'good' : usable >= 20 ? 'warn' : 'bad');
-      const queueRatio = queue / queueCapacity;
-      setKpi('bqr-queue', queue + ' / ' + queueCapacity,
-        queueRatio >= 1 ? 'bad' : queueRatio >= 0.9 ? 'warn' : 'good');
+      const queueRatio = queueKnown ? queue / queueCapacity : NaN;
+      setKpi('bqr-queue', queueKnown ? queue + ' / ' + queueCapacity : '—',
+        !queueKnown ? 'idle' : queueRatio >= 1 ? 'bad' : queueRatio >= 0.9 ? 'warn' : 'good');
       setKpi('bqr-choppy-capability',
         choppyCapability === 'OBSERVED' ? '已观察到' : '未知',
         choppyCapability === 'OBSERVED' ? 'good' : 'idle');
@@ -1332,8 +1338,10 @@
           countdownText = '等待健康证据';
         }
         byId('bqr-evidence').textContent =
-          sourceText + '降档已生效，当前上限 ' + activeCapKbps
-          + ' kbps；' + countdownText + '。';
+          sourceText + '目标 ' + activeCapKbps + ' kbps；'
+          + (number(latest.actualBitrateKbps, 0) > 0
+              ? '实际码率 ' + number(latest.actualBitrateKbps) + ' kbps；'
+              : '实际码率尚未确认；') + countdownText + '。';
       } else if (retx > 60 || norx > 60 || unused > 49 || queueRatio >= 0.9) {
         byId('bqr-evidence').textContent =
           '链路压力较高，尚无保护降档证据；RF-only 不会触发强制降档。';
@@ -1365,7 +1373,7 @@
       const displayCeiling = peerCeiling > 0
         ? Math.min(effectiveCeiling, peerCeiling) : effectiveCeiling;
       byId('bqr-ceiling').textContent =
-        '当前上限 ' + displayCeiling + ' kbps · ' + phaseLabel;
+        '治理目标 ' + displayCeiling + ' kbps · ' + phaseLabel;
 
       const lowerLocked = !!latest.lock500to900;
       const upperLocked = !!latest.lock900to1000;
@@ -1387,7 +1395,7 @@
       } else if (activeCapKbps === 400) {
         lowerState = 'blocked';           // must recover 400->500 first
       } else {
-        lowerState = 'restored';          // ceiling >= 900: the 900 tier is already there
+        lowerState = number(latest.actualBitrateKbps, 0) >= 900 ? 'restored' : 'unknown';
       }
       // 900 -> 1000 bar = status of the 1000 tier (first match wins).
       let upperState;
@@ -1403,7 +1411,7 @@
       } else if (probing1000) {
         upperState = probeState;          // probe toward 1000 in flight
       } else if (peerKnown && upperSupported) {
-        upperState = 'restored';          // ceiling >= 1000: the 1000 tier is already there
+        upperState = number(latest.actualBitrateKbps, 0) >= 1000 ? 'restored' : 'unknown';
       } else {
         upperState = 'unknown';
       }
@@ -1414,6 +1422,16 @@
         lowerState === 'recovering' ? barProgress : null);
       renderBoundary('boundary-900-1000', upperState,
         upperState === 'recovering' ? barProgress : null);
+      if (controlUnavailable || latest.governorEffective === false) {
+        byId('bqr-ceiling').textContent = controlUnavailable
+          ? '实际码率未知 · 治理未生效' : '码率治理未开启';
+        byId('bqr-evidence').textContent = monitorOnly
+          ? '当前音频路径暂不支持码率治理，仅记录链路状态。播放不稳时请降低播放质量。'
+          : controlUnavailable ? '等待可用的编码器数据，暂不执行码率治理。'
+          : '当前仅记录链路状态，不执行码率治理。';
+        renderBoundary('boundary-500-900', 'unknown');
+        renderBoundary('boundary-900-1000', 'unknown');
+      }
     }
     renderReasons(data.reasonCounts || {}, data.reasonTimes || {});
     renderHistory(data.history || []);

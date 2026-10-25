@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      test_version:
+        description: Optional prerelease versionName, e.g. 2.5.7-offload-test1
+        required: false
+        type: string
 
 jobs:
   build:
@@ -34,6 +39,28 @@ jobs:
 
       - name: Generate Gradle Wrapper
         run: gradle wrapper --gradle-version 8.13
+
+      - name: Apply optional test version
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_version != '' }}
+        env:
+          TEST_VERSION: ${{ inputs.test_version }}
+        run: |
+          python3 <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          version = os.environ["TEST_VERSION"].strip()
+          if not re.fullmatch(r"\d+\.\d+\.\d+-[0-9A-Za-z][0-9A-Za-z.-]*", version):
+              raise SystemExit("Test version must include a prerelease suffix")
+          path = Path("app/build.gradle.kts")
+          text = path.read_text(encoding="utf-8")
+          code = int(re.search(r"versionCode\s*=\s*(\d+)", text).group(1)) + 1
+          text = re.sub(r"versionCode\s*=\s*\d+", f"versionCode = {code}", text, count=1)
+          text = re.sub(r'versionName\s*=\s*"[^"]+"', f'versionName = "{version}"', text, count=1)
+          path.write_text(text, encoding="utf-8")
+          print(f"Test APK: {version} ({code})")
+          PY
 
       - name: Build Release APK
         run: ./gradlew :app:assembleRelease

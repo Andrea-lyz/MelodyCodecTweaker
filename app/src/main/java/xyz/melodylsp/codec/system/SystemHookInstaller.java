@@ -1,6 +1,7 @@
 package xyz.melodylsp.codec.system;
 
 import android.app.Application;
+import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothProfile;
 import android.content.BroadcastReceiver;
@@ -111,6 +112,11 @@ public final class SystemHookInstaller {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private CodecBridgeService bridgeService;
     private volatile Object a2dpServiceInstance;
+    private volatile Method a2dpPlayingMethod;
+    private String cachedPlayingMac;
+    private long cachedPlayingQueryMs;
+    private Boolean cachedA2dpPlaying;
+    private boolean playingQueryFailureLogged;
     private CodecBroadcastBridge codecBroadcastBridge;
     private BluetoothLeAudioBridge leAudioBridge;
     private volatile GameLeaController gameLeaController;
@@ -144,6 +150,8 @@ public final class SystemHookInstaller {
     private boolean smartAudioQueueSampleScheduled;
     private int smartAudioQueueSampleFailures;
     private final LhdcLinkHealthController linkHealthController;
+    private volatile boolean governorExperimentalEnabled;
+    private String lastEncoderDiagnosticState;
     private volatile String activeLhdcMac;
     private String lastBqrDiagnosticState;
     private long lastBqrDiagnosticMs;
@@ -398,6 +406,7 @@ public final class SystemHookInstaller {
                     // Experimental governor switch: mirror the module preference so the
                     // runtime flag matches the UI (default OFF in production builds).
                     boolean governorEnabled = readGovernorExperimentalEnabled(appContext);
+                    governorExperimentalEnabled = governorEnabled;
                     NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(governorEnabled);
                     linkHealthController.setGovernorEnabled(
                             governorEnabled, SystemClock.elapsedRealtime());
@@ -457,6 +466,7 @@ public final class SystemHookInstaller {
                     boolean govEnabled = intent.getBooleanExtra(
                             CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, false);
                     persistGovernorExperimentalEnabled(appContext, govEnabled);
+                    governorExperimentalEnabled = govEnabled;
                     NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(govEnabled);
                     linkHealthController.setGovernorEnabled(
                             govEnabled, SystemClock.elapsedRealtime());
@@ -560,6 +570,13 @@ public final class SystemHookInstaller {
         // The policy may have changed since the controller callback was queued. Native only
         // consumes targets in QUALITY; never label an observe-only cache update as applied.
         if (!NativeLhdcMemoryPatch.shouldSampleQueue()) return;
+        if (!NativeLhdcMemoryPatch.isGovernorStreaming()) {
+            // Retire an old software cap without inventing a hardware bitrate transaction.
+            NativeLhdcMemoryPatch.setGovernorProbeCeilingKbpsQuiet(ceilingKbps);
+            MLog.event("lhdc.link.probe_state", "mac", redactMac(mac),
+                    "ceilingKbps", ceilingKbps, "reason", reason, "action", "cache_only");
+            return;
+        }
         int requestId = NativeLhdcMemoryPatch.setGovernorProbeCeilingKbps(ceilingKbps);
         // Phase N-1 requestId transaction: register the issued Target_Cap so native
         // confirmations with the same requestId close the switch and timeouts fall back
@@ -665,6 +682,12 @@ public final class SystemHookInstaller {
             payload.put("kind", kind == null ? "state" : kind);
             payload.put("mac", redactMac(mac));
             payload.put("streaming", NativeLhdcMemoryPatch.isGovernorStreaming());
+            payload.put("encoderControlAvailable", snapshot.encoderControlAvailable);
+            payload.put("encoderState", snapshot.encoderState);
+            payload.put("platformPlayback", snapshot.platformPlayback);
+            payload.put("governorEffective", governorExperimentalEnabled
+                    && NativeLhdcMemoryPatch.isQualityPolicySelected()
+                    && snapshot.encoderControlAvailable);
             payload.put("governorInstalled", NativeLhdcMemoryPatch.isGovernorInstalled());
             payload.put("governorInstallResult",
                     NativeLhdcMemoryPatch.lastGovernorInstallResult());
@@ -908,6 +931,8 @@ public final class SystemHookInstaller {
         }
         if (a2dpService == null) return;
         a2dpServiceInstance = a2dpService;
+        a2dpPlayingMethod = findMethod(a2dpService.getClass(),
+                "isA2dpPlaying", BluetoothDevice.class);
         try {
             if (bridgeService == null) {
                 bridgeService = new CodecBridgeService(a2dpService);
@@ -1342,6 +1367,7 @@ public final class SystemHookInstaller {
             }
             linkHealthController.activate(mac, capturedAtMs);
         }
+        updateEncoderObservation(mac, capturedAtMs);
         boolean streaming = NativeLhdcMemoryPatch.isGovernorStreaming();
         linkHealthController.onBqrSample(mac, sample, capturedAtMs, streaming);
         LhdcLinkHealthController.Snapshot snapshot =
@@ -1365,6 +1391,12 @@ public final class SystemHookInstaller {
                 "overflow", sample.overflowCount,
                 "underflow", sample.underflowCount,
                 "streaming", streaming,
+                "encoderControlAvailable", snapshot.encoderControlAvailable,
+                "encoderState", snapshot.encoderState,
+                "platformPlayback", snapshot.platformPlayback,
+                "governorEffective", governorExperimentalEnabled
+                        && NativeLhdcMemoryPatch.isQualityPolicySelected()
+                        && snapshot.encoderControlAvailable,
                 "actualBitrateKbps", actualBitrateKbps,
                 "requestedBitrateKbps", requestedBitrateKbps,
                 "bitrateVerification", bitrateVerification,
@@ -1412,7 +1444,8 @@ public final class SystemHookInstaller {
                 + snapshot.probeBadBqrWindows + '|' + snapshot.streamSessionId + '|'
                 + snapshot.peerCeilingKbps + '|' + sample.overflowCount + '|'
                 + sample.underflowCount + '|' + snapshot.shadowUnstableWindows + '|'
-                + snapshot.shadowCandidateCount + '|' + snapshot.choppyCapabilityState;
+                + snapshot.shadowCandidateCount + '|' + snapshot.choppyCapabilityState + '|'
+                + snapshot.encoderState + '|' + governorExperimentalEnabled;
         if (!diagnosticState.equals(lastBqrDiagnosticState)
                 || capturedAtMs - lastBqrDiagnosticMs >= BQR_DIAGNOSTIC_INTERVAL_MS) {
             lastBqrDiagnosticState = diagnosticState;
@@ -1444,6 +1477,52 @@ public final class SystemHookInstaller {
 
     private static String rateText(double value) {
         return Double.isNaN(value) ? "?" : String.format(Locale.ROOT, "%.1f", value);
+    }
+
+    private void updateEncoderObservation(String mac, long nowMs) {
+        if (mac == null) return;
+        linkHealthController.onEncoderObservation(mac,
+                NativeLhdcMemoryPatch.isGovernorStreaming(), queryA2dpPlaying(mac, nowMs), nowMs);
+        LhdcLinkHealthController.Snapshot snapshot = linkHealthController.snapshot(mac, nowMs);
+        boolean effective = governorExperimentalEnabled
+                && NativeLhdcMemoryPatch.isQualityPolicySelected()
+                && snapshot.encoderControlAvailable;
+        String signature = mac + '|' + snapshot.encoderState + '|'
+                + snapshot.platformPlayback + '|' + effective;
+        if (!signature.equals(lastEncoderDiagnosticState)) {
+            lastEncoderDiagnosticState = signature;
+            MLog.event("lhdc.link.control_state", "mac", redactMac(mac),
+                    "encoderControlAvailable", snapshot.encoderControlAvailable,
+                    "encoderState", snapshot.encoderState,
+                    "platformPlayback", snapshot.platformPlayback,
+                    "governorEffective", effective);
+        }
+    }
+
+    private Boolean queryA2dpPlaying(String mac, long nowMs) {
+        if (mac.equals(cachedPlayingMac) && nowMs >= cachedPlayingQueryMs
+                && nowMs - cachedPlayingQueryMs < LHDC_QUEUE_IDLE_INTERVAL_MS) {
+            return cachedA2dpPlaying;
+        }
+        cachedPlayingMac = mac;
+        cachedPlayingQueryMs = nowMs;
+        cachedA2dpPlaying = null;
+        Object service = a2dpServiceInstance;
+        Method method = a2dpPlayingMethod;
+        if (service == null || method == null) return null;
+        try {
+            BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+            if (adapter != null) {
+                Object result = method.invoke(service, adapter.getRemoteDevice(mac));
+                if (result instanceof Boolean) cachedA2dpPlaying = (Boolean) result;
+            }
+        } catch (Throwable t) {
+            if (!playingQueryFailureLogged) {
+                playingQueryFailureLogged = true;
+                MLog.w("A2DP playback query unavailable; encoder route remains unknown", t);
+            }
+        }
+        return cachedA2dpPlaying;
     }
 
     private void hookRemoteChoppyReport() {
@@ -1491,6 +1570,8 @@ public final class SystemHookInstaller {
                                 mainHandler.post(() -> {
                                     linkHealthController.setQualityPolicyActive(
                                             NativeLhdcMemoryPatch.shouldSampleQueue(), nowMs);
+                                    updateEncoderObservation(attribution.mac,
+                                            SystemClock.elapsedRealtime());
                                     linkHealthController.onRemoteChoppyReport(
                                             attribution.mac, level, nowMs);
                                     LhdcLinkHealthController.Snapshot snapshot =
@@ -1698,6 +1779,7 @@ public final class SystemHookInstaller {
             method = smartAudioQueueLengthMethod;
         }
         long nextDelay = LHDC_QUEUE_IDLE_INTERVAL_MS;
+        updateEncoderObservation(activeLhdcMac, SystemClock.elapsedRealtime());
         if (instance != null && method != null && NativeLhdcMemoryPatch.shouldSampleQueue()) {
             nextDelay = LHDC_QUEUE_SAMPLE_INTERVAL_MS;
             try {
