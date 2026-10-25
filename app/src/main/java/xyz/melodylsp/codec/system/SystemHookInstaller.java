@@ -43,6 +43,7 @@ import dalvik.system.DexFile;
 import xyz.melodylsp.codec.MelodyCodecLspEntry;
 import xyz.melodylsp.codec.BuildConfig;
 import xyz.melodylsp.codec.bridge.CodecIpc;
+import xyz.melodylsp.codec.bridge.CodecRequest;
 import xyz.melodylsp.codec.bridge.CodecSnapshot;
 import xyz.melodylsp.codec.bridge.GameModeCodecPolicy;
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
@@ -113,6 +114,12 @@ public final class SystemHookInstaller {
     private CodecBridgeService bridgeService;
     private volatile Object a2dpServiceInstance;
     private volatile Method a2dpPlayingMethod;
+    private volatile Method a2dpActiveDevicesMethod;
+    private final LhdcPlatformProtection platformProtection = new LhdcPlatformProtection();
+    private final ThreadLocal<Boolean> platformCodecWrite = new ThreadLocal<>();
+    private boolean platformUserWriteHookInstalled;
+    private boolean platformProtectionPollScheduled;
+    private String lastPlatformProtectionState;
     private String cachedPlayingMac;
     private long cachedPlayingQueryMs;
     private Boolean cachedA2dpPlaying;
@@ -294,6 +301,7 @@ public final class SystemHookInstaller {
         hookConstructors(a2dpCls);
         hookLifecycle(a2dpCls);
         hookCodecConfigUpdated(a2dpCls);
+        hookPlatformCodecWrites(a2dpCls);
         hookNativeCodecPreferenceLogger();
         hookGameLatencyExtensionReady();
         hookSmartAudioQueueSampler();
@@ -470,6 +478,7 @@ public final class SystemHookInstaller {
                     NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(govEnabled);
                     linkHealthController.setGovernorEnabled(
                             govEnabled, SystemClock.elapsedRealtime());
+                    schedulePlatformProtectionPoll();
                     MLog.eventLogOnly("lhdc.governor.experimental", "enabled", govEnabled);
                 }
             }
@@ -685,6 +694,11 @@ public final class SystemHookInstaller {
             payload.put("encoderControlAvailable", snapshot.encoderControlAvailable);
             payload.put("encoderState", snapshot.encoderState);
             payload.put("platformPlayback", snapshot.platformPlayback);
+            payload.put("platformProtectionState", platformProtection.phase(mac));
+            payload.put("platformProtectionAvailable", platformProtection.available(mac));
+            payload.put("platformProtectionConfirmed", platformProtection.confirmed(mac));
+            payload.put("platformConfiguredBitrateKbps",
+                    platformProtection.confirmed(mac) ? 900 : 0);
             payload.put("governorEffective", governorExperimentalEnabled
                     && NativeLhdcMemoryPatch.isQualityPolicySelected()
                     && snapshot.encoderControlAvailable);
@@ -933,9 +947,11 @@ public final class SystemHookInstaller {
         a2dpServiceInstance = a2dpService;
         a2dpPlayingMethod = findMethod(a2dpService.getClass(),
                 "isA2dpPlaying", BluetoothDevice.class);
+        a2dpActiveDevicesMethod = findMethod(a2dpService.getClass(), "getActiveDevices");
         try {
             if (bridgeService == null) {
                 bridgeService = new CodecBridgeService(a2dpService);
+                bridgeService.setSnapshotDecorator(platformProtection::annotate);
             }
             if (context != null) {
                 ensureCodecBroadcastBridge(context, bridgeService);
@@ -1086,6 +1102,8 @@ public final class SystemHookInstaller {
         String normalizedMac = normalizeMac(mac);
         if (normalizedMac == null) return;
         mainHandler.post(() -> {
+            if ("codec_write".equals(reason)) platformProtection.onUserWrite(normalizedMac);
+            schedulePlatformProtectionPoll();
             linkHealthController.setQualityPolicyActive(
                     NativeLhdcMemoryPatch.shouldSampleQueue(), SystemClock.elapsedRealtime());
             if (ceilingKbps > 0) {
@@ -1197,7 +1215,7 @@ public final class SystemHookInstaller {
 
     private static int peerCeilingFromSnapshot(CodecSnapshot snapshot) {
         if (snapshot == null) return 0;
-        long lowByte = snapshot.activeCodecSpecific1 & 0xFFL;
+        long lowByte = snapshot.selectionCodecSpecific1() & 0xFFL;
         if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_900) return 900;
         if (lowByte == CodecLabelTable.LHDC_QUALITY_FIXED_1000) return 1000;
         return 0;
@@ -1206,6 +1224,7 @@ public final class SystemHookInstaller {
     private void resetLhdcLinkState(String mac, String reason) {
         String key = normalizeMac(mac);
         if (key == null) return;
+        platformProtection.onUserWrite(key);
         boolean nativeSessionActive = key.equals(activeLhdcMac);
         boolean controllerWasActive = linkHealthController.resetDevice(
                 key, SystemClock.elapsedRealtime(), reason);
@@ -1368,6 +1387,7 @@ public final class SystemHookInstaller {
             linkHealthController.activate(mac, capturedAtMs);
         }
         updateEncoderObservation(mac, capturedAtMs);
+        schedulePlatformProtectionPoll();
         boolean streaming = NativeLhdcMemoryPatch.isGovernorStreaming();
         linkHealthController.onBqrSample(mac, sample, capturedAtMs, streaming);
         LhdcLinkHealthController.Snapshot snapshot =
@@ -1394,6 +1414,10 @@ public final class SystemHookInstaller {
                 "encoderControlAvailable", snapshot.encoderControlAvailable,
                 "encoderState", snapshot.encoderState,
                 "platformPlayback", snapshot.platformPlayback,
+                "platformProtectionState", platformProtection.phase(mac),
+                "platformProtectionAvailable", platformProtection.available(mac),
+                "platformProtectionConfirmed", platformProtection.confirmed(mac),
+                "platformConfiguredBitrateKbps", platformProtection.confirmed(mac) ? 900 : 0,
                 "governorEffective", governorExperimentalEnabled
                         && NativeLhdcMemoryPatch.isQualityPolicySelected()
                         && snapshot.encoderControlAvailable,
@@ -1499,6 +1523,124 @@ public final class SystemHookInstaller {
         }
     }
 
+    private void hookPlatformCodecWrites(Class<?> a2dpClass) {
+        try {
+            Class<?> config = Class.forName("android.bluetooth.BluetoothCodecConfig", false,
+                    classLoader);
+            Method method = a2dpClass.getMethod("setCodecConfigPreference",
+                    BluetoothDevice.class, config);
+            module.hook(method).intercept(chain -> {
+                if (!Boolean.TRUE.equals(platformCodecWrite.get())) {
+                    Object[] args = chain.getArgs().toArray();
+                    String mac = args.length > 0 ? macFromDeviceArg(args[0]) : null;
+                    platformProtection.onUserWrite(mac);
+                }
+                return chain.proceed();
+            });
+            platformUserWriteHookInstalled = true;
+            MLog.event("lhdc.platform.write_hook", "available", true);
+        } catch (Throwable t) {
+            MLog.w("LHDC platform user-write guard unavailable; protection disabled", t);
+        }
+    }
+
+    private void schedulePlatformProtectionPoll() {
+        if (platformProtectionPollScheduled) return;
+        platformProtectionPollScheduled = true;
+        mainHandler.postDelayed(this::pollPlatformProtection, 1_000L);
+    }
+
+    private boolean isPlatformDeviceActive(String mac) {
+        Object service = a2dpServiceInstance;
+        Method method = a2dpActiveDevicesMethod;
+        if (service == null || method == null || mac == null) return false;
+        try {
+            Object result = method.invoke(service);
+            if (result instanceof List) {
+                for (Object device : (List<?>) result) {
+                    if (mac.equals(normalizeMac(macFromDeviceArg(device)))) return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private void pollPlatformProtection() {
+        platformProtectionPollScheduled = false;
+        String mac = normalizeMac(activeLhdcMac);
+        CodecBridgeService bridge = bridgeService;
+        if (mac == null || bridge == null) return;
+        boolean selected = NativeLhdcMemoryPatch.isQualityPolicySelected();
+        boolean enabled = governorExperimentalEnabled;
+        boolean software = NativeLhdcMemoryPatch.isGovernorStreaming();
+        boolean active = isPlatformDeviceActive(mac);
+        if (!active) platformProtection.onInactive(mac);
+        if (active && (!software || platformProtection.hasOverride(mac))) {
+            CodecSnapshot live = bridge.getStatusUnchecked(mac);
+            if (live != null) {
+                long nowMs = SystemClock.elapsedRealtime();
+                LhdcPlatformProtection.Decision decision = platformProtection.observe(
+                        live, selected, enabled, software, queryA2dpPlaying(mac, nowMs),
+                        platformUserWriteHookInstalled, nowMs);
+                if (decision != null) submitPlatformProtection(decision);
+                String phase = platformProtection.phase(mac);
+                String signature = mac + '|' + phase + '|'
+                        + platformProtection.available(mac) + '|'
+                        + platformProtection.confirmed(mac) + '|' + live.activeCodecSpecific1;
+                if (!signature.equals(lastPlatformProtectionState)) {
+                    lastPlatformProtectionState = signature;
+                    MLog.event("lhdc.platform.state", "mac", redactMac(mac),
+                            "platformProtectionState", phase,
+                            "platformProtectionAvailable", platformProtection.available(mac),
+                            "platformProtectionConfirmed", platformProtection.confirmed(mac),
+                            "configuredSpecific1", live.activeCodecSpecific1,
+                            "selectedSpecific1", live.selectionCodecSpecific1(),
+                            "actualBitrateKbps", 0,
+                            "bitrateVerification", "codec_config_only");
+                    sendLhdcDiagnosticLiveState(mac, linkHealthController.snapshot(mac, nowMs),
+                            "platform_" + phase, "state");
+                }
+            } else {
+                platformProtection.onInactive(mac);
+            }
+        } else if (software && !platformProtection.hasOverride(mac)) {
+            platformProtection.onUserWrite(mac);
+        }
+        if ((enabled && selected) || platformProtection.hasOverride(mac)) {
+            schedulePlatformProtectionPoll();
+        }
+    }
+
+    private void submitPlatformProtection(LhdcPlatformProtection.Decision decision) {
+        String mac = normalizeMac(decision.request.mac);
+        CodecBridgeService bridge = bridgeService;
+        boolean permitted = bridge != null && isPlatformDeviceActive(mac)
+                && mac != null && mac.equals(normalizeMac(activeLhdcMac))
+                && NativeLhdcMemoryPatch.isQualityPolicySelected()
+                && (decision.restoring || (governorExperimentalEnabled
+                && !NativeLhdcMemoryPatch.isGovernorStreaming()))
+                && platformProtection.isPending(mac, decision.id);
+        CodecSnapshot fresh = permitted ? bridge.getStatusUnchecked(mac) : null;
+        if (!LhdcPlatformProtection.sameConfig(decision.before, fresh)) {
+            platformProtection.onSubmission(mac, decision.id, false);
+            return;
+        }
+        int result;
+        platformCodecWrite.set(Boolean.TRUE);
+        try {
+            result = bridge.setCodecUnchecked(decision.request);
+        } finally {
+            platformCodecWrite.remove();
+        }
+        platformProtection.onSubmission(mac, decision.id, result == CodecRequest.RESULT_OK);
+        MLog.event("lhdc.platform.request", "mac", redactMac(mac), "requestId", decision.id,
+                "restoring", decision.restoring, "result", result,
+                "configuredSpecific1", decision.request.codecSpecific1,
+                "sampleRate", decision.request.sampleRate,
+                "actualBitrateKbps", 0, "bitrateVerification", "pending_codec_config");
+    }
+
     private Boolean queryA2dpPlaying(String mac, long nowMs) {
         if (mac.equals(cachedPlayingMac) && nowMs >= cachedPlayingQueryMs
                 && nowMs - cachedPlayingQueryMs < LHDC_QUEUE_IDLE_INTERVAL_MS) {
@@ -1572,6 +1714,8 @@ public final class SystemHookInstaller {
                                             NativeLhdcMemoryPatch.shouldSampleQueue(), nowMs);
                                     updateEncoderObservation(attribution.mac,
                                             SystemClock.elapsedRealtime());
+                                    platformProtection.onChoppy(attribution.mac, nowMs);
+                                    schedulePlatformProtectionPoll();
                                     linkHealthController.onRemoteChoppyReport(
                                             attribution.mac, level, nowMs);
                                     LhdcLinkHealthController.Snapshot snapshot =

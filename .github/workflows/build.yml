@@ -11,6 +11,10 @@ on:
         description: Optional prerelease versionName, e.g. 2.5.7-offload-test1
         required: false
         type: string
+      test_version_code:
+        description: Optional versionCode for the test build; must exceed the stable versionCode
+        required: false
+        type: string
 
 jobs:
   build:
@@ -44,6 +48,7 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.test_version != '' }}
         env:
           TEST_VERSION: ${{ inputs.test_version }}
+          TEST_VERSION_CODE: ${{ inputs.test_version_code }}
         run: |
           python3 <<'PY'
           import os
@@ -55,7 +60,16 @@ jobs:
               raise SystemExit("Test version must include a prerelease suffix")
           path = Path("app/build.gradle.kts")
           text = path.read_text(encoding="utf-8")
-          code = int(re.search(r"versionCode\s*=\s*(\d+)", text).group(1)) + 1
+          base_code = int(re.search(r"versionCode\s*=\s*(\d+)", text).group(1))
+          override = os.environ.get("TEST_VERSION_CODE", "").strip()
+          if override:
+              if not re.fullmatch(r"\d+", override) or int(override) <= base_code:
+                  raise SystemExit(
+                      f"test_version_code must be a whole number above the stable versionCode {base_code}"
+                  )
+              code = int(override)
+          else:
+              code = base_code + 1
           text = re.sub(r"versionCode\s*=\s*\d+", f"versionCode = {code}", text, count=1)
           text = re.sub(r'versionName\s*=\s*"[^"]+"', f'versionName = "{version}"', text, count=1)
           path.write_text(text, encoding="utf-8")

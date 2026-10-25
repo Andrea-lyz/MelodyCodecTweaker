@@ -3177,7 +3177,7 @@ public final class CodecController {
             }
             return;
         }
-        int policy = LhdcQualityPolicy.fromSpecific1(snapshot.activeCodecSpecific1);
+        int policy = LhdcQualityPolicy.fromSpecific1(snapshot.selectionCodecSpecific1());
         Integer previous = lhdcPoliciesByMac.put(mac, policy);
         if (previous == null || previous != policy) {
             MLog.event("lhdc.policy.session_synced",
@@ -3197,14 +3197,14 @@ public final class CodecController {
         PreferenceStore.RememberedValue remembered = prefs.readSnapshot(mac);
         if (remembered != null
                 && remembered.codecType == snapshot.activeCodecType
-                && remembered.codecSpecific1 == snapshot.activeCodecSpecific1
+                && remembered.codecSpecific1 == snapshot.selectionCodecSpecific1()
                 && remembered.sampleRate == snapshot.activeSampleRate) {
             return;
         }
         prefs.writeSnapshot(
                 mac,
                 snapshot.activeCodecType,
-                snapshot.activeCodecSpecific1,
+                snapshot.selectionCodecSpecific1(),
                 snapshot.activeSampleRate);
     }
 

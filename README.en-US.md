@@ -2,6 +2,10 @@
 
 # OPlus Headset Audio Helper
 
+## Development branch: LHDC platform protection
+
+With the governor enabled and no observable software encoder, repeated headset choppy reports can trigger one temporary 1000 → 900 kbps system configuration change. Disabling the governor restores the selected 1000 kbps. Sample rate and the remembered selection are preserved. Reconfiguration may briefly interrupt playback; configuration acknowledgement is not an actual hardware bitrate reading. Device validation is still required. See [conditions and limitations](docs/lhdc-governor-observation.md).
+
 [简体中文](README.md) · [English](README.en-US.md)
 
 <p align="center">

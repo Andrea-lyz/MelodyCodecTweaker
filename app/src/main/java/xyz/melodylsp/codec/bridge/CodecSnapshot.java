@@ -47,6 +47,26 @@ public final class CodecSnapshot implements Parcelable {
 
     public final long readTimestampMs;
 
+    /** Nonzero only for a module-owned temporary platform configuration override. */
+    private long governorSelectionSpecific1;
+
+    public long selectionCodecSpecific1() {
+        return governorSelectionSpecific1 != 0L
+                ? governorSelectionSpecific1 : activeCodecSpecific1;
+    }
+
+    public CodecSnapshot withGovernorSelection(long specific1) {
+        CodecSnapshot copy = new CodecSnapshot(mac, activeCodecType, activeSampleRate,
+                activeBitsPerSample, activeChannelMode, activeCodecSpecific1,
+                activeCodecSpecific2, activeCodecSpecific3, activeCodecSpecific4,
+                selectableCodecSpecific1, selectableSampleRateMask, selectableCodecTypes,
+                selectableCodecSampleRates, selectableCodecBitsPerSample,
+                selectableCodecChannelModes, selectableCodecSpecific1Values,
+                optionalCodecsSupported, optionalCodecsEnabled, readTimestampMs);
+        copy.governorSelectionSpecific1 = specific1;
+        return copy;
+    }
+
     public CodecSnapshot(
             String mac,
             int activeCodecType,
@@ -289,12 +309,14 @@ public final class CodecSnapshot implements Parcelable {
         dest.writeInt(optionalCodecsSupported);
         dest.writeInt(optionalCodecsEnabled);
         dest.writeLong(readTimestampMs);
+        dest.writeInt(0x4d43544f); // Optional MCT override extension; old snapshots have no trailer.
+        dest.writeLong(governorSelectionSpecific1);
     }
 
     public static final Creator<CodecSnapshot> CREATOR = new Creator<CodecSnapshot>() {
         @Override
         public CodecSnapshot createFromParcel(Parcel in) {
-            return new CodecSnapshot(
+            CodecSnapshot snapshot = new CodecSnapshot(
                     in.readString(),
                     in.readInt(),
                     in.readInt(),
@@ -314,6 +336,15 @@ public final class CodecSnapshot implements Parcelable {
                     in.readInt(),
                     in.readInt(),
                     in.readLong());
+            if (in.dataAvail() >= Integer.BYTES + Long.BYTES) {
+                int position = in.dataPosition();
+                if (in.readInt() == 0x4d43544f) {
+                    snapshot.governorSelectionSpecific1 = in.readLong();
+                } else {
+                    in.setDataPosition(position);
+                }
+            }
+            return snapshot;
         }
 
         @Override

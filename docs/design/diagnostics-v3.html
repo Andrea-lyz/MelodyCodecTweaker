@@ -1275,10 +1275,17 @@
       const streaming = !!latest.streaming;
       const monitorOnly = latest.encoderState === 'monitor_only';
       const controlUnavailable = latest.encoderControlAvailable === false;
+      const platformProtection = latest.platformProtectionAvailable === true;
+      const platformConfirmed = latest.platformProtectionConfirmed === true;
+      const platformPhase = latest.platformProtectionState || '';
+      const platformFailed = /_(timeout|rejected)$/.test(platformPhase);
       const platformPlaying = latest.platformPlayback === 'playing';
       setPill(activity,
         age > 20000 || monitorOnly ? 'warn' : (streaming ? 'ok' : 'idle'),
-        age > 20000 ? '等待新样本' : monitorOnly ? '仅监测'
+        age > 20000 ? '等待新样本' : platformProtection
+          ? platformFailed ? '兼容保护异常' : platformPhase === 'restoring_1000' ? '正在恢复'
+            : platformConfirmed ? '兼容保护' : platformPhase === 'pending_900' ? '正在切档' : '兼容保护待命'
+          : monitorOnly ? '仅监测'
           : streaming ? '活动' : platformPlaying ? '等待编码器'
           : latest.platformPlayback === 'idle' ? '已暂停' : '播放状态未知',
         age <= 20000 && streaming);
@@ -1429,6 +1436,20 @@
           ? '当前音频路径暂不支持码率治理，仅记录链路状态。播放不稳时请降低播放质量。'
           : controlUnavailable ? '等待可用的编码器数据，暂不执行码率治理。'
           : '当前仅记录链路状态，不执行码率治理。';
+        renderBoundary('boundary-500-900', 'unknown');
+        renderBoundary('boundary-900-1000', 'unknown');
+      }
+      if (platformProtection) {
+        byId('bqr-ceiling').textContent = platformFailed
+          ? '兼容保护未确认 · 实际码率未知'
+          : platformPhase === 'restoring_1000' ? '1000 kbps 配置确认中'
+            : platformConfirmed ? '系统配置 900 kbps · 实际码率未知'
+              : platformPhase === 'pending_900' ? '900 kbps 配置确认中' : '兼容保护待命 · 实际码率未知';
+        byId('bqr-evidence').textContent = platformFailed
+          ? '系统未确认切档结果。恢复失败时，请重新选择音质优先。'
+          : platformConfirmed
+            ? '临时保护配置已确认。关闭治理器后恢复所选 1000 kbps；切档可能短暂停顿。'
+            : '治理器开启时，持续卡顿可触发 900 kbps 兼容保护；切档可能短暂停顿。';
         renderBoundary('boundary-500-900', 'unknown');
         renderBoundary('boundary-900-1000', 'unknown');
       }

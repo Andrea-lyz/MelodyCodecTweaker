@@ -13,8 +13,9 @@ import xyz.melodylsp.codec.util.TrustedBroadcasts;
  * <p>Quality priority is transported as the real fixed 1000 kbps mode, so Android developer
  * options and the codec configuration remain truthful. The native governor captures the active
  * handle from the fixed-bitrate encoder path, then applies temporary congestion protection only
- * inside the encoder. Playback-time protection never calls {@code setCodecConfigPreference()} and
- * therefore does not rebuild the A2DP session.</p>
+ * inside the software encoder without rebuilding the A2DP session. The opt-in platform fallback
+ * may reconfigure 1000 to 900 when no software encoder is observable; its snapshots retain the
+ * original selection separately from the temporary transport configuration.</p>
  */
 public final class LhdcQualityPolicy {
 

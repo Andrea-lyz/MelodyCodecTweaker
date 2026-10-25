@@ -553,9 +553,11 @@ public final class DiagnosticEvents {
             mark(editor, "lhdc.link.bqr", "active", message, time);
         }
         if (message.contains("evt=lhdc.link.bqr_summary")
-                || message.contains("evt=lhdc.link.control_state")) {
+                || message.contains("evt=lhdc.link.control_state")
+                || message.contains("evt=lhdc.platform.state")) {
             mark(editor, "lhdc.link.governor",
-                    message.contains("governorEffective=true") ? "active"
+                    message.contains("governorEffective=true")
+                            || message.contains("platformProtectionConfirmed=true") ? "active"
                             : message.contains("encoderState=monitor_only") ? "attention" : "idle",
                     message, time);
         }

@@ -32,11 +32,17 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
 
     private final Object a2dpService;
     private final Class<?> a2dpClass;
+    private volatile java.util.function.UnaryOperator<CodecSnapshot> snapshotDecorator =
+            snapshot -> snapshot;
     private final RemoteCallbackList<ICodecBridgeListener> listeners = new RemoteCallbackList<>();
 
     public CodecBridgeService(Object a2dpService) {
         this.a2dpService = a2dpService;
         this.a2dpClass = a2dpService.getClass();
+    }
+
+    void setSnapshotDecorator(java.util.function.UnaryOperator<CodecSnapshot> decorator) {
+        snapshotDecorator = decorator;
     }
 
     public void registerToServiceManager() throws Exception {
@@ -63,7 +69,7 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
             Method m = a2dpClass.getMethod("getCodecStatus", BluetoothDevice.class);
             Object status = m.invoke(a2dpService, device);
             if (status == null) return null;
-            return decode(mac, status);
+            return snapshotDecorator.apply(decode(mac, status));
         } catch (Throwable t) {
             MLog.w("bridge.getStatus failed", t);
             return null;
@@ -150,7 +156,7 @@ public final class CodecBridgeService extends ICodecBridge.Stub {
         if (device == null || status == null) return null;
         CodecSnapshot snapshot;
         try {
-            snapshot = decode(device.getAddress(), status);
+            snapshot = snapshotDecorator.apply(decode(device.getAddress(), status));
         } catch (Throwable t) {
             MLog.w("notifyCodecChanged decode failed", t);
             return null;
