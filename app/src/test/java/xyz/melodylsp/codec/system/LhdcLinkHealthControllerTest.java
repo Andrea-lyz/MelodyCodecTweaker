@@ -19,7 +19,112 @@ public final class LhdcLinkHealthControllerTest {
             LhdcLinkHealthController.Listener listener) {
         LhdcLinkHealthController controller = new LhdcLinkHealthController(listener);
         controller.setQualityPolicyActive(true, 0L);
+        controller.onEncoderObservation(MAC, true, Boolean.TRUE, 0L);
         return controller;
+    }
+
+    @Test
+    public void playingWithoutSoftwareEncoderCannotCreatePhantom900Cap() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = qualityController(recorder);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 100L);
+        controller.activate(MAC, 100L);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 8_100L);
+        for (int i = 0; i < 10; i++) {
+            long now = 20_000L + i * 6_000L;
+            controller.onBqrSample(MAC, bqrFallbackBad(), now, false);
+            controller.onRemoteChoppyReport(MAC, 1, now);
+        }
+        LhdcLinkHealthController.Snapshot state = controller.snapshot(MAC, 80_000L);
+        assertFalse(state.encoderControlAvailable);
+        assertEquals("monitor_only", state.encoderState);
+        assertEquals("playing", state.platformPlayback);
+        assertEquals(1000, state.ceilingKbps);
+        assertEquals(0, state.leakyFallbackCapKbps);
+        assertEquals(0, state.bqrFallbackCapKbps);
+        assertEquals(1, state.lastRemoteChoppyLevel);
+        assertTrue(state.retransmissionsPerSecond > 30);
+        assertTrue(recorder.events.stream().noneMatch(e -> e.startsWith("900:")));
+    }
+
+    @Test
+    public void confirmedUnobservedRouteRetiresCapsAndTransactionsKeepsPeerCeiling() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = qualityController(recorder);
+        controller.activate(MAC, 100L);
+        controller.setPeerCeilingKbps(MAC, 900, 200L, "codec_confirmed");
+        controller.setBqrFallbackCapKbpsForTest(MAC, 500, 20_000L);
+        controller.onTargetCapIssued(MAC, 500, 7, 20_000L);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 30_000L);
+        assertEquals(500, controller.snapshot(MAC, 30_000L).ceilingKbps);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 38_000L);
+        LhdcLinkHealthController.Snapshot state = controller.snapshot(MAC, 38_000L);
+        assertEquals(900, state.ceilingKbps);
+        assertEquals(900, state.peerCeilingKbps);
+        assertEquals(0, state.bqrFallbackCapKbps);
+        assertEquals(0, state.leakyFallbackCapKbps);
+        assertEquals("monitor_only", state.encoderState);
+        assertTrue(recorder.events.contains("900:encoder_unobserved"));
+        controller.onTransitionConfirmed(MAC, 500, 7, 39_000L);
+        controller.onEncoderObservation(MAC, true, Boolean.TRUE, 40_000L);
+        assertNull(controller.tickSwitchTransactions(MAC, 50_000L));
+    }
+
+    @Test
+    public void ordinaryPausePreservesLearnedBoundaryAndCap() {
+        LhdcLinkHealthController controller = qualityController(null);
+        controller.activate(MAC, 100L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                900, 1000, 20_000L);
+        controller.onGovernorEvent(MAC, LhdcLinkHealthController.EVENT_QUICK_FAILURE,
+                900, 1000, 21_000L);
+        assertTrue(controller.snapshot(MAC, 21_000L).boundary900To1000Locked);
+        controller.onEncoderObservation(MAC, false, Boolean.FALSE, 30_000L);
+        controller.onEncoderObservation(MAC, false, Boolean.FALSE, 90_000L);
+        assertEquals("waiting", controller.snapshot(MAC, 90_000L).encoderState);
+        assertEquals(900, controller.snapshot(MAC, 90_000L).ceilingKbps);
+        assertTrue(controller.snapshot(MAC, 90_000L).boundary900To1000Locked);
+    }
+
+    @Test
+    public void unknownPlaybackQueryDoesNotClassifyOffloadOrEraseCap() {
+        LhdcLinkHealthController controller = qualityController(null);
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(MAC, 900, 20_000L);
+        controller.onEncoderObservation(MAC, false, null, 30_000L);
+        controller.onEncoderObservation(MAC, false, null, 90_000L);
+        assertEquals("unknown", controller.snapshot(MAC, 90_000L).platformPlayback);
+        assertEquals("waiting", controller.snapshot(MAC, 90_000L).encoderState);
+        assertEquals(900, controller.snapshot(MAC, 90_000L).ceilingKbps);
+    }
+
+    @Test
+    public void pauseInterruptsMissingEncoderGraceAndSoftwareCaptureRestoresControl() {
+        LhdcLinkHealthController controller = qualityController(null);
+        controller.activate(MAC, 100L);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 20_000L);
+        controller.onEncoderObservation(MAC, false, Boolean.FALSE, 27_000L);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 30_000L);
+        assertEquals("waiting", controller.snapshot(MAC, 30_000L).encoderState);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 38_000L);
+        assertEquals("monitor_only", controller.snapshot(MAC, 38_000L).encoderState);
+        controller.onEncoderObservation(MAC, true, Boolean.TRUE, 50_000L);
+        assertTrue(controller.snapshot(MAC, 50_000L).encoderControlAvailable);
+        assertEquals("software", controller.snapshot(MAC, 50_000L).encoderState);
+        controller.onRemoteChoppyReport(MAC, 1, 70_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 71_000L);
+        assertEquals(900, controller.snapshot(MAC, 71_000L).leakyFallbackCapKbps);
+    }
+
+    @Test
+    public void unavailableEncoderCleanupIsIsolatedToItsHeadset() {
+        LhdcLinkHealthController controller = qualityController(null);
+        String other = "AA:BB:CC:DD:EE:02";
+        controller.activate(MAC, 100L);
+        controller.setBqrFallbackCapKbpsForTest(other, 500, 20_000L);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 30_000L);
+        controller.onEncoderObservation(MAC, false, Boolean.TRUE, 38_000L);
+        assertEquals(500, controller.snapshot(other, 38_000L).ceilingKbps);
     }
 
     @Test

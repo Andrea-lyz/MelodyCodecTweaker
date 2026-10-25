@@ -26,6 +26,7 @@ final class LhdcLinkHealthController {
     static final long[] REQUIRED_QUIET_MS = {15_000L, 30_000L, 45_000L};
     static final long MIN_BQR_INTERVAL_MS = 3_000L;
     static final long MAX_BQR_INTERVAL_MS = 15_000L;
+    static final long ENCODER_OBSERVATION_GRACE_MS = 8_000L;
     /**
      * Phase N-2 START_GUARD: after first play / connect / resume / stream rebuild, bad BQR
      * windows do not participate in slow-heat downgrade counting and choppy reports are
@@ -314,6 +315,9 @@ final class LhdcLinkHealthController {
         final int bqrFallbackCapKbps;
         /** Leaky-bucket fallback cap in kbps; 0 when inactive. */
         final int leakyFallbackCapKbps;
+        final boolean encoderControlAvailable;
+        final String encoderState;
+        final String platformPlayback;
         /** BQR recovery streak: counted windows while capped; 0 when inactive. */
         final int bqrFallbackHealthyWindows;
         /** Windows the current BQR tier needs (400->5, 500->6, 900->8); 0 when inactive. */
@@ -369,7 +373,10 @@ final class LhdcLinkHealthController {
                 long bqrFallbackHoldRemainingMs,
                 int leakyFallbackHealthyWindows,
                 int leakyFallbackRequiredHealthyWindows,
-                long leakyFallbackHoldRemainingMs) {
+                long leakyFallbackHoldRemainingMs,
+                boolean encoderControlAvailable,
+                String encoderState,
+                String platformPlayback) {
             this.ceilingKbps = ceilingKbps;
             this.healthyBqrWindows = healthyBqrWindows;
             this.usableAfhChannels = usableAfhChannels;
@@ -406,6 +413,9 @@ final class LhdcLinkHealthController {
             this.shadowStreamSessionId = shadowStreamSessionId;
             this.bqrFallbackCapKbps = bqrFallbackCapKbps;
             this.leakyFallbackCapKbps = leakyFallbackCapKbps;
+            this.encoderControlAvailable = encoderControlAvailable;
+            this.encoderState = encoderState;
+            this.platformPlayback = platformPlayback;
             this.bqrFallbackHealthyWindows = bqrFallbackHealthyWindows;
             this.bqrFallbackRequiredHealthyWindows = bqrFallbackRequiredHealthyWindows;
             this.bqrFallbackHoldRemainingMs = bqrFallbackHoldRemainingMs;
@@ -467,6 +477,10 @@ final class LhdcLinkHealthController {
         int probeBadBqrWindows;
         long healthyDecaySinceMs;
         boolean streaming;
+        boolean encoderControlAvailable;
+        boolean encoderUnavailableConfirmed;
+        long missingEncoderSinceMs = -1L;
+        String platformPlayback = "unknown";
         long streamSessionId;
         int lastRemoteChoppyLevel;
         long lastRemoteChoppyMs;
@@ -544,6 +558,71 @@ final class LhdcLinkHealthController {
 
     LhdcLinkHealthController(Listener listener) {
         this.listener = listener;
+    }
+
+    /** A software callback is control evidence; A2DP playback alone is not. */
+    synchronized void onEncoderObservation(
+            String mac, boolean softwareStreaming, Boolean platformPlaying, long nowMs) {
+        if (mac == null) return;
+        DeviceState state = stateFor(mac);
+        boolean wasAvailable = state.encoderControlAvailable;
+        state.encoderControlAvailable = softwareStreaming;
+        state.platformPlayback = platformPlaying == null ? "unknown"
+                : platformPlaying ? "playing" : "idle";
+        if (softwareStreaming) {
+            if (!wasAvailable) state.startGuardUntilMs = nowMs + START_GUARD_MS;
+            state.missingEncoderSinceMs = -1L;
+            state.encoderUnavailableConfirmed = false;
+            return;
+        }
+        state.streaming = false;
+        state.lowQueueSinceMs = 0L;
+        state.criticalQueueSinceMs = 0L;
+        state.healthyDecaySinceMs = 0L;
+        if (cancelRecoveryProbe(state, nowMs, true)) {
+            publishCeiling(mac, state, "probe_stream_idle", nowMs);
+        }
+        if (!Boolean.TRUE.equals(platformPlaying)) {
+            // Pause or an unavailable platform query is not evidence of an offload handoff.
+            state.missingEncoderSinceMs = -1L;
+            return;
+        }
+        if (state.missingEncoderSinceMs < 0L || nowMs < state.missingEncoderSinceMs) {
+            state.missingEncoderSinceMs = nowMs;
+        }
+        if (state.encoderUnavailableConfirmed
+                || nowMs - state.missingEncoderSinceMs < ENCODER_OBSERVATION_GRACE_MS) return;
+        state.encoderUnavailableConfirmed = true;
+        // Caps/transactions from a software encoder cannot describe an unobserved route.
+        // Keep peer capability and BQR/choppy diagnostics, and leave other headsets alone.
+        clearBoundary(state.to900);
+        clearBoundary(state.to1000);
+        state.bqrFallbackCapKbps = 0;
+        state.bqrFallbackBadWindows = 0;
+        state.bqrFallbackStepBadWindows = 0;
+        state.bqrFallbackHealthyWindows = 0;
+        state.bqrFallbackSinceMs = 0L;
+        state.bqrFallbackRecoveredMs = 0L;
+        state.bqrFallbackEscalationLevel = 0;
+        state.leakyFallbackCapKbps = 0;
+        state.leakyFallbackSinceMs = 0L;
+        state.leakyFallbackHealthyWindows = 0;
+        state.leakyRecoveredMs = 0L;
+        state.choppyBucket = 0;
+        state.choppyBucketLastDecayMs = nowMs;
+        state.pendingTargetKbps = 0;
+        state.pendingRequestId = 0;
+        state.pendingSinceMs = 0L;
+        state.currentConfirmedKbps = 0;
+        state.currentQueueLength = -1;
+        state.queueCapacity = 0;
+        state.lowQueueSinceMs = 0L;
+        state.criticalQueueSinceMs = 0L;
+        state.bqrFastFailUntilMs = 0L;
+        state.bqrFastFailQueueSinceMs = 0L;
+        state.downgradeDeadZoneUntilMs = 0L;
+        state.lastPublishedCeiling = -1;
+        publishCeiling(mac, state, "encoder_unobserved", nowMs);
     }
 
     /**
@@ -745,6 +824,11 @@ final class LhdcLinkHealthController {
             String mac, BqrSample sample, long nowMs, boolean streaming) {
         if (mac == null || sample == null) return;
         DeviceState state = stateFor(mac);
+        state.encoderControlAvailable = streaming;
+        if (streaming) {
+            state.encoderUnavailableConfirmed = false;
+            state.missingEncoderSinceMs = -1L;
+        }
         if (!state.streaming && streaming && state.lastBqrMs != 0L) {
             // Phase N-2: resume (streaming false -> true after the device already streamed)
             // is a new stream start and re-arms the START_GUARD. The very first BQR of a
@@ -752,6 +836,14 @@ final class LhdcLinkHealthController {
             state.startGuardUntilMs = nowMs + START_GUARD_MS;
         }
         state.streaming = streaming;
+        if (!streaming) {
+            state.lowQueueSinceMs = 0L;
+            state.criticalQueueSinceMs = 0L;
+            state.healthyDecaySinceMs = 0L;
+            if (cancelRecoveryProbe(state, nowMs, true)) {
+                publishCeiling(mac, state, "probe_stream_idle", nowMs);
+            }
+        }
         boolean legalWindow = sample.unusedAfhChannels >= 0
                 && sample.unusedAfhChannels <= 79
                 && sample.retransmissionCount >= 0L
@@ -780,7 +872,7 @@ final class LhdcLinkHealthController {
                     && state.retransmissionsPerSecond <= MAX_RETRANSMISSIONS_PER_SECOND
                     && state.noRxPerSecond <= MAX_NO_RX_PER_SECOND;
             state.healthyBqrWindows = strictlyHealthy ? state.healthyBqrWindows + 1 : 0;
-            if (!qualityPolicyActive) return;
+            if (!qualityPolicyActive || !state.encoderControlAvailable) return;
             if (governorEnabled) {
                 evaluateBqrFallback(mac, state, nowMs, streaming, legalWindow);
                 recordBqrSnapshot(state, nowMs);
@@ -888,6 +980,10 @@ final class LhdcLinkHealthController {
     synchronized void onQueueSample(String mac, int length, int capacity, long nowMs) {
         if (mac == null || capacity <= 0 || length < 0) return;
         DeviceState state = stateFor(mac);
+        // Callers only submit queue samples while the native encoder callback is fresh.
+        state.encoderControlAvailable = true;
+        state.encoderUnavailableConfirmed = false;
+        state.missingEncoderSinceMs = -1L;
         if (!state.streaming && state.lastBqrMs != 0L) {
             // Phase N-2: resume (queue sampling restarts after an A2DP suspend on a device
             // that already streamed) re-arms the START_GUARD.
@@ -896,7 +992,7 @@ final class LhdcLinkHealthController {
         state.streaming = true;
         state.currentQueueLength = length;
         state.queueCapacity = capacity;
-        if (!qualityPolicyActive) return;
+        if (!qualityPolicyActive || !state.encoderControlAvailable) return;
         long occupancy = (long) length * 100L;
         if (occupancy <= (long) capacity * 25L) {
             if (state.lowQueueSinceMs == 0L) state.lowQueueSinceMs = nowMs;
@@ -951,6 +1047,7 @@ final class LhdcLinkHealthController {
     synchronized void onCongestion(String mac, long nowMs) {
         if (mac == null || !qualityPolicyActive) return;
         DeviceState state = stateFor(mac);
+        if (!state.encoderControlAvailable) return;
         noteCongestion(state, nowMs);
         if (cancelRecoveryProbe(state, nowMs, false)) {
             publishCeiling(mac, state, "probe_choppy", nowMs);
@@ -974,7 +1071,7 @@ final class LhdcLinkHealthController {
             state.remoteChoppyCount = 0;
         }
         state.remoteChoppyCount++;
-        if (!qualityPolicyActive) return;
+        if (!qualityPolicyActive || !state.encoderControlAvailable) return;
         if (nowMs < state.startGuardUntilMs || nowMs < state.postSwitchGuardUntilMs) {
             // Phase N-2 guards: choppy during stream warm-up (START_GUARD) or right after a
             // Target_Cap switch (POST_SWITCH_GUARD) is recorded but not integrated, so a
@@ -1001,6 +1098,7 @@ final class LhdcLinkHealthController {
             String mac, int event, int fromKbps, int toKbps, long detailMs, long nowMs) {
         if (mac == null || !qualityPolicyActive) return;
         DeviceState state = stateFor(mac);
+        if (!state.encoderControlAvailable) return;
         BoundaryState boundary = boundaryFor(state, fromKbps, toKbps);
         if (boundary == null) return;
         if (event == EVENT_UPGRADE_APPLIED) {
@@ -1069,6 +1167,7 @@ final class LhdcLinkHealthController {
             String mac, int targetKbps, int requestId, long nowMs) {
         if (mac == null || !qualityPolicyActive || requestId <= 0 || targetKbps <= 0) return;
         DeviceState state = stateFor(mac);
+        if (!state.encoderControlAvailable) return;
         state.pendingTargetKbps = targetKbps;
         state.pendingRequestId = requestId;
         state.pendingSinceMs = nowMs;
@@ -1082,7 +1181,8 @@ final class LhdcLinkHealthController {
             String mac, int toKbps, int requestId, long nowMs) {
         if (mac == null || !qualityPolicyActive || requestId <= 0) return;
         DeviceState state = devices.get(mac);
-        if (state == null || state.pendingRequestId != requestId) return;
+        if (state == null || !state.encoderControlAvailable
+                || state.pendingRequestId != requestId) return;
         state.currentConfirmedKbps = toKbps;
         state.pendingTargetKbps = 0;
         state.pendingRequestId = 0;
@@ -1097,7 +1197,8 @@ final class LhdcLinkHealthController {
     synchronized PendingTransaction tickSwitchTransactions(String mac, long nowMs) {
         if (!qualityPolicyActive) return null;
         DeviceState state = devices.get(mac);
-        if (state == null || state.pendingRequestId == 0) return null;
+        if (state == null || !state.encoderControlAvailable
+                || state.pendingRequestId == 0) return null;
         if (nowMs - state.pendingSinceMs < SWITCH_CONFIRM_TIMEOUT_MS) return null;
         PendingTransaction timedOut = new PendingTransaction(
                 state.pendingTargetKbps, state.pendingRequestId, state.pendingSinceMs);
@@ -1117,7 +1218,7 @@ final class LhdcLinkHealthController {
                     "stable", 0L, 0, 0L, 0L, "none", 0L,
                     0, false, -1L, 0, -1L, 0,
                     choppyCapabilityState, 0L, 0L, 0, 0, 0, -1L, 0L, 0, 0,
-                    0, 0, 0L, 0, 0, 0L);
+                    0, 0, 0L, 0, 0, 0L, false, "waiting", "unknown");
         }
         BoundaryState probe = inFlightBoundary(state);
         BoundaryState blocked = probe != null ? probe : firstBlockedBoundary(state);
@@ -1192,7 +1293,11 @@ final class LhdcLinkHealthController {
                 bqrHoldRemaining,
                 state.leakyFallbackHealthyWindows,
                 leakyRequired,
-                leakyHoldRemaining);
+                leakyHoldRemaining,
+                state.encoderControlAvailable,
+                state.encoderControlAvailable ? "software"
+                        : state.encoderUnavailableConfirmed ? "monitor_only" : "waiting",
+                state.platformPlayback);
     }
 
     /** Phase 5 countdown UI: required recovery windows per BQR cap tier. */
@@ -1219,7 +1324,7 @@ final class LhdcLinkHealthController {
     }
 
     private void maybeOpenRecoveryProbe(String mac, DeviceState state, long nowMs) {
-        if (!qualityPolicyActive) return;
+        if (!qualityPolicyActive || !state.encoderControlAvailable) return;
         BoundaryState boundary = firstBlockedBoundary(state);
         if (boundary == null || !state.streaming) return;
         long quietMs = quietMsForTier(boundary.evidenceTier);
