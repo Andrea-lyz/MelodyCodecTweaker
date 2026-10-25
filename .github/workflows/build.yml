@@ -15,6 +15,11 @@ on:
         description: Optional versionCode for the test build; must exceed the stable versionCode
         required: false
         type: string
+      unlock_only_diagnostic:
+        description: Build the unlock-only diagnostic APK (all link governance disabled)
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -77,7 +82,13 @@ jobs:
           PY
 
       - name: Build Release APK
-        run: ./gradlew :app:assembleRelease
+        run: |
+          if [ "${{ inputs.unlock_only_diagnostic }}" = "true" ]; then
+            echo "Building unlock-only diagnostic APK"
+            ./gradlew :app:assembleRelease -PunlockOnlyDiagnostic=true
+          else
+            ./gradlew :app:assembleRelease
+          fi
 
       # The artifact is a signed release build; the name no longer claims "dev".
       # Note: the experimental governor (auto bitrate protection) defaults OFF at

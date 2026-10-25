@@ -14,6 +14,11 @@ android {
         versionName = "2.5.6"
         buildConfigField("String", "LHDC_GOVERNOR_MODE", "\"adaptive_governor\"")
         buildConfigField("boolean", "LHDC_DYN_OBSERVE", "false")
+        // 仅解锁诊断版：关闭全部链路治理（治理器、10ms 节奏、BQR/队列降档、900 兼容保护），
+        // 只保留码率 branch 补丁与快切等价补丁，用于区分模块介入与链路本身的问题。
+        buildConfigField("boolean", "UNLOCK_ONLY_DIAGNOSTIC",
+                (project.findProperty("unlockOnlyDiagnostic") as String? ?: "false")
+                        .toBoolean().toString())
         // Toast-matrix 设备验证开关（release 恒为 false；debug 可由 -P 覆盖，运行时还有 DEBUG 二次门控）
         buildConfigField("boolean", "TOAST_TEST_BLOCK_BITRATE", "false")
         buildConfigField("boolean", "TOAST_TEST_BLOCK_FAST_SWITCH", "false")

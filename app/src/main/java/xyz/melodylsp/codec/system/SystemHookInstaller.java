@@ -413,13 +413,21 @@ public final class SystemHookInstaller {
                     NativeLhdcMemoryPatch.installGovernor();
                     // Experimental governor switch: mirror the module preference so the
                     // runtime flag matches the UI (default OFF in production builds).
-                    boolean governorEnabled = readGovernorExperimentalEnabled(appContext);
+                    boolean governorEnabled = !NativeLhdcMemoryPatch.UNLOCK_ONLY_DIAGNOSTIC
+                            && readGovernorExperimentalEnabled(appContext);
                     governorExperimentalEnabled = governorEnabled;
                     NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(governorEnabled);
                     linkHealthController.setGovernorEnabled(
                             governorEnabled, SystemClock.elapsedRealtime());
                     MLog.eventLogOnly(
                             "lhdc.governor.experimental", "enabled", governorEnabled);
+                    if (NativeLhdcMemoryPatch.UNLOCK_ONLY_DIAGNOSTIC) {
+                        MLog.event("lhdc.unlock_only.active",
+                                "governor", false,
+                                "pacing", false,
+                                "platformProtection", false,
+                                "unlockPatch", true);
+                    }
                     MLog.setDiagnosticContext(appContext, "bluetooth");
                     MLog.event("scope.system.context.ready");
                     ensureLeAudioBridge(appContext);
@@ -473,6 +481,11 @@ public final class SystemHookInstaller {
                 if (intent.hasExtra(CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED)) {
                     boolean govEnabled = intent.getBooleanExtra(
                             CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+                    if (NativeLhdcMemoryPatch.UNLOCK_ONLY_DIAGNOSTIC) {
+                        MLog.eventLogOnly(
+                                "lhdc.unlock_only.toggle_ignored", "enabled", govEnabled);
+                        return;
+                    }
                     persistGovernorExperimentalEnabled(appContext, govEnabled);
                     governorExperimentalEnabled = govEnabled;
                     NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(govEnabled);
@@ -951,7 +964,9 @@ public final class SystemHookInstaller {
         try {
             if (bridgeService == null) {
                 bridgeService = new CodecBridgeService(a2dpService);
-                bridgeService.setSnapshotDecorator(platformProtection::annotate);
+                if (!NativeLhdcMemoryPatch.UNLOCK_ONLY_DIAGNOSTIC) {
+                    bridgeService.setSnapshotDecorator(platformProtection::annotate);
+                }
             }
             if (context != null) {
                 ensureCodecBroadcastBridge(context, bridgeService);
@@ -1545,6 +1560,7 @@ public final class SystemHookInstaller {
     }
 
     private void schedulePlatformProtectionPoll() {
+        if (NativeLhdcMemoryPatch.UNLOCK_ONLY_DIAGNOSTIC) return;
         if (platformProtectionPollScheduled) return;
         platformProtectionPollScheduled = true;
         mainHandler.postDelayed(this::pollPlatformProtection, 1_000L);
@@ -1714,8 +1730,10 @@ public final class SystemHookInstaller {
                                             NativeLhdcMemoryPatch.shouldSampleQueue(), nowMs);
                                     updateEncoderObservation(attribution.mac,
                                             SystemClock.elapsedRealtime());
-                                    platformProtection.onChoppy(attribution.mac, nowMs);
-                                    schedulePlatformProtectionPoll();
+                                    if (!NativeLhdcMemoryPatch.UNLOCK_ONLY_DIAGNOSTIC) {
+                                        platformProtection.onChoppy(attribution.mac, nowMs);
+                                        schedulePlatformProtectionPoll();
+                                    }
                                     linkHealthController.onRemoteChoppyReport(
                                             attribution.mac, level, nowMs);
                                     LhdcLinkHealthController.Snapshot snapshot =

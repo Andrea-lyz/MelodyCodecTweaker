@@ -315,7 +315,9 @@ public final class MasterSwitchActivity extends Activity {
             root.put("enabled", modulePrefs.getBoolean(KEY_ENABLED, true));
             root.put("hideLauncherIcon",
                     modulePrefs.getBoolean(KEY_HIDE_LAUNCHER_ICON, false));
-            root.put("governorEnabled", modulePrefs.getBoolean(
+            root.put("unlockOnly", BuildConfig.UNLOCK_ONLY_DIAGNOSTIC);
+            root.put("governorEnabled", !BuildConfig.UNLOCK_ONLY_DIAGNOSTIC
+                    && modulePrefs.getBoolean(
                     CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false));
             root.put("snapshotTakenAt", System.currentTimeMillis());
             root.put("recording", buildRecordingSnapshot());

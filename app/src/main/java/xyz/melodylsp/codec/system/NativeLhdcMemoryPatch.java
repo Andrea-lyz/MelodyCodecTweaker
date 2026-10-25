@@ -184,6 +184,14 @@ public final class NativeLhdcMemoryPatch {
      */
     private static volatile int desiredGovernorProbeCeilingKbps = 1000;
 
+    /**
+     * Diagnostic build that keeps only the codec unlock (fixed 1000 / 192 kHz capability) and
+     * drops every link-governance path: no encoder capture, no 10 ms pacing wrapper, no
+     * target-cap writes and no 900 kbps platform fallback. It exists to separate module
+     * influence from the raw link behaviour at the unlocked bitrate.
+     */
+    static final boolean UNLOCK_ONLY_DIAGNOSTIC = BuildConfig.UNLOCK_ONLY_DIAGNOSTIC;
+
     private NativeLhdcMemoryPatch() {
     }
 
@@ -372,6 +380,13 @@ public final class NativeLhdcMemoryPatch {
      * observation instead of trusting the first-install flag forever.</p>
      */
     static synchronized boolean installGovernor() {
+        if (UNLOCK_ONLY_DIAGNOSTIC) {
+            // The unlock branch and the fast-switch equality patch stay active; only the
+            // encoder wrapper (capture + 10 ms pacing) is skipped.
+            governorInstalled = false;
+            lastGovernorInstallResult = 0;
+            return false;
+        }
         if (!ensureNativeLoaded()) {
             MLog.event("lhdc.governor.install",
                     "ok", false,
@@ -416,6 +431,7 @@ public final class NativeLhdcMemoryPatch {
     }
 
     static synchronized void setGovernorExperimentalEnabled(boolean enabled) {
+        if (UNLOCK_ONLY_DIAGNOSTIC) return;
         if (!ensureNativeLoaded()) return;
         try {
             nativeSetGovernorExperimentalEnabled(enabled);
@@ -433,6 +449,10 @@ public final class NativeLhdcMemoryPatch {
     }
 
     static synchronized boolean setGovernorPolicy(int policy) {
+        if (UNLOCK_ONLY_DIAGNOSTIC) {
+            governorPolicy = LhdcQualityPolicy.normalize(policy);
+            return true;
+        }
         if (!ensureNativeLoaded()) return false;
         try {
             nativeSetGovernorPolicy(policy);
@@ -507,6 +527,7 @@ public final class NativeLhdcMemoryPatch {
 
     private static int setGovernorProbeCeilingKbpsInternal(
             int ceilingKbps, boolean transaction) {
+        if (UNLOCK_ONLY_DIAGNOSTIC) return 0;
         int previous = cacheDesiredGovernorProbeCeilingKbps(ceilingKbps);
         int normalized = desiredGovernorProbeCeilingKbps;
         if (!governorInstalled && !installGovernor()) {
@@ -557,7 +578,7 @@ public final class NativeLhdcMemoryPatch {
     }
 
     static void reportRemoteChoppy(int level) {
-        if (level <= 0) return;
+        if (level <= 0 || UNLOCK_ONLY_DIAGNOSTIC) return;
         if (!governorInstalled && !installGovernor()) return;
         try {
             nativeReportChoppy(level);
