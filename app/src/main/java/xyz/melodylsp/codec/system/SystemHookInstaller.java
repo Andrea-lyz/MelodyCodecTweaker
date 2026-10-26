@@ -115,6 +115,8 @@ public final class SystemHookInstaller {
     private volatile Object a2dpServiceInstance;
     private volatile Method a2dpPlayingMethod;
     private volatile Method a2dpActiveDevicesMethod;
+    private volatile Method a2dpActiveDeviceMethod;
+    private volatile String platformActiveDeviceState = "unknown";
     private final LhdcPlatformProtection platformProtection = new LhdcPlatformProtection();
     private final ThreadLocal<Boolean> platformCodecWrite = new ThreadLocal<>();
     private boolean platformUserWriteHookInstalled;
@@ -697,6 +699,9 @@ public final class SystemHookInstaller {
             payload.put("platformProtectionState", platformProtection.phase(mac));
             payload.put("platformProtectionAvailable", platformProtection.available(mac));
             payload.put("platformProtectionConfirmed", platformProtection.confirmed(mac));
+            payload.put("platformAcceptsReports", platformProtection.acceptsReports(mac));
+            payload.put("platformActiveDevice", platformActiveDeviceState);
+            payload.put("platformWriteHookInstalled", platformUserWriteHookInstalled);
             payload.put("platformConfiguredBitrateKbps",
                     platformProtection.confirmed(mac) ? 900 : 0);
             payload.put("governorEffective", governorExperimentalEnabled
@@ -947,7 +952,13 @@ public final class SystemHookInstaller {
         a2dpServiceInstance = a2dpService;
         a2dpPlayingMethod = findMethod(a2dpService.getClass(),
                 "isA2dpPlaying", BluetoothDevice.class);
+        // ColorOS 16.0.0 A2dpService only exposes the singular getActiveDevice(); newer
+        // AOSP builds expose getActiveDevices(). Resolve both and prefer the list form.
         a2dpActiveDevicesMethod = findMethod(a2dpService.getClass(), "getActiveDevices");
+        a2dpActiveDeviceMethod = findMethod(a2dpService.getClass(), "getActiveDevice");
+        MLog.eventLogOnly("bt.a2dp.active_device_api",
+                "list", a2dpActiveDevicesMethod != null,
+                "single", a2dpActiveDeviceMethod != null);
         try {
             if (bridgeService == null) {
                 bridgeService = new CodecBridgeService(a2dpService);
@@ -1417,6 +1428,9 @@ public final class SystemHookInstaller {
                 "platformProtectionState", platformProtection.phase(mac),
                 "platformProtectionAvailable", platformProtection.available(mac),
                 "platformProtectionConfirmed", platformProtection.confirmed(mac),
+                "platformAcceptsReports", platformProtection.acceptsReports(mac),
+                "platformActiveDevice", platformActiveDeviceState,
+                "platformWriteHookInstalled", platformUserWriteHookInstalled,
                 "platformConfiguredBitrateKbps", platformProtection.confirmed(mac) ? 900 : 0,
                 "governorEffective", governorExperimentalEnabled
                         && NativeLhdcMemoryPatch.isQualityPolicySelected()
@@ -1550,20 +1564,51 @@ public final class SystemHookInstaller {
         mainHandler.postDelayed(this::pollPlatformProtection, 1_000L);
     }
 
-    private boolean isPlatformDeviceActive(String mac) {
+    /**
+     * Resolves whether {@code mac} is the active A2DP device.
+     *
+     * @return {@link Boolean#TRUE}/{@link Boolean#FALSE} when the platform answered,
+     *         {@code null} when neither accessor exists or both threw. Callers must treat
+     *         {@code null} as "unknown", never as "inactive": the first release of the
+     *         platform fallback silently required the plural accessor, which ColorOS only
+     *         exposes on newer builds, so the whole protection stayed inert.
+     */
+    private Boolean platformDeviceActivity(String mac) {
         Object service = a2dpServiceInstance;
-        Method method = a2dpActiveDevicesMethod;
-        if (service == null || method == null || mac == null) return false;
-        try {
-            Object result = method.invoke(service);
-            if (result instanceof List) {
-                for (Object device : (List<?>) result) {
-                    if (mac.equals(normalizeMac(macFromDeviceArg(device)))) return true;
+        if (mac == null) return Boolean.FALSE;
+        if (service == null) return null;
+        boolean answered = false;
+        Method listMethod = a2dpActiveDevicesMethod;
+        if (listMethod != null) {
+            try {
+                Object result = listMethod.invoke(service);
+                if (result instanceof List) {
+                    answered = true;
+                    for (Object device : (List<?>) result) {
+                        if (mac.equals(normalizeMac(macFromDeviceArg(device)))) {
+                            return Boolean.TRUE;
+                        }
+                    }
                 }
+            } catch (Throwable ignored) {
+                // Fall through to the singular accessor.
             }
-        } catch (Throwable ignored) {
         }
-        return false;
+        Method singleMethod = a2dpActiveDeviceMethod;
+        if (singleMethod != null) {
+            try {
+                Object device = singleMethod.invoke(service);
+                if (device != null) return mac.equals(normalizeMac(macFromDeviceArg(device)));
+                answered = true;
+            } catch (Throwable ignored) {
+                // Reported as unknown below.
+            }
+        }
+        return answered ? Boolean.FALSE : null;
+    }
+
+    private boolean isPlatformDeviceActive(String mac) {
+        return !Boolean.FALSE.equals(platformDeviceActivity(mac));
     }
 
     private void pollPlatformProtection() {
@@ -1574,7 +1619,10 @@ public final class SystemHookInstaller {
         boolean selected = NativeLhdcMemoryPatch.isQualityPolicySelected();
         boolean enabled = governorExperimentalEnabled;
         boolean software = NativeLhdcMemoryPatch.isGovernorStreaming();
-        boolean active = isPlatformDeviceActive(mac);
+        Boolean activity = platformDeviceActivity(mac);
+        boolean active = !Boolean.FALSE.equals(activity);
+        platformActiveDeviceState = activity == null
+                ? "unknown" : (activity ? "true" : "false");
         if (!active) platformProtection.onInactive(mac);
         if (active && (!software || platformProtection.hasOverride(mac))) {
             CodecSnapshot live = bridge.getStatusUnchecked(mac);
@@ -1584,32 +1632,56 @@ public final class SystemHookInstaller {
                         live, selected, enabled, software, queryA2dpPlaying(mac, nowMs),
                         platformUserWriteHookInstalled, nowMs);
                 if (decision != null) submitPlatformProtection(decision);
-                String phase = platformProtection.phase(mac);
-                String signature = mac + '|' + phase + '|'
-                        + platformProtection.available(mac) + '|'
-                        + platformProtection.confirmed(mac) + '|' + live.activeCodecSpecific1;
-                if (!signature.equals(lastPlatformProtectionState)) {
-                    lastPlatformProtectionState = signature;
-                    MLog.event("lhdc.platform.state", "mac", redactMac(mac),
-                            "platformProtectionState", phase,
-                            "platformProtectionAvailable", platformProtection.available(mac),
-                            "platformProtectionConfirmed", platformProtection.confirmed(mac),
-                            "configuredSpecific1", live.activeCodecSpecific1,
-                            "selectedSpecific1", live.selectionCodecSpecific1(),
-                            "actualBitrateKbps", 0,
-                            "bitrateVerification", "codec_config_only");
-                    sendLhdcDiagnosticLiveState(mac, linkHealthController.snapshot(mac, nowMs),
-                            "platform_" + phase, "state");
-                }
+                publishPlatformProtectionState(mac, live, enabled);
             } else {
                 platformProtection.onInactive(mac);
+                publishPlatformProtectionState(mac, null, enabled);
             }
         } else if (software && !platformProtection.hasOverride(mac)) {
             platformProtection.onUserWrite(mac);
+        } else {
+            // An inactive device used to produce no log line at all, which made the
+            // protection look merely "idle" while nothing was ever observed.
+            publishPlatformProtectionState(mac, null, enabled);
         }
         if ((enabled && selected) || platformProtection.hasOverride(mac)) {
             schedulePlatformProtectionPoll();
         }
+    }
+
+    /**
+     * Publishes the full gate set for the platform fallback. Every gate that can keep the
+     * 1000 -> 900 protection from arming is reported, so a feedback package never again
+     * shows only "available=false" without the reason.
+     */
+    private void publishPlatformProtectionState(String mac, CodecSnapshot live, boolean enabled) {
+        boolean available = platformProtection.available(mac);
+        boolean confirmed = platformProtection.confirmed(mac);
+        boolean accepts = platformProtection.acceptsReports(mac);
+        String phase = platformProtection.phase(mac);
+        long configuredSpecific1 = live == null ? -1L : live.activeCodecSpecific1;
+        long nowMs = SystemClock.elapsedRealtime();
+        String signature = mac + '|' + phase + '|' + available + '|' + confirmed + '|'
+                + accepts + '|' + platformActiveDeviceState + '|'
+                + platformUserWriteHookInstalled + '|' + configuredSpecific1;
+        if (signature.equals(lastPlatformProtectionState)) return;
+        lastPlatformProtectionState = signature;
+        MLog.event("lhdc.platform.state", "mac", redactMac(mac),
+                "platformProtectionState", phase,
+                "platformProtectionAvailable", available,
+                "platformProtectionConfirmed", confirmed,
+                "platformAcceptsReports", accepts,
+                "platformActiveDevice", platformActiveDeviceState,
+                "platformWriteHookInstalled", platformUserWriteHookInstalled,
+                "platformGovernorEnabled", enabled,
+                "platformCodecStatusReadable", live != null,
+                "platformPlaying", String.valueOf(cachedA2dpPlaying),
+                "configuredSpecific1", configuredSpecific1,
+                "selectedSpecific1", live == null ? -1L : live.selectionCodecSpecific1(),
+                "actualBitrateKbps", 0,
+                "bitrateVerification", "codec_config_only");
+        sendLhdcDiagnosticLiveState(mac, linkHealthController.snapshot(mac, nowMs),
+                "platform_" + phase, "state");
     }
 
     private void submitPlatformProtection(LhdcPlatformProtection.Decision decision) {

@@ -247,6 +247,31 @@ public class LhdcPlatformProtectionTest {
         assertTrue(p.confirmed(A));
     }
 
+    @Test public void neverObservedRouteReportsUnavailableInsteadOfIdleProtection() {
+        // 2.5.7-offload-test2 shipped a plural-only active-device lookup that ColorOS does
+        // not expose, so observe() was never reached and every feedback sample read
+        // "available=false" with no explanation. Keep that state distinguishable from an
+        // observed-but-gated route.
+        LhdcPlatformProtection p = new LhdcPlatformProtection();
+        assertFalse(p.available(A));
+        assertFalse(p.acceptsReports(A));
+        assertFalse(p.confirmed(A));
+        assertEquals("idle", p.phase(A));
+    }
+
+    @Test public void acceptsReportsMirrorsEveryGateThatBlocksTheFallback() {
+        LhdcPlatformProtection p = new LhdcPlatformProtection();
+        assertNull(p.observe(live(0x8008), true, true, false, true, true, 0));
+        assertTrue(p.available(A));
+        assertTrue(p.acceptsReports(A));
+        // A governor switch-off, a paused stream or an unreadable codec status must not
+        // keep reporting the protection as armed.
+        assertNull(p.observe(live(0x8008), true, false, false, true, true, 1_000));
+        assertFalse(p.acceptsReports(A));
+        assertFalse(p.available(A));
+        assertEquals("waiting", p.phase(A));
+    }
+
     @Test public void rejectedRestoreRemainsVisibleWithoutRetryLoop() {
         LhdcPlatformProtection p = new LhdcPlatformProtection();
         trigger(p);

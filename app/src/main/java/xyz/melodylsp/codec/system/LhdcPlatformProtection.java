@@ -202,6 +202,12 @@ final class LhdcPlatformProtection {
         return state != null && (state.acceptsReports || state.original != null);
     }
 
+    /** True while the next choppy reports would actually be able to arm the fallback. */
+    synchronized boolean acceptsReports(String mac) {
+        State state = states.get(key(mac));
+        return state != null && state.acceptsReports;
+    }
+
     synchronized boolean confirmed(String mac) {
         State state = states.get(key(mac));
         return state != null && state.confirmed;
