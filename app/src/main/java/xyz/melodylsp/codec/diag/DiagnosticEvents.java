@@ -551,7 +551,13 @@ public final class DiagnosticEvents {
         }
         if (message.contains("evt=lhdc.link.bqr_summary")) {
             mark(editor, "lhdc.link.bqr", "active", message, time);
-            mark(editor, "lhdc.link.governor", "active", message, time);
+        }
+        if (message.contains("evt=lhdc.link.bqr_summary")
+                || message.contains("evt=lhdc.link.control_state")) {
+            mark(editor, "lhdc.link.governor",
+                    message.contains("governorEffective=true") ? "active"
+                            : message.contains("encoderState=monitor_only") ? "attention" : "idle",
+                    message, time);
         }
         if (message.contains("evt=lhdc.governor.choppy_hooks")) {
             mark(editor, "lhdc.link.choppy",
@@ -568,10 +574,8 @@ public final class DiagnosticEvents {
             mark(editor, "lhdc.link.bqr", "active", message, time);
             mark(editor, "lhdc.link.shadow", "would_protect", message, time);
         }
-        if (message.contains("evt=lhdc.link.probe_ceiling")
-                || message.contains("evt=lhdc.link.governor_event")) {
-            mark(editor, "lhdc.link.governor", "active", message, time);
-        }
+        // Target publications and acknowledgements do not prove current control capability.
+        // The explicit control-state observation and BQR summary own the governor status.
         if (message.contains("evt=dexkit.")) {
             mark(editor, "dexkit", stateFromMessage(message), message, time);
         }
