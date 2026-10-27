@@ -50,6 +50,7 @@ import xyz.melodylsp.codec.diag.DiagnosticEvents;
 import xyz.melodylsp.codec.label.CodecLabelTable;
 import xyz.melodylsp.codec.leaudio.BluetoothLeAudioBridge;
 import xyz.melodylsp.codec.leaudio.LeAudioIpc;
+import xyz.melodylsp.codec.util.LhdcOffloadPath;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
@@ -399,6 +400,7 @@ public final class SystemHookInstaller {
                 Object app = chain.getThisObject();
                 if (app instanceof Context) {
                     appContext = ((Context) app).getApplicationContext();
+                    LhdcOffloadPath.refresh(appContext);
                     registerLhdcDiagnosticLiveControlReceiver(appContext);
                     registerLhdcSessionReceiver(appContext);
                     NativeLhdcMemoryPatch.configureModuleContext(appContext);
@@ -465,6 +467,14 @@ public final class SystemHookInstaller {
                 if (intent.hasExtra(CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED)) {
                     boolean govEnabled = intent.getBooleanExtra(
                             CodecIpc.EXTRA_GOVERNOR_EXPERIMENTAL_ENABLED, false);
+                    if (LhdcOffloadPath.isOffloaded()) {
+                        // The switch is greyed out on the offload path. Reject the change here as
+                        // well so a stale page cannot arm a governor that can never observe.
+                        MLog.eventLogOnly("lhdc.governor.offload_rejected",
+                                "requested", govEnabled,
+                                "detail", LhdcOffloadPath.describe());
+                        return;
+                    }
                     persistGovernorExperimentalEnabled(appContext, govEnabled);
                     governorExperimentalEnabled = govEnabled;
                     NativeLhdcMemoryPatch.setGovernorExperimentalEnabled(govEnabled);
@@ -691,6 +701,9 @@ public final class SystemHookInstaller {
             payload.put("governorInstalled", NativeLhdcMemoryPatch.isGovernorInstalled());
             payload.put("governorInstallResult",
                     NativeLhdcMemoryPatch.lastGovernorInstallResult());
+            payload.put("lhdcOffloadPath", LhdcOffloadPath.isOffloaded());
+            payload.put("governanceAvailable", !LhdcOffloadPath.isOffloaded());
+            payload.put("offloadKnown", LhdcOffloadPath.isKnown());
             payload.put("actualBitrateKbps",
                     NativeLhdcMemoryPatch.currentGovernorBitrateKbps());
             payload.put("requestedBitrateKbps",
@@ -931,6 +944,7 @@ public final class SystemHookInstaller {
         }
         if (a2dpService == null) return;
         a2dpServiceInstance = a2dpService;
+        LhdcOffloadPath.refresh(context != null ? context : currentApplication(), a2dpService);
         a2dpPlayingMethod = findMethod(a2dpService.getClass(),
                 "isA2dpPlaying", BluetoothDevice.class);
         try {
@@ -1403,6 +1417,7 @@ public final class SystemHookInstaller {
                 "healthyWindows", snapshot.healthyBqrWindows,
                 "governorInstalled", NativeLhdcMemoryPatch.isGovernorInstalled(),
                 "governorInstallResult", NativeLhdcMemoryPatch.lastGovernorInstallResult(),
+                "lhdcOffloadPath", LhdcOffloadPath.isOffloaded(),
                 "bqrFallbackCapKbps", snapshot.bqrFallbackCapKbps,
                 "leakyFallbackCapKbps", snapshot.leakyFallbackCapKbps,
                 "ceilingKbps", snapshot.ceilingKbps,

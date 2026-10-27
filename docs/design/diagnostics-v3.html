@@ -157,6 +157,11 @@
     }
     .switch input:checked + span { background: var(--blue); }
     .switch input:checked + span::before { transform: translateX(18px); }
+    /* offload path: the governance switch is read-only */
+    .switch.is-disabled { opacity: .5; }
+    .switch.is-disabled span { cursor: not-allowed; background: #e6e9f0; }
+    .card.notice { border: 1px solid rgba(255,149,0,.35); background: rgba(255,149,0,.06); }
+    .card.notice .label strong { color: var(--orange); }
 
     /* primary buttons */
     .actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
@@ -647,13 +652,24 @@
   <!-- ═══════════════ 链路：BQR 实时环境 + 历史窗口 ═══════════════ -->
   <section class="panel" data-panel="link">
 
+  <!-- ═══════════════ 硬件 offload：治理不可用提示 ═══════════════ -->
+  <section class="card notice" id="governance-notice" hidden>
+    <div class="switch-row">
+      <div class="label">
+        <strong>硬件 offload · 码率治理不可用</strong>
+        <p>当前 LHDC 由系统的 offload 路径编码，编码器运行在蓝牙控制器 / DSP 内，模块读不到也改不了码率。</p>
+        <p>治理器已自动停用；播放质量与采样率选择、耳机记忆与重连回放仍然可用。</p>
+      </div>
+    </div>
+  </section>
+
   <!-- ═══════════════ 码率拥塞治理器（实验性） ═══════════════ -->
-  <section class="card">
+  <section class="card" id="governor-card">
     <div class="switch-row">
       <div class="label">
         <strong>码率拥塞治理器（实验性）</strong>
         <p>开启后「音质优先」会按链路证据自动降档保护、环境恢复后自动升回，默认关闭。</p>
-        <p>实验性功能，移动/干扰环境下可能出现短暂降码率。</p>
+        <p id="governor-hint">实验性功能，移动/干扰环境下可能出现短暂降码率。</p>
       </div>
       <label class="switch">
         <input type="checkbox" data-governor-enabled>
@@ -1833,6 +1849,29 @@
     });
   }
 
+  /* ── v3-36: 硬件 offload 路径下治理不可用，链路页整块置灰 ── */
+  function renderGovernance(governance) {
+    const info = governance || {};
+    const offload = !!info.known && !!info.offloadPath;
+    const notice = byId('governance-notice');
+    const card = byId('governor-card');
+    const hint = byId('governor-hint');
+    const governorSwitch = document.querySelector('input[data-governor-enabled]');
+    if (notice) notice.hidden = !offload;
+    if (card) card.classList.toggle('is-disabled', offload);
+    if (hint) {
+      hint.textContent = offload
+        ? '当前 LHDC 走硬件 offload，码率治理在本机不可用（已自动停用）。'
+        : '实验性功能，移动/干扰环境下可能出现短暂降码率。';
+    }
+    if (governorSwitch) {
+      governorSwitch.disabled = offload;
+      const track = governorSwitch.closest('.switch');
+      if (track) track.classList.toggle('is-disabled', offload);
+      if (offload) governorSwitch.checked = false;
+    }
+  }
+
   function applySnapshot(s) {
     if (!s || typeof s !== 'object') return;
     // Fail open: a single card renderer must never leave the whole page invisible.
@@ -1844,6 +1883,7 @@
     enabledSwitch.checked = !!s.enabled;
     hideSwitch.checked = !!s.hideLauncherIcon;
     governorSwitch.checked = !!s.governorEnabled;
+    renderGovernance(s.governance);
     liveTakenAt = number(s.live && s.live.takenAt, 0);
     renderRecording(s);
     renderBqr(s.bqr);

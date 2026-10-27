@@ -40,6 +40,7 @@ import xyz.melodylsp.codec.diag.FeedbackCollector;
 import xyz.melodylsp.codec.diag.RootBluetoothLogCapture;
 import xyz.melodylsp.codec.diag.StatusProbe;
 import xyz.melodylsp.codec.system.NativeLhdcMemoryPatch;
+import xyz.melodylsp.codec.util.LhdcOffloadPath;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.util.TrustedBroadcasts;
 
@@ -88,6 +89,8 @@ public final class MasterSwitchActivity extends Activity {
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final LiveBqrStore liveBqrStore = new LiveBqrStore();
+    /** Last offload verdict pushed by the Bluetooth process; null until it is known. */
+    private volatile Boolean cachedLhdcOffloadPath;
     private SharedPreferences modulePrefs;
     private SharedPreferences diagPrefs;
     private WebView webView;
@@ -126,7 +129,11 @@ public final class MasterSwitchActivity extends Activity {
                     CodecIpc.EXTRA_DIAGNOSTIC_LIVE_PAYLOAD);
             if (payload == null || payload.isEmpty()) return;
             try {
-                liveBqrStore.accept(new JSONObject(payload));
+                JSONObject sample = new JSONObject(payload);
+                if (sample.has("lhdcOffloadPath")) {
+                    cachedLhdcOffloadPath = sample.optBoolean("lhdcOffloadPath", false);
+                }
+                liveBqrStore.accept(sample);
                 if (foreground) pushSnapshotToPage();
             } catch (Throwable ignored) {
             }
@@ -328,10 +335,35 @@ public final class MasterSwitchActivity extends Activity {
             root.put("memory", buildMemorySnapshot());
             root.put("events", buildRecentEventsSnapshot());
             root.put("bqr", liveBqrStore.snapshot());
+            root.put("governance", buildGovernanceSnapshot());
             root.put("feedbackBusy", feedbackBusy);
         } catch (Throwable ignored) {
         }
         return root;
+    }
+
+    /** False when LHDC is encoded by the DSP: the 链路 page greys out every governance control. */
+    private boolean governanceAvailable() {
+        Boolean pushed = cachedLhdcOffloadPath;
+        if (pushed != null) return !pushed;
+        LhdcOffloadPath.refresh(this);
+        return !LhdcOffloadPath.isOffloaded();
+    }
+
+    /**
+     * Offload verdict for the 链路 page. The Bluetooth process is authoritative; the local audio
+     * HAL probe only covers a page opened before the first BQR sample arrives.
+     */
+    private JSONObject buildGovernanceSnapshot() throws Exception {
+        Boolean pushed = cachedLhdcOffloadPath;
+        LhdcOffloadPath.refresh(this);
+        boolean known = pushed != null || LhdcOffloadPath.isKnown();
+        boolean offloaded = pushed != null ? pushed : LhdcOffloadPath.isOffloaded();
+        JSONObject out = new JSONObject();
+        out.put("known", known);
+        out.put("offloadPath", offloaded);
+        out.put("available", !offloaded);
+        return out;
     }
 
     private JSONObject buildRecordingSnapshot() throws Exception {
@@ -604,6 +636,14 @@ public final class MasterSwitchActivity extends Activity {
         @JavascriptInterface
         public void setGovernorEnabled(boolean enabled) {
             runOnUiThread(() -> {
+                if (!governanceAvailable()) {
+                    // Offload path: the encoder lives in the DSP, nothing can be steered.
+                    Toast.makeText(MasterSwitchActivity.this,
+                            "当前 LHDC 由系统硬件 offload 编码，码率治理不可用",
+                            Toast.LENGTH_SHORT).show();
+                    pushSnapshotToPage();
+                    return;
+                }
                 modulePrefs.edit()
                         .putBoolean(CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, enabled)
                         .apply();

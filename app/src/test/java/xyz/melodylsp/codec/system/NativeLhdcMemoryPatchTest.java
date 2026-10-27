@@ -9,7 +9,20 @@ import java.nio.file.Files;
 
 import org.junit.Test;
 
+import xyz.melodylsp.codec.util.LhdcOffloadPath;
+
 public final class NativeLhdcMemoryPatchTest {
+
+    @Test
+    public void offloadPathNeverInstallsTheGovernor() {
+        LhdcOffloadPath.setForTest(Boolean.TRUE, Boolean.TRUE);
+        try {
+            assertFalse(NativeLhdcMemoryPatch.governorApplicable());
+        } finally {
+            LhdcOffloadPath.resetForTest();
+        }
+        assertTrue(NativeLhdcMemoryPatch.governorApplicable());
+    }
 
     @Test
     public void debugBuildIdentifiesFixed1000AbEvidenceMode() {

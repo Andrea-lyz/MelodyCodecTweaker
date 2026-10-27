@@ -20,6 +20,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import xyz.melodylsp.codec.bridge.LhdcQualityPolicy;
+import xyz.melodylsp.codec.util.LhdcOffloadPath;
 import xyz.melodylsp.codec.util.MLog;
 import xyz.melodylsp.codec.BuildConfig;
 
@@ -177,6 +178,8 @@ public final class NativeLhdcMemoryPatch {
     private static volatile boolean governorInstalled;
     private static volatile int governorPolicy = LhdcQualityPolicy.ADAPTIVE;
     private static volatile int lastGovernorInstallResult;
+    /** Reported by {@link #lastGovernorInstallResult()} when LHDC runs on the offload path. */
+    static final int RESULT_OFFLOAD_PATH = -9;
     private static volatile int lastPacingInstallResult;
     /**
      * Java-side replay cache for the native probe ceiling. Updated before any install attempt so
@@ -371,7 +374,30 @@ public final class NativeLhdcMemoryPatch {
      * recorded slots after a vendor reload (result 4), so callers may invoke this on each stream
      * observation instead of trusting the first-install flag forever.</p>
      */
+    /**
+     * False when LHDC is encoded by the DSP (hardware offload): there is no encoder to capture,
+     * so the governor must stay uninstalled and the module keeps the unlock-only behaviour.
+     */
+    static boolean governorApplicable() {
+        return !LhdcOffloadPath.isOffloaded();
+    }
+
     static synchronized boolean installGovernor() {
+        if (!governorApplicable()) {
+            // Hardware offload encodes inside the controller, so there is no encoder to observe
+            // and nothing to steer. Stay in the unlock-only behaviour instead of installing a
+            // hook that can never fire.
+            boolean changed = governorInstalled || lastGovernorInstallResult != RESULT_OFFLOAD_PATH;
+            governorInstalled = false;
+            lastGovernorInstallResult = RESULT_OFFLOAD_PATH;
+            if (changed) {
+                MLog.event("lhdc.governor.install",
+                        "ok", false,
+                        "result", "offload_path",
+                        "detail", LhdcOffloadPath.describe());
+            }
+            return false;
+        }
         if (!ensureNativeLoaded()) {
             MLog.event("lhdc.governor.install",
                     "ok", false,
