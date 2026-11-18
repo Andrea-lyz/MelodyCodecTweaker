@@ -50,6 +50,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
     public void onModuleLoaded(@NonNull ModuleLoadedParam param) {
         MLog.attach(this);
         refreshDiagnosticRecordingState();
+        MLog.refreshVerboseLoggingFromRemotePreferences();
         MLog.event("module.loaded", "process", param.getProcessName(),
                 "framework", getFrameworkName(),
                 "framework_version", getFrameworkVersionCode(),
@@ -60,6 +61,7 @@ public final class MelodyCodecLspEntry extends XposedModule {
     public void onPackageLoaded(@NonNull PackageLoadedParam param) {
         MLog.attach(this);
         refreshDiagnosticRecordingState();
+        MLog.refreshVerboseLoggingFromRemotePreferences();
         String pkg = param.getPackageName();
         if (HOST_PKG.equals(pkg)) {
             installHostScope(param);

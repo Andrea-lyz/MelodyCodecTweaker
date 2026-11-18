@@ -185,6 +185,12 @@ std::atomic<uint64_t> g_last_encode_ms{0};
 std::atomic<int> g_policy{kPolicyAdaptive};
 // Fail closed until Java has read the persisted experimental-governor preference.
 std::atomic<bool> g_governor_experimental_enabled{true};
+// Mirrors MLog verbose mode (debug-log switch or feedback recording). Off by default so
+// per-event chatter stays out of logcat; state transitions are always logged.
+std::atomic<bool> g_verbose_logging{false};
+// Last nativeInstallGovernor() result; INT32_MIN = never logged. The self-heal path calls
+// install on every BQR sample, so only a changed result is worth a log line.
+std::atomic<int> g_last_hook_install_result{INT32_MIN};
 std::atomic<uint32_t> g_policy_epoch{1};
 std::atomic<uint64_t> g_choppy_sequence{0};
 std::atomic<int> g_choppy_level{0};
@@ -1415,8 +1421,11 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeInstallGovernor(
                 pacing_result);
     }
 #endif
-    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=hook.install mode=fixed_encode result=%d", result);
+    if (result != g_last_hook_install_result.exchange(result, std::memory_order_acq_rel)
+            || g_verbose_logging.load(std::memory_order_acquire)) {
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=hook.install mode=fixed_encode result=%d", result);
+    }
     return result;
 }
 
@@ -1629,9 +1638,17 @@ Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeReportChoppy(
         JNIEnv*, jclass, jint level) {
     const uint64_t sequence = g_choppy_sequence.fetch_add(1, std::memory_order_acq_rel) + 1;
     g_choppy_level.store(level, std::memory_order_release);
-    __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
-            "evt=choppy.received level=%d sequence=%llu",
-            level, static_cast<unsigned long long>(sequence));
+    if (g_verbose_logging.load(std::memory_order_acquire)) {
+        __android_log_print(ANDROID_LOG_INFO, kGovernorTag,
+                "evt=choppy.received level=%d sequence=%llu",
+                level, static_cast<unsigned long long>(sequence));
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_xyz_melodylsp_codec_system_NativeLhdcMemoryPatch_nativeSetVerboseLogging(
+        JNIEnv*, jclass, jboolean enabled) {
+    g_verbose_logging.store(enabled == JNI_TRUE, std::memory_order_release);
 }
 
 extern "C" JNIEXPORT jint JNICALL

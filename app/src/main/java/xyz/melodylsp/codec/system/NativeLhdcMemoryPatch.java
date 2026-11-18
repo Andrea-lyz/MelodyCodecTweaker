@@ -1463,6 +1463,25 @@ public final class NativeLhdcMemoryPatch {
         return null;
     }
 
+    private static volatile boolean nativeVerboseListenerBound;
+
+    /** Mirrors MLog verbose mode into native so per-event governor chatter follows the switch. */
+    private static void bindNativeVerboseLogging() {
+        applyNativeVerboseLogging();
+        if (nativeVerboseListenerBound) return;
+        nativeVerboseListenerBound = true;
+        MLog.addVerboseListener(NativeLhdcMemoryPatch::applyNativeVerboseLogging);
+    }
+
+    private static void applyNativeVerboseLogging() {
+        if (!nativeLoaded) return;
+        try {
+            nativeSetVerboseLogging(MLog.isVerboseActive());
+        } catch (Throwable ignored) {
+            // A stale library without the export keeps its built-in default (quiet).
+        }
+    }
+
     private static synchronized boolean ensureNativeLoaded() {
         if (nativeLoaded) return true;
         if (nativeLoadAttempted) return false;
@@ -1474,6 +1493,7 @@ public final class NativeLhdcMemoryPatch {
                 System.load(path);
                 nativeLoaded = true;
                 nativeLoadError = null;
+                bindNativeVerboseLogging();
                 MLog.event("lhdc.memory_patch.native_loaded", "path", path);
                 return true;
             }
@@ -1485,6 +1505,7 @@ public final class NativeLhdcMemoryPatch {
             System.loadLibrary("melody_lhdc_patch");
             nativeLoaded = true;
             nativeLoadError = null;
+            bindNativeVerboseLogging();
             MLog.event("lhdc.memory_patch.native_loaded",
                     "path", path != null && !path.isEmpty() ? path + "|loadLibrary" : "loadLibrary");
             return true;
@@ -1511,6 +1532,8 @@ public final class NativeLhdcMemoryPatch {
             int originalProtection);
 
     private static native int nativeInstallGovernor();
+
+    private static native void nativeSetVerboseLogging(boolean enabled);
 
     private static native int nativeGetFixedQualityPacingInstallResult();
 

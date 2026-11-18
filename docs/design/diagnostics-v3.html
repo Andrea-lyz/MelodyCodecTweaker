@@ -569,6 +569,20 @@
     </div>
   </section>
 
+  <!-- ═══════════════ 调试日志 ═══════════════ -->
+  <section class="card">
+    <div class="switch-row">
+      <div class="label">
+        <strong>调试日志</strong>
+        <p>默认关闭：只记录警告、错误和关键状态，减少 LSPosed 日志写入与耗电。开启后输出 BQR、桥接回复等高频细节，排查完成后请关闭。「开始记录问题」期间会自动输出完整日志，无需手动开启。</p>
+      </div>
+      <label class="switch">
+        <input type="checkbox" data-verbose-logging>
+        <span></span>
+      </label>
+    </div>
+  </section>
+
   <!-- ═══════════════ 环境信息 ═══════════════ -->
   <section class="card">
     <h2>环境信息</h2>
@@ -1883,6 +1897,8 @@
     enabledSwitch.checked = !!s.enabled;
     hideSwitch.checked = !!s.hideLauncherIcon;
     governorSwitch.checked = !!s.governorEnabled;
+    const verboseSwitch = document.querySelector('input[data-verbose-logging]');
+    if (verboseSwitch) verboseSwitch.checked = !!s.verboseLogging;
     renderGovernance(s.governance);
     liveTakenAt = number(s.live && s.live.takenAt, 0);
     renderRecording(s);
@@ -1929,6 +1945,9 @@
   });
   document.querySelector('input[data-governor-enabled]').addEventListener('change', event => {
     if (bridge && bridge.setGovernorEnabled) bridge.setGovernorEnabled(!!event.target.checked);
+  });
+  document.querySelector('input[data-verbose-logging]').addEventListener('change', event => {
+    if (bridge && bridge.setVerboseLogging) bridge.setVerboseLogging(!!event.target.checked);
   });
   byId('record-button').addEventListener('click', () => {
     if (bridge && bridge.toggleRecording) bridge.toggleRecording();

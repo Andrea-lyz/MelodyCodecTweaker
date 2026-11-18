@@ -23,11 +23,37 @@ import xyz.melodylsp.codec.diag.StatusProbe;
  * Module-wide logging facade. Logs go to standard {@link Log} as well as the libxposed
  * framework log when an {@link XposedInterface} has been attached, so users can either tail
  * {@code logcat -s MelodyCodecLsp} or read the LSPosed module log viewer.
+ *
+ * <p>Output is tiered to keep the always-on cost low. Verbose mode (the diagnostic page's
+ * debug-log switch, or any active feedback recording session) restores the full stream to both
+ * sinks. Outside verbose mode:</p>
+ * <ul>
+ *   <li>warnings / errors and status-essential or sticky events reach logcat and the LSPosed
+ *       module log;</li>
+ *   <li>other low-frequency events reach logcat only (the LSPosed log is persisted to disk by
+ *       the framework daemon and is the expensive sink);</li>
+ *   <li>high-frequency telemetry ({@link #isDebugOnlyEventName}) and {@code d()} are
+ *       dropped.</li>
+ * </ul>
+ * <p>Gating only affects text output: {@link StatusProbe} observation, sticky snapshots and
+ * diagnostic-page persistence are unchanged, so the status page keeps working with the switch
+ * off.</p>
  */
 public final class MLog {
 
     public static final String TAG = "MelodyCodecLsp";
 
+    /** Process-local mirror so the switch survives host / bluetooth process restarts. */
+    private static final String LOCAL_LOG_PREFS = "melody_codec_log";
+
+    static final int SINK_NONE = 0;
+    static final int SINK_LOGCAT = 1;
+    static final int SINK_ALL = 2;
+
+    private static volatile boolean verboseLogging;
+    /** Set once the local mirror or a control broadcast supplied the switch value. */
+    private static volatile boolean verboseFromAuthoritativeSource;
+    private static final List<Runnable> verboseListeners = new ArrayList<>();
     private static volatile XposedInterface xposed;
     private static volatile String hostVersion = "?";
     private static volatile Context diagnosticContext;
@@ -61,6 +87,7 @@ public final class MLog {
             diagnosticScope = scope;
         }
         refreshDiagnosticRecordingFromRemotePreferences();
+        loadLocalVerboseLogging(appContext);
         registerDiagnosticControlReceiver(appContext);
         if (isDiagnosticRecordingActive(System.currentTimeMillis())) {
             flushPendingDiagnostics(appContext, diagnosticScope);
@@ -71,10 +98,78 @@ public final class MLog {
     }
 
     public static void configureDiagnosticRecordingUntil(long untilMs) {
+        long previous = diagnosticRecordingUntilMs;
         diagnosticRecordingUntilMs = Math.max(0L, untilMs);
         if (!isDiagnosticRecordingActive(System.currentTimeMillis())) {
             diagnosticSnapshotPublishedUntilMs = 0L;
             clearPendingDiagnostics();
+        }
+        if (previous != diagnosticRecordingUntilMs) notifyVerboseListeners();
+    }
+
+    /** Applies the diagnostic page's debug-log switch in this process. */
+    public static void configureVerboseLogging(boolean enabled) {
+        boolean changed = verboseLogging != enabled;
+        verboseLogging = enabled;
+        if (changed) notifyVerboseListeners();
+    }
+
+    /** True when the debug-log switch is on or a feedback recording session is active. */
+    public static boolean isVerboseActive() {
+        return isVerbose(verboseLogging, diagnosticRecordingUntilMs, System.currentTimeMillis());
+    }
+
+    static boolean isVerbose(boolean switchOn, long recordingUntilMs, long nowMs) {
+        return switchOn || isRecordingActive(recordingUntilMs, nowMs);
+    }
+
+    /**
+     * Registers a callback fired when the verbose state may have changed (switch toggled or a
+     * recording session started / stopped). Used to mirror the state into native code.
+     */
+    public static void addVerboseListener(Runnable listener) {
+        if (listener == null) return;
+        synchronized (verboseListeners) {
+            verboseListeners.add(listener);
+        }
+    }
+
+    private static void notifyVerboseListeners() {
+        List<Runnable> copy;
+        synchronized (verboseListeners) {
+            if (verboseListeners.isEmpty()) return;
+            copy = new ArrayList<>(verboseListeners);
+        }
+        for (Runnable listener : copy) {
+            try {
+                listener.run();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void loadLocalVerboseLogging(Context context) {
+        if (context == null) return;
+        try {
+            SharedPreferences local =
+                    context.getSharedPreferences(LOCAL_LOG_PREFS, Context.MODE_PRIVATE);
+            if (local.contains(DiagnosticEvents.KEY_VERBOSE_LOGGING)) {
+                verboseFromAuthoritativeSource = true;
+                configureVerboseLogging(
+                        local.getBoolean(DiagnosticEvents.KEY_VERBOSE_LOGGING, false));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void persistLocalVerboseLogging(Context context, boolean enabled) {
+        if (context == null) return;
+        try {
+            context.getSharedPreferences(LOCAL_LOG_PREFS, Context.MODE_PRIVATE)
+                    .edit()
+                    .putBoolean(DiagnosticEvents.KEY_VERBOSE_LOGGING, enabled)
+                    .apply();
+        } catch (Throwable ignored) {
         }
     }
 
@@ -98,6 +193,23 @@ public final class MLog {
         }
     }
 
+    /**
+     * Reads the switch through the libxposed remote preferences pipe. Used at module / package
+     * load, before a process context exists; the process-local mirror (applied in
+     * {@link #setDiagnosticContext}) wins afterwards because the pipe returns defaults when
+     * the module process is not running.
+     */
+    public static void refreshVerboseLoggingFromRemotePreferences() {
+        if (verboseFromAuthoritativeSource) return;
+        try {
+            MelodyCodecLspEntry entry = MelodyCodecLspEntry.current();
+            if (entry == null) return;
+            configureVerboseLogging(entry.getRemotePreferences(DiagnosticEvents.MODULE_PREFS)
+                    .getBoolean(DiagnosticEvents.KEY_VERBOSE_LOGGING, false));
+        } catch (Throwable ignored) {
+        }
+    }
+
     private static synchronized void registerDiagnosticControlReceiver(Context context) {
         if (context == null || diagnosticControlReceiver != null) return;
         BroadcastReceiver receiver = new BroadcastReceiver() {
@@ -116,6 +228,20 @@ public final class MLog {
                 }
                 configureDiagnosticRecordingUntil(intent.getLongExtra(
                         DiagnosticEvents.EXTRA_RECORDING_UNTIL, 0L));
+                if (intent.hasExtra(DiagnosticEvents.EXTRA_VERBOSE_LOGGING)) {
+                    boolean verbose = intent.getBooleanExtra(
+                            DiagnosticEvents.EXTRA_VERBOSE_LOGGING, false);
+                    verboseFromAuthoritativeSource = true;
+                    if (verbose != verboseLogging) {
+                        configureVerboseLogging(verbose);
+                        persistLocalVerboseLogging(receiverContext, verbose);
+                        // Low-frequency, user-initiated: always visible so a log reader can
+                        // tell where the verbose stream starts or stops.
+                        event("diag.log.verbose", "enabled", verbose, "scope", diagnosticScope);
+                    } else {
+                        persistLocalVerboseLogging(receiverContext, verbose);
+                    }
+                }
                 boolean active = isDiagnosticRecordingActive(System.currentTimeMillis());
                 if (active) maybePublishDiagnosticSnapshot(receiverContext, diagnosticScope);
                 eventLogOnly("diag.recording.control",
@@ -141,11 +267,14 @@ public final class MLog {
         }
     }
 
+    /** Debug detail: emitted only in verbose mode (debug switch or recording session). */
     public static void d(String message) {
+        if (!isVerboseActive()) return;
         emit(Log.DEBUG, message, null);
     }
 
     public static void d(String message, Throwable t) {
+        if (!isVerboseActive()) return;
         emit(Log.DEBUG, message, t);
     }
 
@@ -183,12 +312,85 @@ public final class MLog {
     }
 
     private static void emitEvent(String name, boolean persistDiagnostic, Object... kvPairs) {
-        StringBuilder sb = new StringBuilder("evt=").append(name);
-        for (int i = 0; i + 1 < kvPairs.length; i += 2) {
-            sb.append(' ').append(kvPairs[i]).append('=').append(kvPairs[i + 1]);
+        long now = System.currentTimeMillis();
+        boolean recording = isDiagnosticRecordingActive(now);
+        int sinks = eventSinks(name, isVerbose(verboseLogging, diagnosticRecordingUntilMs, now));
+        boolean persist = persistDiagnostic
+                && (recording || isStatusEssentialEventName(name));
+        boolean sticky = isStickyDiagnosticEvent(name);
+        // Skip formatting entirely when nobody consumes the text (hot BQR / reply paths).
+        if (sinks != SINK_NONE || persist || sticky) {
+            StringBuilder sb = new StringBuilder("evt=").append(name);
+            for (int i = 0; i + 1 < kvPairs.length; i += 2) {
+                sb.append(' ').append(kvPairs[i]).append('=').append(kvPairs[i + 1]);
+            }
+            emit(Log.INFO, sb.toString(), null, persistDiagnostic, name, sinks);
         }
-        emit(Log.INFO, sb.toString(), null, persistDiagnostic, name);
         StatusProbe.observe(name, kvPairs);
+    }
+
+    /** Output sinks for a structured event; never affects persistence or status probing. */
+    static int eventSinks(String name, boolean verbose) {
+        if (verbose || "diag.log.verbose".equals(name)) return SINK_ALL;
+        if (isDebugOnlyEventName(name)) return SINK_NONE;
+        if (isStatusEssentialEventName(name) || isStickyDiagnosticEvent(name)) return SINK_ALL;
+        return SINK_LOGCAT;
+    }
+
+    static int plainSinks(int priority, boolean verbose) {
+        if (verbose || priority >= Log.WARN) return SINK_ALL;
+        if (priority >= Log.INFO) return SINK_LOGCAT;
+        return SINK_NONE;
+    }
+
+    /**
+     * High-frequency telemetry and request/reply chatter that is only useful while actively
+     * debugging. Checked before the status-essential list, so an event can stay persisted for
+     * the status page while its text output is debug-only. Recording sessions force verbose,
+     * so feedback packs still contain all of these.
+     */
+    static boolean isDebugOnlyEventName(String name) {
+        if (name == null || name.isEmpty()) return false;
+        // Per-BQR-sample (~every 6 s while streaming, also for inactive devices) and remote
+        // choppy telemetry from the bluetooth process.
+        if (name.startsWith("lhdc.link.bqr")
+                && !"lhdc.link.bqr_hooks".equals(name)) {
+            return true;
+        }
+        // Process-start chatter repeated by every Melody process launch.
+        if (name.startsWith("replay.bootstrap.")) return true;
+        if (name.startsWith("dexkit.find.")) return true;
+        if (name.startsWith("remember.snapshot.")) return true;
+        switch (name) {
+            case "lhdc.link.remote_choppy":
+            case "lhdc.link.choppy_dedup":
+            case "lhdc.link.live_control":
+            case "lhdc.link.control_state":
+            case "lhdc.link.governor_event":
+            case "lhdc.link.probe_state":
+            case "lhdc.dyn.observe":
+            case "native.patch.state.recv":
+            case "codec.bt.reply":
+            case "codec.broadcast.query":
+            case "codec.status.skip.acl_disconnected":
+            case "codec.bridge.status.skip.acl_disconnected":
+            case "le.bt.reply":
+            case "le.ws.reply":
+            case "le.melody.state.recv":
+            case "game.ll.state.sent":
+            case "game.ll.state.recv":
+            case "game.ll.state.confirmed":
+            case "snapshot.refresh.stale.ignore":
+            case "snapshot.publish.device_mismatch":
+            case "surface.scan.skip_non_codec":
+            case "a2dp.ready.keep":
+            case "replay.already_applied":
+            case "replay.advisory.dedup":
+            case "diag.recording.control":
+                return true;
+            default:
+                return false;
+        }
     }
 
     /** Returns a single-token throwable summary suitable for structured event values. */
@@ -206,12 +408,8 @@ public final class MLog {
     }
 
     private static void emit(int priority, String message, Throwable t) {
-        emit(priority, message, t, true);
-    }
-
-    private static void emit(
-            int priority, String message, Throwable t, boolean persistDiagnostic) {
-        emit(priority, message, t, persistDiagnostic, null);
+        emit(priority, message, t, true, null,
+                plainSinks(priority, isVerboseActive()));
     }
 
     private static void emit(
@@ -219,19 +417,22 @@ public final class MLog {
             String message,
             Throwable t,
             boolean persistDiagnostic,
-            String stickyEventName) {
+            String stickyEventName,
+            int sinks) {
         long time = System.currentTimeMillis();
         String prefixed = prefix() + redactBluetoothAddresses(message);
         String safeStack = t != null
                 ? redactBluetoothAddresses(Log.getStackTraceString(t))
                 : null;
-        if (t == null) {
-            Log.println(priority, TAG, prefixed);
-        } else {
-            Log.println(priority, TAG, prefixed + '\n' + safeStack);
+        if (sinks != SINK_NONE) {
+            if (t == null) {
+                Log.println(priority, TAG, prefixed);
+            } else {
+                Log.println(priority, TAG, prefixed + '\n' + safeStack);
+            }
         }
         XposedInterface api = xposed;
-        if (api != null) {
+        if (api != null && sinks == SINK_ALL) {
             try {
                 if (t == null) api.log(priority, TAG, prefixed);
                 else api.log(priority, TAG, prefixed + '\n' + safeStack);

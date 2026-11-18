@@ -158,7 +158,11 @@ public final class MasterSwitchActivity extends Activity {
     protected void onResume() {
         super.onResume();
         foreground = true;
-        DiagnosticEvents.refreshRecordingState(this);
+        // Also converge the debug-log switch in hooked processes that restarted or missed the
+        // last broadcast; the recording refresh carries it when a session is active.
+        if (!DiagnosticEvents.refreshRecordingState(this)) {
+            DiagnosticEvents.syncControlState(this);
+        }
         registerLiveBqrReceiver();
         sendLiveSubscription(true);
         if (webView != null) webView.onResume();
@@ -324,6 +328,7 @@ public final class MasterSwitchActivity extends Activity {
                     modulePrefs.getBoolean(KEY_HIDE_LAUNCHER_ICON, false));
             root.put("governorEnabled", modulePrefs.getBoolean(
                     CodecIpc.KEY_GOVERNOR_EXPERIMENTAL_ENABLED, false));
+            root.put("verboseLogging", DiagnosticEvents.isVerboseLogging(this));
             root.put("snapshotTakenAt", System.currentTimeMillis());
             root.put("recording", buildRecordingSnapshot());
             root.put("environment", cachedEnvironment != null
@@ -652,6 +657,19 @@ public final class MasterSwitchActivity extends Activity {
                         enabled
                                 ? "实验性功能已开启，自动码率保护生效"
                                 : "实验性功能已关闭，码率保护立即解除",
+                        Toast.LENGTH_SHORT).show();
+                pushSnapshotToPage();
+            });
+        }
+
+        @JavascriptInterface
+        public void setVerboseLogging(boolean enabled) {
+            runOnUiThread(() -> {
+                DiagnosticEvents.setVerboseLogging(MasterSwitchActivity.this, enabled);
+                Toast.makeText(MasterSwitchActivity.this,
+                        enabled
+                                ? "调试日志已开启，排查完成后请关闭以省电"
+                                : "调试日志已关闭，仅保留关键日志",
                         Toast.LENGTH_SHORT).show();
                 pushSnapshotToPage();
             });

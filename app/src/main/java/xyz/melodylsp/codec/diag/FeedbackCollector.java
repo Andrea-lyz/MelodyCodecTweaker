@@ -399,6 +399,10 @@ public final class FeedbackCollector {
         json(sb, "launcherHidden", String.valueOf(context.getSharedPreferences(
                 "module_prefs", Context.MODE_PRIVATE).getBoolean("hide_launcher_icon", false)),
                 false, 1);
+        // Outside a recording session, debug-only events are absent from logcat unless this
+        // switch was on; recording itself always forces the verbose stream.
+        json(sb, "verboseLogging", String.valueOf(DiagnosticEvents.isVerboseLogging(context)),
+                false, 1);
         sb.append("  \"statuses\": {\n");
         for (int i = 0; i < STATUS_KEYS.length; i++) {
             String key = STATUS_KEYS[i];
