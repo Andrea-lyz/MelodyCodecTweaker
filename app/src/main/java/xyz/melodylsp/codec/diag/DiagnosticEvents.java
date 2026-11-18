@@ -37,6 +37,10 @@ public final class DiagnosticEvents {
     public static final String ACTION_RECORDING_CONTROL =
             BuildConfig.APPLICATION_ID + ".action.DIAGNOSTIC_RECORDING_CONTROL";
     public static final String EXTRA_RECORDING_UNTIL = "recording_until";
+    /** Diagnostic page debug-log switch (default off); see {@link MLog} output tiers. */
+    public static final String KEY_VERBOSE_LOGGING = "diagnostics.verbose_logging";
+    /** Optional on {@link #ACTION_RECORDING_CONTROL}; absent on broadcasts from older builds. */
+    public static final String EXTRA_VERBOSE_LOGGING = "verbose_logging";
     public static final long RECORDING_DURATION_MS = 30 * 60_000L;
     public static final String EXTRA_SCOPE = "scope";
     public static final String EXTRA_PRIORITY = "priority";
@@ -265,12 +269,42 @@ public final class DiagnosticEvents {
         editor.apply();
     }
 
+    public static boolean isVerboseLogging(Context context) {
+        if (context == null) return false;
+        return context.getSharedPreferences(MODULE_PREFS, Context.MODE_PRIVATE)
+                .getBoolean(KEY_VERBOSE_LOGGING, false);
+    }
+
+    /** Persists the debug-log switch and pushes it to every hooked scope. */
+    public static void setVerboseLogging(Context context, boolean enabled) {
+        if (context == null) return;
+        context.getSharedPreferences(MODULE_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_VERBOSE_LOGGING, enabled)
+                .commit();
+        MLog.configureVerboseLogging(enabled);
+        syncControlState(context);
+    }
+
+    /**
+     * Re-sends the current recording deadline and debug-log switch without changing either, so
+     * a hooked process that missed an earlier broadcast (process restart, frozen) converges.
+     */
+    public static void syncControlState(Context context) {
+        if (context == null) return;
+        long until = recordingUntil(context);
+        notifyRecordingState(context,
+                isRecordingUntil(until, System.currentTimeMillis()) ? until : 0L);
+    }
+
     private static void notifyRecordingState(Context context, long until) {
+        boolean verbose = isVerboseLogging(context);
         for (String packageName : DIAGNOSTIC_SCOPES) {
             try {
                 Intent intent = new Intent(ACTION_RECORDING_CONTROL);
                 intent.setPackage(packageName);
                 intent.putExtra(EXTRA_RECORDING_UNTIL, until);
+                intent.putExtra(EXTRA_VERBOSE_LOGGING, verbose);
                 TrustedBroadcasts.send(context, intent);
             } catch (Throwable ignored) {
             }
