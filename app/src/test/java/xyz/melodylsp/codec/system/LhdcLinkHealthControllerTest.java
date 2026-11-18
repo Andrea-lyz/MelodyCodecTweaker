@@ -2593,6 +2593,183 @@ public final class LhdcLinkHealthControllerTest {
     }
 
     /** 6 s window: 200 retx -> 33.3/s, 160 noRx -> 26.7/s, both above the fallback gate. */
+    // --- Steady-state queue flush (2026-11-18, PJZ110 + Enco X3 airtime starvation) ---
+
+    @Test
+    public void queueFlushRequiresHighWaterCollapseWithinOneTick() {
+        assertTrue(LhdcLinkHealthController.isQueueFlush(42, 1_000L, 0, 1_200L));
+        assertTrue(LhdcLinkHealthController.isQueueFlush(30, 1_000L, 5, 1_300L));
+        // Normal drain: the link clears at most ~13 packets per tick above production.
+        assertFalse(LhdcLinkHealthController.isQueueFlush(42, 1_000L, 20, 1_200L));
+        // Below high water: not an overflow.
+        assertFalse(LhdcLinkHealthController.isQueueFlush(29, 1_000L, 0, 1_200L));
+        // Sampling gap too long (pause / missed ticks): ambiguous, never counted.
+        assertFalse(LhdcLinkHealthController.isQueueFlush(42, 1_000L, 0, 1_400L));
+        // No previous sample.
+        assertFalse(LhdcLinkHealthController.isQueueFlush(-1, 0L, 0, 200L));
+        assertFalse(LhdcLinkHealthController.isQueueFlush(42, 0L, 0, 200L));
+    }
+
+    @Test
+    public void repeatedQueueFlushStepsDownWhileBqrLooksHealthy() {
+        Recorder recorder = new Recorder();
+        LhdcLinkHealthController controller = qualityController(recorder);
+        controller.activate(MAC, 100L);
+        // BQR stays in the X3 normal band (26/23): the BQR fallback alone never fires.
+        for (int i = 0; i < 4; i++) {
+            controller.onBqrSample(MAC, midBandBqr(), 20_000L + i * 6_000L, true);
+        }
+        queueFlush(controller, 40_000L);
+        LhdcLinkHealthController.Snapshot afterOne = controller.snapshot(MAC, 40_200L);
+        assertEquals(1000, afterOne.ceilingKbps);
+        assertEquals(1, afterOne.queueFlushCount);
+        queueFlush(controller, 50_000L);
+        LhdcLinkHealthController.Snapshot afterTwo = controller.snapshot(MAC, 50_200L);
+        assertEquals(900, afterTwo.ceilingKbps);
+        assertEquals(900, afterTwo.bqrFallbackCapKbps);
+        assertEquals(2, afterTwo.queueFlushCount);
+        assertTrue(recorder.events.contains("900:bqr_fallback_triggered_queue_flush"));
+        assertTrue(recorder.flushEvents.contains("42->0 count30s=2 session=2"));
+    }
+
+    @Test
+    public void queueFlushStepsAgainAfterSettleButNotBelow500() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.activate(MAC, 100L);
+        queueFlush(controller, 20_000L);
+        queueFlush(controller, 25_000L);
+        // Downgrade decided on the collapse sample at 25.2 s.
+        assertEquals(900, controller.snapshot(MAC, 25_200L).ceilingKbps);
+        // Within the 3 s settle the old rung's tail must not count or seed the window.
+        queueFlush(controller, 26_000L);
+        queueFlush(controller, 27_500L);
+        assertEquals(900, controller.snapshot(MAC, 27_700L).ceilingKbps);
+        // After the settle two fresh flushes step 900 -> 500 without waiting the 10 s dead zone.
+        queueFlush(controller, 29_000L);
+        assertEquals(900, controller.snapshot(MAC, 29_200L).ceilingKbps);
+        queueFlush(controller, 31_000L);
+        assertEquals(500, controller.snapshot(MAC, 31_200L).ceilingKbps);
+        queueFlush(controller, 80_000L);
+        queueFlush(controller, 85_000L);
+        assertEquals(500, controller.snapshot(MAC, 85_200L).ceilingKbps);
+    }
+
+    @Test
+    public void queueFlushIsNotBlockedByPostSwitchGuardAfterRecovery() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.activate(MAC, 100L);
+        queueFlush(controller, 20_000L);
+        queueFlush(controller, 25_000L);
+        assertEquals(900, controller.snapshot(MAC, 25_200L).bqrFallbackCapKbps);
+        // Clean windows until the strict tier restores 1000 (8 windows + 120 s hold).
+        long t = 30_000L;
+        while (controller.snapshot(MAC, t).bqrFallbackCapKbps != 0 && t < 400_000L) {
+            controller.onBqrSample(MAC, midBandBqr(), t, true);
+            t += 6_000L;
+        }
+        assertEquals(1000, controller.snapshot(MAC, t).ceilingKbps);
+        // Right after the recovery publish (POST_SWITCH_GUARD armed) flushes still count.
+        queueFlush(controller, t + 1_000L);
+        queueFlush(controller, t + 3_000L);
+        assertEquals(900, controller.snapshot(MAC, t + 3_200L).ceilingKbps);
+    }
+
+    @Test
+    public void warmUpRequiresAThirdFlushInsideStartGuard() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.activate(MAC, 100L);
+        queueFlush(controller, 2_000L);
+        queueFlush(controller, 6_000L);
+        // Two flushes inside START_GUARD (a possible warm-up transient) do not step down.
+        assertEquals(1000, controller.snapshot(MAC, 6_200L).ceilingKbps);
+        // A third within the window is sustained starvation, not a transient.
+        queueFlush(controller, 12_000L);
+        assertEquals(900, controller.snapshot(MAC, 12_200L).ceilingKbps);
+        assertEquals(3, controller.snapshot(MAC, 12_200L).queueFlushCount);
+    }
+
+    @Test
+    public void singleWarmUpFlushDoesNotStepDown() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.activate(MAC, 100L);
+        queueFlush(controller, 2_000L);
+        // The window expires before any second flush.
+        queueFlush(controller, 40_000L);
+        assertEquals(1000, controller.snapshot(MAC, 40_200L).ceilingKbps);
+    }
+
+    @Test
+    public void queueFlushIgnoredWhenGovernorDisabledButStillCounted() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.setGovernorEnabled(false, 0L);
+        controller.activate(MAC, 100L);
+        queueFlush(controller, 20_000L);
+        queueFlush(controller, 25_000L);
+        LhdcLinkHealthController.Snapshot state = controller.snapshot(MAC, 25_200L);
+        assertEquals(1000, state.ceilingKbps);
+        assertEquals(2, state.queueFlushCount);
+    }
+
+    @Test
+    public void queueFlushWindowsBlockStrictTierRecovery() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.activate(MAC, 100L);
+        queueFlush(controller, 20_000L);
+        queueFlush(controller, 25_000L);
+        assertEquals(900, controller.snapshot(MAC, 25_200L).bqrFallbackCapKbps);
+        // Healthy-looking BQR every 6 s for 6 minutes, but one flush every 33 s (never two in
+        // a 30 s window, so no further step): at most 5 clean windows between flushes.
+        driveHealthyBqrWithFlushEvery33s(controller, 36_500L, 390_000L);
+        LhdcLinkHealthController.Snapshot state = controller.snapshot(MAC, 390_000L);
+        assertEquals(900, state.bqrFallbackCapKbps);
+        assertEquals(900, state.ceilingKbps);
+    }
+
+    @Test
+    public void strictTierRecoversWhenWindowsAreFlushFree() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.activate(MAC, 100L);
+        queueFlush(controller, 20_000L);
+        queueFlush(controller, 25_000L);
+        assertEquals(900, controller.snapshot(MAC, 25_200L).bqrFallbackCapKbps);
+        for (long t = 30_000L; t <= 390_000L; t += 6_000L) {
+            controller.onBqrSample(MAC, midBandBqr(), t, true);
+        }
+        LhdcLinkHealthController.Snapshot state = controller.snapshot(MAC, 390_000L);
+        assertEquals(0, state.bqrFallbackCapKbps);
+        assertEquals(1000, state.ceilingKbps);
+    }
+
+    @Test
+    public void queueFlushWindowsBlockLeakyRecovery() {
+        LhdcLinkHealthController controller = qualityController(new Recorder());
+        controller.activate(MAC, 100L);
+        controller.onRemoteChoppyReport(MAC, 1, 16_000L);
+        controller.onRemoteChoppyReport(MAC, 1, 24_000L);
+        assertEquals(900, controller.snapshot(MAC, 24_000L).leakyFallbackCapKbps);
+        driveHealthyBqrWithFlushEvery33s(controller, 36_500L, 300_000L);
+        assertEquals(900, controller.snapshot(MAC, 300_000L).leakyFallbackCapKbps);
+    }
+
+    /** BQR (X3 normal band) every 6 s from 30 s; a flush every 33 s from firstFlushMs. */
+    private static void driveHealthyBqrWithFlushEvery33s(
+            LhdcLinkHealthController controller, long firstFlushMs, long endMs) {
+        long nextFlush = firstFlushMs;
+        for (long t = 30_000L; t <= endMs; t += 500L) {
+            if (t == nextFlush) {
+                queueFlush(controller, t);
+                nextFlush += 33_000L;
+            }
+            if (t % 6_000L == 0L) controller.onBqrSample(MAC, midBandBqr(), t, true);
+        }
+    }
+
+    /** One 200 ms tick at high water followed by the stack's whole-queue drop. */
+    private static void queueFlush(LhdcLinkHealthController controller, long atMs) {
+        controller.onQueueSample(MAC, 42, 45, atMs);
+        controller.onQueueSample(MAC, 0, 45, atMs + 200L);
+    }
+
     private static LhdcLinkHealthController.BqrSample bqrFallbackBad() {
         return new LhdcLinkHealthController.BqrSample(
                 45, 0, 200, 160, 8, -50, 0, 0, 0);
@@ -2689,6 +2866,7 @@ public final class LhdcLinkHealthControllerTest {
 
     private static final class Recorder implements LhdcLinkHealthController.Listener {
         final List<String> events = new ArrayList<>();
+        final List<String> flushEvents = new ArrayList<>();
         final List<String> stateEvents = new ArrayList<>();
         final List<String> shadowEvents = new ArrayList<>();
         final List<String> fallbackEvents = new ArrayList<>();
@@ -2700,6 +2878,13 @@ public final class LhdcLinkHealthControllerTest {
         @Override
         public void onProbeCeilingChanged(String mac, int ceilingKbps, String reason) {
             events.add(ceilingKbps + ":" + reason);
+        }
+
+        @Override
+        public void onQueueFlush(String mac, int fromLength, int toLength,
+                int countInWindow, int sessionCount, long nowMs) {
+            flushEvents.add(fromLength + "->" + toLength + " count30s=" + countInWindow
+                    + " session=" + sessionCount);
         }
 
         @Override

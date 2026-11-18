@@ -75,6 +75,7 @@ public final class MLogTest {
         assertEquals(MLog.SINK_ALL, MLog.eventSinks("write.path", false));
         assertEquals(MLog.SINK_ALL, MLog.eventSinks("replay.outcome", false));
         assertEquals(MLog.SINK_ALL, MLog.eventSinks("diag.log.verbose", false));
+        assertEquals(MLog.SINK_ALL, MLog.eventSinks("lhdc.link.queue_flush", false));
     }
 
     @Test

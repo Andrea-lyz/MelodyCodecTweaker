@@ -331,7 +331,14 @@ public final class MLog {
 
     /** Output sinks for a structured event; never affects persistence or status probing. */
     static int eventSinks(String name, boolean verbose) {
-        if (verbose || "diag.log.verbose".equals(name)) return SINK_ALL;
+        // diag.log.verbose marks where the verbose stream starts/stops; lhdc.link.queue_flush is
+        // an audible ~225 ms gap and the key stutter evidence. Some ColorOS builds drop module
+        // logcat, so both always reach the LSPosed log (each is rare on a healthy link).
+        if (verbose
+                || "diag.log.verbose".equals(name)
+                || "lhdc.link.queue_flush".equals(name)) {
+            return SINK_ALL;
+        }
         if (isDebugOnlyEventName(name)) return SINK_NONE;
         if (isStatusEssentialEventName(name) || isStickyDiagnosticEvent(name)) return SINK_ALL;
         return SINK_LOGCAT;
