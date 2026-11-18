@@ -250,6 +250,26 @@ public final class SystemHookInstaller {
                     }
 
                     @Override
+                    public void onQueueFlush(
+                            String mac,
+                            int fromLength,
+                            int toLength,
+                            int countInWindow,
+                            int sessionCount,
+                            long nowMs) {
+                        // Each flush is an audible ~225 ms gap; low frequency on a healthy link,
+                        // so it stays visible in logcat without the debug switch.
+                        MLog.event("lhdc.link.queue_flush",
+                                "mac", redactMac(mac),
+                                "from", fromLength,
+                                "to", toLength,
+                                "count30s", countInWindow,
+                                "sessionCount", sessionCount,
+                                "actualBitrateKbps",
+                                NativeLhdcMemoryPatch.currentGovernorBitrateKbps());
+                    }
+
+                    @Override
                     public void onShadowTrigger(
                             String mac,
                             String kind,
@@ -1430,6 +1450,8 @@ public final class SystemHookInstaller {
                 "requiredQuietMs", snapshot.requiredQuietMs,
                 "queue", snapshot.currentQueueLength,
                 "queueCapacity", snapshot.queueCapacity,
+                "queueFlushes", snapshot.queueFlushCount,
+                "lastQueueFlushAgoMs", snapshot.lastQueueFlushAgoMs,
                 "lowQueueDurationMs", snapshot.lowQueueDurationMs,
                 "lastCongestionAgoMs", snapshot.lastCongestionAgoMs,
                 "probePhase", snapshot.probePhase,
@@ -1460,7 +1482,8 @@ public final class SystemHookInstaller {
                 + snapshot.peerCeilingKbps + '|' + sample.overflowCount + '|'
                 + sample.underflowCount + '|' + snapshot.shadowUnstableWindows + '|'
                 + snapshot.shadowCandidateCount + '|' + snapshot.choppyCapabilityState + '|'
-                + snapshot.encoderState + '|' + governorExperimentalEnabled;
+                + snapshot.encoderState + '|' + governorExperimentalEnabled + '|'
+                + snapshot.queueFlushCount;
         if (!diagnosticState.equals(lastBqrDiagnosticState)
                 || capturedAtMs - lastBqrDiagnosticMs >= BQR_DIAGNOSTIC_INTERVAL_MS) {
             lastBqrDiagnosticState = diagnosticState;

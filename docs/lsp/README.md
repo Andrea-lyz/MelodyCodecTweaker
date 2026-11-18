@@ -18,6 +18,17 @@
 - 在官方耳机主面板和 OneSpace 快捷面板中使用同一套控制。
 - 出现问题时可一键生成反馈包，方便适配不同机型和系统版本。
 
+## 2.5.8 更新 / Updates
+
+- 码率拥堵治理器改为以发送队列溢出（约 225 ms 断音）为直接依据：30 秒内 2 次溢出就降一档，出现过溢出的时段不再算作恢复证据。实机在空口争用下 3 分钟断音由 46 次降到 14 次。
+- The bitrate congestion governor now acts on TX queue overflow (a ~225 ms gap): two overflows within 30 s step down one rung, and periods with an overflow no longer count toward recovery. Under airtime contention, gaps in a 3 min device run fell from 46 to 14.
+- 诊断页新增「调试日志」开关（默认关闭），关闭时高频遥测不再写入 LSPosed 日志；「开始记录问题」期间自动完整输出。
+- Adds a "Debug log" switch (off by default); while off, high-frequency telemetry is not written to the LSPosed log, and "Start recording issue" still enables full output.
+- 电脑上的「手机连接（Phone Link）」反复通过蓝牙连接手机会造成 1000 kbps 卡顿，关闭其蓝牙连接后可稳定播放。
+- Phone Link on a PC reconnecting over Bluetooth causes 1000 kbps stutter; turning off its Bluetooth connection restores stable playback.
+
+[完整中英文说明 / Full bilingual release notes](https://github.com/Andrea-lyz/MelodyCodecTweaker/blob/main/docs/releases/2.5.8.md)
+
 ## 2.5.6 更新 / Updates
 
 - 治理器关闭时，支持的 LHDC V5 音质优先流改用 10 ms 发送节奏，保持所选码率和采样率；实机记录确认码率仍为 1000 kbps。高负载无线环境下仍可能卡顿。

@@ -178,6 +178,35 @@ final class LhdcLinkHealthController {
     static final int BQR_FAST_FAIL_QUEUE_THRESHOLD = 40;
     static final long BQR_FAST_FAIL_HOLD_MS = 3_000L;
     static final long BQR_FAST_FAIL_PROBE_WINDOW_MS = 30_000L;
+    /**
+     * Steady-state queue flush (2026-11-18, PJZ110 + Enco X3, governor off, 1000 kbps). When the
+     * btif TX queue reaches its 45-packet cap the stack drops the whole queue (~225 ms audible
+     * gap, then a headset choppy report ~100 ms later). Airtime starvation from another
+     * connection on the phone (a Phone Link PC reconnecting every ~30 s) produced 46 flushes in
+     * 3 min while BQR stayed at retx ~21/s, noRx ~20/s — well inside the "healthy" band — so
+     * BQR alone can neither trigger a downgrade nor veto a recovery here. A flush is seen on the
+     * 200 ms queue tick as a one-sample collapse from high water: the link drains at most ~13
+     * packets per tick above the production rate, so a >= 25-packet drop is never a normal
+     * drain.
+     */
+    static final int QUEUE_FLUSH_HIGH_WATER = 30;
+    static final int QUEUE_FLUSH_MIN_DROP = 25;
+    static final long QUEUE_FLUSH_MAX_SAMPLE_GAP_MS = 300L;
+    /**
+     * Two flushes within 30 s step one rung down (measured: 1000 kbps ~15 flushes/min vs 902 kbps
+     * ~4.5/min on the same starved link). A single flush is tolerated so an isolated glitch
+     * does not cost a rung.
+     */
+    static final int QUEUE_FLUSH_TRIGGER_COUNT = 2;
+    static final long QUEUE_FLUSH_TRIGGER_WINDOW_MS = 30_000L;
+    /**
+     * After any downgrade, flushes are ignored for this long instead of the full 10 s
+     * {@link #DOWNGRADE_DEAD_ZONE_MS}: the backlog drains within ~1-2 s of a lower rung, so a
+     * flush after 3 s is the new rung failing, not the old rung's tail. Device run 2026-11-18:
+     * with the 10 s dead zone, 900 flushed 6 times before it could be judged and 1000 -> 500
+     * took ~30 s with 13 audible gaps.
+     */
+    static final long QUEUE_FLUSH_SETTLE_MS = 3_000L;
 
     interface Listener {
         void onProbeCeilingChanged(String mac, int ceilingKbps, String reason);
@@ -218,6 +247,20 @@ final class LhdcLinkHealthController {
                 String reason,
                 double retransmissionsPerSecond,
                 double noRxPerSecond,
+                long nowMs) {
+        }
+
+        /**
+         * A steady-state TX queue flush (audible ~225 ms gap) was detected. countInWindow is the
+         * number of flushes within {@link #QUEUE_FLUSH_TRIGGER_WINDOW_MS}. Implementations only
+         * log.
+         */
+        default void onQueueFlush(
+                String mac,
+                int fromLength,
+                int toLength,
+                int countInWindow,
+                int sessionCount,
                 long nowMs) {
         }
 
@@ -330,6 +373,10 @@ final class LhdcLinkHealthController {
         final int leakyFallbackRequiredHealthyWindows;
         /** Leaky-bucket hold remaining in ms; 0 when inactive or expired. */
         final long leakyFallbackHoldRemainingMs;
+        /** TX queue flushes (audible ~225 ms gaps) detected in this stream session. */
+        final int queueFlushCount;
+        /** Age of the most recent queue flush; -1 when none in this session. */
+        final long lastQueueFlushAgoMs;
 
         Snapshot(
                 int ceilingKbps,
@@ -376,8 +423,12 @@ final class LhdcLinkHealthController {
                 long leakyFallbackHoldRemainingMs,
                 boolean encoderControlAvailable,
                 String encoderState,
-                String platformPlayback) {
+                String platformPlayback,
+                int queueFlushCount,
+                long lastQueueFlushAgoMs) {
             this.ceilingKbps = ceilingKbps;
+            this.queueFlushCount = queueFlushCount;
+            this.lastQueueFlushAgoMs = lastQueueFlushAgoMs;
             this.healthyBqrWindows = healthyBqrWindows;
             this.usableAfhChannels = usableAfhChannels;
             this.retransmissionsPerSecond = retransmissionsPerSecond;
@@ -539,6 +590,17 @@ final class LhdcLinkHealthController {
         final long[] bqrSnapshotTimes = new long[DISASTER_SNAPSHOT_WINDOWS];
         int bqrSnapshotIndex;
         long lastDisasterShadowMs;
+        // Steady-state queue flush detection (independent of the leap-window sampling state).
+        int prevQueueLength = -1;
+        long prevQueueSampleMs;
+        int queueFlushCount;
+        long lastQueueFlushMs;
+        long queueFlushWindowStartMs;
+        int queueFlushesInWindow;
+        /** Flushes since the last decision-eligible BQR window; consumed by onBqrSample. */
+        int queueFlushesSinceBqrWindow;
+        /** True when the current BQR window saw a flush: it must not count as recovery evidence. */
+        boolean bqrWindowHadQueueFlush;
     }
 
     private final Map<String, DeviceState> devices = new HashMap<>();
@@ -863,6 +925,10 @@ final class LhdcLinkHealthController {
         if (validInterval) {
             state.lastValidBqrMs = nowMs;
             state.validBqrWindowCount++;
+            // A window that contained an audible queue flush is never recovery evidence, even
+            // when its retx/noRx look healthy (airtime starvation does not raise them).
+            state.bqrWindowHadQueueFlush = state.queueFlushesSinceBqrWindow > 0;
+            state.queueFlushesSinceBqrWindow = 0;
             double seconds = intervalMs / 1000.0;
             state.retransmissionsPerSecond = sample.retransmissionCount / seconds;
             state.noRxPerSecond = sample.noRxCount / seconds;
@@ -904,6 +970,7 @@ final class LhdcLinkHealthController {
                                                     < BQR_FALLBACK_BAD_RETX_PER_SEC
                                             && state.noRxPerSecond
                                                     < BQR_FALLBACK_BAD_NO_RX_PER_SEC
+                                            && !state.bqrWindowHadQueueFlush
                                     ? state.leakyFallbackHealthyWindows + 1 : 0;
                         }
                     }
@@ -992,7 +1059,16 @@ final class LhdcLinkHealthController {
         state.streaming = true;
         state.currentQueueLength = length;
         state.queueCapacity = capacity;
+        boolean flushed = detectQueueFlush(mac, state, length, nowMs);
         if (!qualityPolicyActive || !state.encoderControlAvailable) return;
+        if (flushed) {
+            // A flush is an audible gap: hard congestion evidence, same as a full queue.
+            noteCongestion(state, nowMs);
+            if (cancelRecoveryProbe(state, nowMs, false)) {
+                publishCeiling(mac, state, "probe_queue_flush", nowMs);
+            }
+            if (governorEnabled) evaluateQueueFlushTrigger(mac, state, nowMs);
+        }
         long occupancy = (long) length * 100L;
         if (occupancy <= (long) capacity * 25L) {
             if (state.lowQueueSinceMs == 0L) state.lowQueueSinceMs = nowMs;
@@ -1042,6 +1118,68 @@ final class LhdcLinkHealthController {
             decayLeakyBucket(state, nowMs);
         }
         if (mac.equals(activeMac)) maybeOpenRecoveryProbe(mac, state, nowMs);
+    }
+
+    /**
+     * Records a steady-state TX queue flush: a one-tick collapse from high water. Counting runs
+     * regardless of policy so diagnostics show flushes even in observe-only sessions.
+     */
+    private boolean detectQueueFlush(String mac, DeviceState state, int length, long nowMs) {
+        int previous = state.prevQueueLength;
+        long previousMs = state.prevQueueSampleMs;
+        state.prevQueueLength = length;
+        state.prevQueueSampleMs = nowMs;
+        if (!isQueueFlush(previous, previousMs, length, nowMs)) return false;
+        state.queueFlushCount++;
+        state.lastQueueFlushMs = nowMs;
+        state.queueFlushesSinceBqrWindow++;
+        if (state.queueFlushWindowStartMs == 0L
+                || nowMs - state.queueFlushWindowStartMs > QUEUE_FLUSH_TRIGGER_WINDOW_MS) {
+            state.queueFlushWindowStartMs = nowMs;
+            state.queueFlushesInWindow = 0;
+        }
+        state.queueFlushesInWindow++;
+        if (listener != null) {
+            listener.onQueueFlush(mac, previous, length, state.queueFlushesInWindow,
+                    state.queueFlushCount, nowMs);
+        }
+        return true;
+    }
+
+    static boolean isQueueFlush(int previous, long previousMs, int length, long nowMs) {
+        return previous >= QUEUE_FLUSH_HIGH_WATER
+                && previous - length >= QUEUE_FLUSH_MIN_DROP
+                && previousMs != 0L
+                && nowMs - previousMs <= QUEUE_FLUSH_MAX_SAMPLE_GAP_MS;
+    }
+
+    /**
+     * Steady-state downgrade on repeated flushes: one rung per trigger through the tiered BQR
+     * fallback (1000 -> 900 -> 500), so recovery reuses its windows, holds and escalation.
+     * Warm-up transients are excluded, and a short settle period after any downgrade gives the
+     * new rung time to drain before it can be judged. The choppy-oriented POST_SWITCH_GUARD and
+     * the 10 s dead zone do not apply: a flush is a measured gap, not a soft signal.
+     */
+    private void evaluateQueueFlushTrigger(String mac, DeviceState state, long nowMs) {
+        long downgradeAtMs = state.downgradeDeadZoneUntilMs == 0L
+                ? 0L : state.downgradeDeadZoneUntilMs - DOWNGRADE_DEAD_ZONE_MS;
+        if (downgradeAtMs != 0L && nowMs < downgradeAtMs + QUEUE_FLUSH_SETTLE_MS) {
+            // The old rung's tail must not seed the next trigger window.
+            state.queueFlushWindowStartMs = 0L;
+            state.queueFlushesInWindow = 0;
+            return;
+        }
+        // START_GUARD is re-armed by every connect / codec switch / stream restart, so chained
+        // restarts kept it open for ~30 s on device (13 ignored gaps at 1000). Inside the guard
+        // one more flush is required instead of discarding the evidence.
+        int required = nowMs < state.startGuardUntilMs
+                ? QUEUE_FLUSH_TRIGGER_COUNT + 1 : QUEUE_FLUSH_TRIGGER_COUNT;
+        if (state.queueFlushesInWindow < required) return;
+        if (effectiveCeiling(state) <= BQR_FALLBACK_CAP_KBPS) return;
+        state.queueFlushWindowStartMs = 0L;
+        state.queueFlushesInWindow = 0;
+        triggerBqrFallback(mac, state, nowMs, "triggered_queue_flush", 0,
+                "bqr_fallback_triggered_queue_flush");
     }
 
     synchronized void onCongestion(String mac, long nowMs) {
@@ -1218,7 +1356,7 @@ final class LhdcLinkHealthController {
                     "stable", 0L, 0, 0L, 0L, "none", 0L,
                     0, false, -1L, 0, -1L, 0,
                     choppyCapabilityState, 0L, 0L, 0, 0, 0, -1L, 0L, 0, 0,
-                    0, 0, 0L, 0, 0, 0L, false, "waiting", "unknown");
+                    0, 0, 0L, 0, 0, 0L, false, "waiting", "unknown", 0, -1L);
         }
         BoundaryState probe = inFlightBoundary(state);
         BoundaryState blocked = probe != null ? probe : firstBlockedBoundary(state);
@@ -1297,7 +1435,10 @@ final class LhdcLinkHealthController {
                 state.encoderControlAvailable,
                 state.encoderControlAvailable ? "software"
                         : state.encoderUnavailableConfirmed ? "monitor_only" : "waiting",
-                state.platformPlayback);
+                state.platformPlayback,
+                state.queueFlushCount,
+                state.lastQueueFlushMs == 0L
+                        ? -1L : Math.max(0L, nowMs - state.lastQueueFlushMs));
     }
 
     /** Phase 5 countdown UI: required recovery windows per BQR cap tier. */
@@ -1500,7 +1641,8 @@ final class LhdcLinkHealthController {
             }
             if (state.bqrFallbackBadWindows >= BQR_FALLBACK_REQUIRED_BAD_WINDOWS) {
                 int windows = state.bqrFallbackBadWindows;
-                triggerBqrFallback(mac, state, nowMs, "triggered", windows, false);
+                triggerBqrFallback(mac, state, nowMs, "triggered", windows,
+                        "bqr_fallback_triggered");
             }
             return;
         }
@@ -1557,7 +1699,11 @@ final class LhdcLinkHealthController {
                 requiredWindows = BQR_FALLBACK_REQUIRED_HEALTHY_WINDOWS_STRICT;
                 holdMs = strictFallbackHoldMs(state);
             }
-            if (cap >= 900) {
+            if (state.bqrWindowHadQueueFlush) {
+                // An audible flush in this window resets every tier's streak: BQR does not see
+                // airtime starvation, so "healthy" retx/noRx here is not recovery evidence.
+                state.bqrFallbackHealthyWindows = 0;
+            } else if (cap >= 900) {
                 // Decision 45: the bad branch above already reset the streak for true bad
                 // windows; a one-sided hot window keeps the streak without counting.
                 if (tierHealthy) {
@@ -1596,7 +1742,7 @@ final class LhdcLinkHealthController {
         if (state.bqrFallbackStepBadWindows >= BQR_FALLBACK_REQUIRED_BAD_WINDOWS) {
             state.bqrFallbackStepBadWindows = 0;
             triggerBqrFallback(mac, state, nowMs, "triggered",
-                    BQR_FALLBACK_REQUIRED_BAD_WINDOWS, false);
+                    BQR_FALLBACK_REQUIRED_BAD_WINDOWS, "bqr_fallback_triggered");
         }
     }
 
@@ -1754,7 +1900,7 @@ final class LhdcLinkHealthController {
             long nowMs,
             String notifyReason,
             int badWindows,
-            boolean queueFastFail) {
+            String publishReason) {
         state.bqrFallbackBadWindows = 0;
         state.bqrFallbackStepBadWindows = 0;
         // Phase N-4 (6.8.3/decision 32): one rung per trigger — 1000->900, 900->500.
@@ -1784,9 +1930,7 @@ final class LhdcLinkHealthController {
         // Phase N-4 dead zone (6.8.4): recovery evidence must not start from the old
         // bitrate's tail.
         state.downgradeDeadZoneUntilMs = nowMs + DOWNGRADE_DEAD_ZONE_MS;
-        publishCeiling(mac, state,
-                queueFastFail ? "bqr_fallback_triggered_queue" : "bqr_fallback_triggered",
-                nowMs);
+        publishCeiling(mac, state, publishReason, nowMs);
         notifyBqrFallback(mac, state, notifyReason, badWindows, 0);
     }
 
@@ -1820,7 +1964,8 @@ final class LhdcLinkHealthController {
             } else if (nowMs - state.bqrFastFailQueueSinceMs >= BQR_FAST_FAIL_HOLD_MS) {
                 state.bqrFastFailQueueSinceMs = 0L;
                 triggerBqrFallback(
-                        mac, state, nowMs, "triggered_queue_fast_fail", 0, true);
+                        mac, state, nowMs, "triggered_queue_fast_fail", 0,
+                        "bqr_fallback_triggered_queue");
             }
         } else {
             state.bqrFastFailQueueSinceMs = 0L;
@@ -2013,6 +2158,14 @@ final class LhdcLinkHealthController {
         state.queueHighAccumMs = 0L;
         state.lastQueueHighMs = 0L;
         state.lastLeapShadowMs = 0L;
+        state.prevQueueLength = -1;
+        state.prevQueueSampleMs = 0L;
+        state.queueFlushCount = 0;
+        state.lastQueueFlushMs = 0L;
+        state.queueFlushWindowStartMs = 0L;
+        state.queueFlushesInWindow = 0;
+        state.queueFlushesSinceBqrWindow = 0;
+        state.bqrWindowHadQueueFlush = false;
         state.bqrSnapshotIndex = 0;
         state.lastDisasterShadowMs = 0L;
         state.lastBqrMs = 0L;

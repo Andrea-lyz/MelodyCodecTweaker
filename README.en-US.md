@@ -18,6 +18,13 @@
 
 The module primarily targets `com.oplus.melody` on ColorOS / OPlus devices, working alongside the `com.android.bluetooth` and `com.oplus.wirelesssettings` scopes for more stable state reading and writing.
 
+## 2.5.8 Update Highlights
+
+- The bitrate congestion governor now acts directly on TX queue overflow (a ~225 ms audible gap): two overflows within 30 s step down one rung, and periods with an overflow no longer count as recovery evidence. Under airtime contention, audible gaps in a 3 min device run fell from 46 to 14.
+- Adds a "Debug log" switch to the diagnostics page (off by default). While off, high-frequency telemetry is no longer written to the LSPosed log; "Start recording issue" still enables full output.
+- The investigation confirmed that Phone Link on a PC, reconnecting to the phone over Bluetooth, causes 1000 kbps stutter; turning off its Bluetooth connection restores stable playback.
+- See the [complete bilingual 2.5.8 release notes](docs/releases/2.5.8.md).
+
 ## 2.5.6 Update Highlights
 
 - With the governor disabled, supported LHDC V5 Quality Priority streams use 10 ms encoder pacing while preserving the selected bitrate and sample rate. Device logs confirmed the bitrate remained at 1000 kbps; stutter may still occur under heavy wireless load.
